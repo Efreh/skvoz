@@ -65,9 +65,16 @@ def ready(url, timeout=15):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["check", "demo"], nargs="?", default="check")
+    parser.add_argument("mode", choices=["check", "demo", "load", "tcp"], nargs="?", default="check")
     parser.add_argument("--offline", action="store_true", help="Use cached Cargo dependencies and Docker image")
+    parser.add_argument("--clients", type=int, default=10)
+    parser.add_argument("--streams-per-client", type=int, default=10)
+    parser.add_argument("--active-per-client", type=int, default=2)
+    parser.add_argument("--bytes", type=int, default=65536)
     args = parser.parse_args()
+    if not (1 <= args.clients <= 100 and 1 <= args.streams_per_client <= 100
+            and 0 <= args.active_per_client <= args.streams_per_client and 0 <= args.bytes <= 2*1024*1024):
+        parser.error("load parameters exceed the bounded experiment scope")
     for executable in ["docker", "cargo", "openssl"]:
         if not shutil.which(executable):
             raise RuntimeError(f"Required executable is missing: {executable}")
@@ -80,17 +87,25 @@ def main():
     token = secrets.token_hex(8)
     container = f"skvoz-testbench-{token}"
     user_password, consumer_password = secrets.token_hex(24), secrets.token_hex(24)
+    mesh_passwords = [secrets.token_hex(24) for _ in range(101)]
     old_mask = os.umask(0o077)
     try:
         with tempfile.TemporaryDirectory(prefix="skvoz-nats-") as temporary:
             directory = Path(temporary)
             certificates(directory)
+            mesh_users = []
+            for peer_id, password in enumerate(mesh_passwords):
+                publish = (f"skvoz.mesh.{token}.*.*.*.0.*" if peer_id == 0
+                           else f"skvoz.mesh.{token}.*.0.*.{peer_id}.*")
+                subscribe = f"skvoz.mesh.{token}.*.{peer_id}.*.*.*"
+                mesh_users.append(f'{{ user: "p{peer_id}", password: "{password}", permissions: {{ publish: ["{publish}"], subscribe: ["{subscribe}"] }} }}')
+            mesh_authorization = ",\n".join(mesh_users)
             config = f'''server_name: "skvoz-testbench"
 port: 4222
 http_port: 8222
 max_payload: 65564
 max_pending: 4MB
-max_connections: 16
+max_connections: 256
 write_deadline: "2s"
 tls {{
   cert_file: "/bench/server.pem"
@@ -102,13 +117,14 @@ tls {{
 authorization {{
   users: [
     {{ user: "user", password: "{user_password}", permissions: {{
-      publish: ["skvoz.bench.{token}.*.consumer"]
-      subscribe: ["skvoz.bench.{token}.*.user"]
+      publish: ["skvoz.bench.{token}.*.1.s.0.s"]
+      subscribe: ["skvoz.bench.{token}.*.0.s.*.*"]
     }} }},
     {{ user: "consumer", password: "{consumer_password}", permissions: {{
-      publish: ["skvoz.bench.{token}.*.user"]
-      subscribe: ["skvoz.bench.{token}.*.consumer"]
-    }} }}
+      publish: ["skvoz.bench.{token}.*.0.s.1.s"]
+      subscribe: ["skvoz.bench.{token}.*.1.s.*.*"]
+    }} }},
+    {mesh_authorization}
   ]
 }}
 '''
@@ -136,14 +152,16 @@ authorization {{
                     "SKVOZ_NATS_USER_PASSWORD": user_password, "SKVOZ_NATS_CONSUMER_PASSWORD": consumer_password,
                     "SKVOZ_NATS_RUN_TOKEN": token, "SKVOZ_NATS_CONTAINER": container, "SKVOZ_NATS_MONITOR": monitor,
                 }
+                env.update({f"SKVOZ_NATS_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(mesh_passwords)})
                 if args.mode == "check":
                     command(cargo + ["test", "--workspace", "--all-targets", "--features", "skvoz-testbench/real-nats", *extra,
                         "--", "--test-threads=1", "--nocapture"], env=env)
                 else:
-                    command(cargo + ["run", "-p", "skvoz-testbench", *extra], env=env)
+                    command(cargo + ["run", "-p", "skvoz-testbench", *extra, "--", args.mode,
+                        str(args.clients), str(args.streams_per_client), str(args.active_per_client), str(args.bytes)], env=env)
             except BaseException:
                 if created:
-                    command(["docker", "logs", "--tail=100", container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    command(["docker", "logs", "--tail=100", container])
                 raise
             finally:
                 if created:

@@ -1,10 +1,11 @@
 # SKVOZ Core
 
 Подпроект ядра в общем репозитории SKVOZ. Rust package `skvoz-core`,
-участник корневого workspace. Сейчас содержит std-only движок потока
-без I/O/runtime и экспериментальный wire codec.
+участник корневого workspace. Содержит std-only Stream/Manager без I/O, экспериментальный wire codec и
+опциональный `nats` runtime (async-nats/Tokio). Все коннекторы и обе стороны
+используют одну библиотеку и контракт.
 
-`src/` — состояния, кредит, очереди и codec; `tests/` — contract/fixture/wire
+`src/` — состояния, кредит, агрегатные бюджеты, multi-peer routing, очереди и codec; `tests/` — contract/fixture/wire
 проверки; `examples/` — пример в памяти. [Контракт движка](../docs/stream-engine.md)
 и [wire формат](../docs/wire.md) находятся в общей документации;
 [fixtures/vectors](tests/fixtures/README.md) — рядом с тестами.
@@ -19,8 +20,14 @@ python3 testbench/run.py check
 
 Последняя команда — основная проверка ядра вместе с настоящим транспортом.
 Клиентские приложения принадлежат [clients/](../clients/README.md),
-экспериментальный NATS runtime/runner — [testbench/](../testbench/README.md).
-Стабильный публичный wire, production node и FFI остаются будущей работой.
+контейнерный runner и сценарии — [testbench/](../testbench/README.md).
+NatsNode находится в библиотеке Core; [TCP relay](../connectors/tcp/README.md)
+использует его как embedding host.
+По умолчанию crate не имеет внешних зависимостей. Feature `nats` включает
+reusable NatsNode с явно заданными peer/session routes и TLS-first credentials.
+[Контракт Manager/NatsNode](../docs/stream-engine.md#менеджер-множества-потоков)
+описывает admission, планирование и границы памяти.
+Стабильный wire, динамическая идентификация и FFI остаются будущей работой.
 Общие правила: [структура репозитория](../docs/repository.md).
 
 [Текущая архитектура и схемы](../docs/architecture.md),

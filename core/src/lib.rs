@@ -4,9 +4,13 @@
 //! owns stream state and byte credit. Frames are an experimental internal API,
 //! not a stable wire format. Polling data does not acknowledge consumption.
 
+mod manager;
+#[cfg(feature = "nats")]
+pub mod nats;
 mod stream;
 mod types;
 pub mod wire;
 
+pub use manager::*;
 pub use stream::Stream;
 pub use types::*;

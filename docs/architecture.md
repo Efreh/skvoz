@@ -5,49 +5,57 @@
 
 ## Компоненты и границы
 
-`skvoz-core` — библиотека Rust с движком одного потока и экспериментальным
-codec. Движок не выполняет I/O и не выбирает async runtime. Он отвечает за
-состояния, порядок байтов, кредит, ограниченные очереди и закрытие.
+`skvoz-core` — одна универсальная Rust-библиотека для любых коннекторов,
+client и server приложений. Stream/Manager/codec не выполняют I/O;
+опциональный feature `nats` добавляет reusable NatsNode на Tokio/async-nats.
+Роль приложения не меняет реализацию или контракт ядра.
 
-`skvoz-testbench` соединяет два экспериментальных `Node` через Core NATS.
-Оба Node и их буферные коннекторы работают в одном процессе; брокер —
-отдельный контейнер. Это текущая топология стенда:
+Manager привязывает поток к `(PeerId, stream_id)`, резервирует полное объявленное
+receive window при admission, ограничивает live/closing slots и pending DATA
+bytes глобально и по peer. Receive payload buffer выделяется только при DATA;
+у idle streams capacity равен нулю. Драйвер обслуживает ready queues и индекс
+opening deadlines; нормальный turn не сканирует все idle streams.
+
+В many-client стенде все client/server приложения находятся в одном процессе,
+а брокер — в отдельном контейнере. В развёртывании приложения могут находиться
+на разных машинах. Server application со встроенным Core и NATS могут делить
+одну машину и её ресурсы. Стенд не доказывает capacity такой машины.
 
 ```mermaid
 flowchart TB
-    subgraph bench["Один процесс skvoz-testbench"]
-        subgraph userSide["Пользователь"]
-            user["Буферный коннектор"]
-            userNode["Node + таблица Stream<br/>skvoz-core"]
-            user <-->|"операции / события"| userNode
-        end
-        subgraph consumerSide["Потребитель"]
-            consumer["Буферный коннектор"]
-            consumerNode["Node + таблица Stream<br/>skvoz-core"]
-            consumer <-->|"операции / события"| consumerNode
-        end
+    subgraph apps["Один процесс нагрузочного стенда"]
+        clients["Client applications 1..N<br/>буферные коннекторы"]
+        clientNodes["NatsNode на каждого клиента<br/>Manager + Streams + codec"]
+        serverApp["Server application<br/>буферный коннектор"]
+        serverNode["Тот же NatsNode<br/>Manager + Streams + codec"]
+        clients <-->|"API / events"| clientNodes
+        serverApp <-->|"API / events"| serverNode
     end
-    nats["Core NATS<br/>отдельный Docker-контейнер"]
-    userNode <-->|"TLS-first, publish / subscribe"| nats
-    consumerNode <-->|"TLS-first, publish / subscribe"| nats
+    broker["Core NATS<br/>отдельный контейнер"]
+    clientNodes <-->|"TLS-first / publish / subscribe"| broker
+    serverNode <-->|"TLS-first / publish / subscribe"| broker
 ```
 
-Роли публикуют фреймы друг другу через разные inbox subjects:
+Каждый NatsNode владеет одним NATS client и одной подпиской, без отдельного
+соединения или задачи на logical stream. Host задаёт явный список доверенных
+peer identities и session generations. Subjects имеют вид
+`<namespace>.<recipient>.<recipient-session>.<sender>.<sender-session>`.
+NatsNode подписывается на свой recipient/session с wildcard sender и проверяет
+точную зарегистрированную пару sender/session до передачи в Manager.
+Credentials/ACL брокера должны связывать sender identity с разрешёнными
+recipient subjects; session token сам по себе не является аутентификацией.
 
-| Роль Node | Публикация | Подписка |
-| --- | --- | --- |
-| Пользователь | Inbox потребителя | Inbox пользователя |
-| Потребитель | Inbox пользователя | Inbox потребителя |
+API коннектора синхронно ставит bounded work. `turn(wait)` кодирует и публикует
+не больше настроенного числа фреймов, принимает bounded input batch и подаёт
+монотонное время менеджеру. Flush выполняется на batch, а не на каждый send.
+Будущий вызов turn обязателен для передачи enqueue операций. `flush_pending`
+передаёт bounded output batch без чтения inbound. Поллинг событий также обязан
+продолжаться, чтобы освободить terminal entries.
 
-Каждый Node владеет одним NATS client, одной подпиской и таблицей потоков.
-Потоки мультиплексируются поверх этих соединений. Драйвер кодирует исходящие
-фреймы, публикует их по порядку, декодирует входящие и передаёт их нужному
-`Stream`. Он также подаёт движкам монотонное время и обрабатывает потерю
-транспорта. Все операции одного `Stream` требуют эксклюзивного mutable доступа.
-
-Буферный коннектор в стенде создаёт и потребляет данные. Будущий внешний
-коннектор будет владеть сокетом или другим I/O; устройство ядра не требует
-знания HTTP, SOCKS или платформенного API этого коннектора.
+`connectors/tcp` владеет одним сокетом и выдаваемыми Core буферами. Реальный
+TCP пример создаёт два выделенных NatsNode того же Core, локальный requester
+и удалённый target. Он проверяет bytes/FIN/ответ после EOF. Для many-socket proxy
+нужен connector dispatcher; текущий relay не является таким proxy.
 
 ## Открытие и возврат кредита
 
@@ -58,9 +66,9 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant A as Коннектор A
-    participant NA as Node A / Stream
+    participant NA as NatsNode A / Manager
     participant N as Core NATS
-    participant NB as Node B / Stream
+    participant NB as NatsNode B / Manager
     participant B as Коннектор B
     A->>NA: open(metadata)
     NA->>N: OPEN с лимитами приёма A
@@ -71,8 +79,9 @@ sequenceDiagram
     N->>NA: ACCEPT
     NA-->>A: Opened
     A->>NA: send(bytes)
-    NA->>N: DATA(offset, bytes)
     NA-->>A: Accepted(n)
+    Note over NA: Последующий turn отправляет очередь
+    NA->>N: DATA(offset, bytes)
     N->>NB: DATA
     NB-->>B: Data(offset, bytes)
     Note over NB,B: Извлечение Data не возвращает кредит
@@ -97,7 +106,7 @@ sequenceDiagram
 
 ## Решение об отправке
 
-Схема ниже описывает `Stream.send` после открытия потока. В ней показаны
+Схема ниже описывает `Manager.send` поверх `Stream.send` после открытия потока. В ней показаны
 условия частичной отправки, backpressure и ошибки API.
 
 ```mermaid
@@ -106,9 +115,9 @@ flowchart TD
     state -->|"нет"| error["InvalidState"]
     state -->|"да"| empty{"Буфер пуст?"}
     empty -->|"да"| zero["Accepted(0)"]
-    empty -->|"нет"| room{"Есть кредит<br/>и место в DATA-очереди?"}
+    empty -->|"нет"| room{"Есть кредит, место в DATA-очереди<br/>и peer/global send budget?"}
     room -->|"нет"| blocked["WouldBlock<br/>буфер остаётся у коннектора"]
-    room -->|"да"| size["n = минимум размера буфера,<br/>local/peer max_frame и кредита"]
+    room -->|"да"| size["n = минимум размера буфера,<br/>local/peer max_frame, кредита<br/>и остатка send budget"]
     size --> offset{"offset + n помещается в u64?"}
     offset -->|"нет"| overflow["OffsetExhausted<br/>состояние не меняется"]
     offset -->|"да"| queue["Поставить DATA в очередь<br/>и зарезервировать n байт кредита"]
@@ -126,7 +135,10 @@ flowchart TD
 в том числе ответ после EOF запроса.
 
 Нормальное завершение требует обоих EOF, передачи локального FIN драйверу и
-потребления всех входящих байтов. Ошибка протокола, отмена, opening timeout или
+потребления всех входящих байтов. Manager удаляет terminal entry и освобождает
+receive reservation только после выдачи всех terminal frames/events. Числовой
+ID в той же peer session повторно не используется; новые monotonic IDs могут
+занять освобождённые slots. Ошибка протокола, отмена, opening timeout или
 потеря транспорта закрывают поток аварийно и освобождают внутренние очереди.
 Ранее переданные вызывающему буферы остаются у вызывающего.
 [Диаграмма состояний и события](stream-engine.md) описывают эти переходы.
@@ -137,18 +149,34 @@ flowchart TD
 
 ## Изоляция и пределы реализации
 
-Runner выдаёт двум ролям разные временные credentials. Каждая роль публикует
-только в inbox peer и подписывается на свой inbox внутри namespace запуска.
-CA, ключи и пароли создаются заново; NATS принимает TLS-first соединения.
-Подробности запуска: [первый запуск](getting-started.md).
+Runner выдаёт раздельные временные credentials каждой стороне и каждому
+клиенту. CA, ключи и пароли создаются заново; NATS принимает TLS-first соединения.
+Подробности: [первый запуск](getting-started.md).
 
-Эта схема не реализует произвольное discovery, production identity,
-переиспользование закрытых stream slots, ротацию credentials, сквозное шифрование
-или активный liveness/resumption. Потеря последней публикации при формально
-живом транспорте требует отдельного механизма обнаружения. Границы очередей
-не устанавливают полный предел RSS процесса и не являются измерением WAN,
-пропускной способности или справедливости планирования.
+Round-robin выдаёт один frame на ready peer, вращая streams внутри peer.
+Ограниченные send budgets защищают admission/очереди; frame fairness не является
+byte fairness или гарантией p99 latency. Полная receive reservation сохраняется
+до terminal cleanup, включая выданные коннектору непотреблённые данные. Малое
+окно экономит обещанный receive budget, но может ограничить throughput при RTT.
 
-Исходники: [Stream](../core/src/stream.rs), [типы](../core/src/types.rs),
-[codec](../core/src/wire.rs), [Node](../testbench/src/node.rs),
-[сценарии стенда](../testbench/src/scenarios.rs).
+Disconnect/SlowConsumer/server/client error навсегда защёлкивает отказ NatsNode.
+Следующий owner API/turn/poll применяет transport_lost; восстановление соединения
+async-nats не восстанавливает потоки. `peer_lost` закрывает только заданного peer.
+Отмена turn/flush_pending при передаче output защёлкивает ClientError, поскольку
+извлечённый frame нельзя безопасно вернуть в ordered очередь. Следующий owner
+API/poll закрывает node; idle input wait можно отменять без этого отказа.
+Статические routes не обновляются во время работы: смена session generation
+клиента требует пересоздания/перенастройки принимающего node. Старые recipient
+subjects не доставляются новой subscription; stale sender session игнорируется.
+Автоматическое restart/rejoin, discovery и resumption не реализованы.
+
+Потеря последней публикации при формально живом транспорте и тихий исчезнувший
+peer требуют отдельного liveness механизма. Логические byte counters не включают
+allocator overhead, externally retained frames/events, connector queues,
+NATS/TLS/runtime buffers или broker. RSS нагрузки включает все clients и server
+в одном процессе; ограничения контейнера относятся только к брокеру. Короткий
+loopback эксперимент не доказывает WAN, mobile или whole-machine SLA.
+
+Исходники: [Stream](../core/src/stream.rs), [Manager](../core/src/manager.rs),
+[codec](../core/src/wire.rs), [NatsNode](../core/src/nats.rs),
+[TCP relay](../connectors/tcp/src/lib.rs), [нагрузка](../testbench/src/mesh.rs).

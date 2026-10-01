@@ -15,11 +15,16 @@ skvoz/
 │   └── examples/
 ├── clients/            # каждый клиент — clients/<name>/
 │   └── README.md       # правила; реализации пока нет
+├── connectors/         # коннекторы внешнего I/O
+│   └── tcp/            # package skvoz-tcp, relay одного сокета
+│       ├── Cargo.toml
+│       ├── src/
+│       └── README.md
 ├── testbench/          # отдельный интеграционный стенд
 │   ├── Cargo.toml      # package skvoz-testbench
 │   ├── src/
 │   ├── tests/
-│   └── run.py          # контейнер NATS и check/demo
+│   └── run.py          # контейнер NATS и check/demo/tcp/load
 ├── docs/               # архитектура и контракты
 └── README.md           # вход в общий проект
 ```

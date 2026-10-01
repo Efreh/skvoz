@@ -296,7 +296,8 @@ fn tiny_received_frames_aggregate_within_the_byte_window() {
         let snapshot = b.snapshot();
         assert_eq!(snapshot.buffered_receive_bytes, offset as usize + 1);
         assert!(snapshot.receive_unconsumed_bytes <= 1024);
-        assert_eq!(snapshot.receive_capacity_bytes, 1024);
+        assert!(snapshot.receive_capacity_bytes <= 1024);
+        assert!(snapshot.receive_capacity_bytes >= snapshot.buffered_receive_bytes);
     }
     assert_eq!(b.poll_events(4).len(), 4);
     assert_eq!(b.snapshot().receive_unconsumed_bytes, 1024);

@@ -66,7 +66,7 @@ impl Stream {
             remote_finished_event: false,
             closed_event: None,
             lifecycle_events: VecDeque::new(),
-            received_bytes: VecDeque::with_capacity(config.receive_window as usize),
+            received_bytes: VecDeque::new(),
             outgoing_data: VecDeque::new(),
             handshake_frame: None,
             credit_frame: None,
@@ -286,6 +286,8 @@ impl Stream {
     pub fn transport_lost(&mut self) {
         if self.phase != Phase::Closed {
             self.abort(CloseReason::TransportLost, None);
+        } else {
+            self.terminal_frame = None;
         }
     }
 
@@ -330,6 +332,33 @@ impl Stream {
             events.push(event);
         }
         events
+    }
+
+    pub(crate) fn has_frames(&self) -> bool {
+        self.terminal_frame.is_some()
+            || self.handshake_frame.is_some()
+            || self.credit_frame.is_some()
+            || !self.outgoing_data.is_empty()
+            || self.fin_frame.is_some()
+    }
+
+    pub(crate) fn has_events(&self) -> bool {
+        !self.lifecycle_events.is_empty()
+            || self.writable_event
+            || !self.received_bytes.is_empty()
+            || self.remote_finished_event
+            || self.closed_event.is_some()
+    }
+
+    pub(crate) fn budget_blocked(&mut self) {
+        self.blocked = true;
+        self.writable_event = false;
+    }
+
+    pub(crate) fn budget_writable(&mut self) {
+        if self.can_send() {
+            self.writable_event = true;
+        }
     }
 
     fn apply_frame(&mut self, frame: &Frame) -> Result<(), ProtocolError> {
@@ -404,6 +433,14 @@ impl Stream {
                     .ok_or(ProtocolError::IncorrectOffset)?;
                 if next - self.consumed > self.config.receive_window as u64 {
                     return Err(ProtocolError::ReceiveWindowExceeded);
+                }
+                let required = self.received_bytes.len() + bytes.len();
+                if required > self.received_bytes.capacity() {
+                    let target = required
+                        .max(self.received_bytes.capacity().saturating_mul(2))
+                        .min(self.config.receive_window as usize);
+                    self.received_bytes
+                        .reserve_exact(target - self.received_bytes.len());
                 }
                 self.received_bytes.extend(bytes.iter().copied());
                 self.received = next;

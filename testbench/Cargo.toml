@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-testbench"
-version = "0.2.0"
+version = "1.0.0"
 description = "Experimental two-sided SKVOZ harness over real NATS"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,10 +11,15 @@ publish = false
 real-nats = []
 
 [dependencies]
-skvoz-core = { path = "../core" }
+skvoz-tcp = { path = "../connectors/tcp" }
+skvoz-core = { path = "../core", features = ["nats"] }
 async-nats = { version = "=0.50.0", default-features = false, features = ["ring"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+
+[[test]]
+name = "multi_owner"
+required-features = ["real-nats"]
 
 [[test]]
 name = "real_nats"

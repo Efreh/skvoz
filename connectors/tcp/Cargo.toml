@@ -1,0 +1,15 @@
+[package]
+name = "skvoz-tcp"
+version = "1.0.0"
+description = "Minimal TCP socket connector embedding universal SKVOZ Core"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+skvoz-core = { path = "../../core", features = ["nats"] }
+tokio = { version = "=1.53.1", features = ["net", "io-util", "time"] }
+
+[lints]
+workspace = true
