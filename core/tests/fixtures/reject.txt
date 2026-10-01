@@ -1,0 +1,10 @@
+OPEN A - => ok
+TRANSFER A B => open(8,4,-)
+EVENTS B 8 => incoming(-)
+REJECT B ff00 => ok
+TRANSFER B A => reject(ff00)
+STATE A => Closed
+STATE B => Closed
+EVENTS A 8 => rejected(ff00),closed(Rejected)
+EVENTS B 8 => closed(Rejected)
+EVENTS A 8 => -

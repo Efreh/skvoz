@@ -1,4 +1,14 @@
-.idea
+.idea/
+target/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.swp
+*~
 
 AGENTS.md
 **/.knowledge/
+.agents/
+.codex/
+.aws/

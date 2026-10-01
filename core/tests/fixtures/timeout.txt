@@ -1,0 +1,8 @@
+OPEN A - => ok
+TRANSFER A B => open(8,4,-)
+TICK A 9 => ok
+STATE A => Opening(Outgoing)
+TICK A 10 => ok
+STATE A => Closed
+EVENTS A 8 => closed(OpenTimeout)
+EVENTS A 8 => -

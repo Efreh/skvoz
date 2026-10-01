@@ -1,0 +1,11 @@
+[package]
+name = "skvoz-core"
+version = "0.2.0"
+description = "Deterministic, bounded byte-stream state engine for SKVOZ"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
