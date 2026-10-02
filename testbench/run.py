@@ -197,9 +197,12 @@ authorization {{
                 if args.mode == "check":
                     command(cargo + ["test", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra,
                         "--", "--test-threads=1", "--nocapture"], env=env)
+                    # The final Rust test restarts Docker without awaiting broker readiness.
+                    ready(monitor)
                     qualify_daemon(ROOT, directory, env, args)
                 elif args.mode == "daemon":
                     command(cargo + ["test", "-p", "skvoz-daemon", "--features", "real-nats", *extra, "--", "--test-threads=1", "--nocapture"], env=env)
+                    ready(monitor)
                     qualify_daemon(ROOT, directory, env, args)
                 elif args.mode == "qualify":
                     qualify(ROOT, directory, env, args)

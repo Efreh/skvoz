@@ -53,7 +53,9 @@ python3 testbench/run.py daemon --offline
 Нужны Linux/Ruby3.4+ помимо основных prerequisites. Runner строит release
 `skvoz-core-daemon`, запускает independent daemons и Python acceptor/Ruby/Python
 stdlib clients через тот же dedicated INFO → TLS broker. `check` также включает
-этот сценарий. Temporary ACL даёт одному device login только явно provisioned
+этот сценарий. После Rust-проверок runner повторно ждёт готовности брокера через
+`/healthz` (до 15 секунд), поскольку сценарии потери транспорта перезапускают NATS.
+Temporary ACL даёт одному device login только явно provisioned
 PeerId1/2; это не automatic ID allocation и не credential isolation между ними.
 
 [IPC contract](../docs/daemon-ipc.md) описывает finite profiles, watermark/credit,
