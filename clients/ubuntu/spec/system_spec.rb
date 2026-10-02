@@ -199,8 +199,9 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     fake.chmod(0o700)
     parent = UbuntuSystem::Application.new(@directory.join('crash'), @server, daemon: fake.to_s, wait_ready: false)
     @applications << parent
+    runtime_base = ENV.fetch('XDG_RUNTIME_DIR', Dir.tmpdir)
     runtime = wait_until do
-      Dir.glob(File.join(Dir.tmpdir, "skvoz-#{Process.uid}", "*", "owner.json")).find do |record|
+      Dir.glob(File.join(runtime_base, "skvoz-#{Process.uid}", "*", "owner.json")).find do |record|
         value = JSON.parse(File.read(record))
         value['parent'] == parent.process.pid && value['daemon'] && File.exist?(File.join(File.dirname(record), 'profile.json'))
       end
