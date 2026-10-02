@@ -148,7 +148,6 @@ impl NatsNode {
             )
             .name(config.name.clone())
             .require_tls(true)
-            .tls_first()
             .add_root_certificates(config.ca.clone())
             .connection_timeout(config.io_timeout)
             .ping_interval(Duration::from_millis(100))

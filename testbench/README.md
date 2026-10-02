@@ -20,7 +20,7 @@ runner вычисляет общий корень по своему пути. Т
 Python 3.9+, доступ к Docker daemon и OpenSSL. Для cached dependencies/image
 добавьте `--offline`; Compose и host NATS не нужны.
 
-Runner поднимает отдельный pinned NATS с TLS-first/временными credentials,
+Runner поднимает отдельный pinned NATS с INFO → TLS/временными credentials,
 ждёт готовности и удаляет свои контейнер/сертификаты после завершения,
 включая failed tests. Режим `check` включает fmt/clippy и реальные проверки;
 режим `demo` запускает двусторонний обмен. `tcp` проверяет реальные сокеты
@@ -52,7 +52,7 @@ python3 testbench/run.py daemon --offline
 
 Нужны Linux/Ruby3.4+ помимо основных prerequisites. Runner строит release
 `skvoz-core-daemon`, запускает independent daemons и Python acceptor/Ruby/Python
-stdlib clients через тот же dedicated TLS-first broker. `check` также включает
+stdlib clients через тот же dedicated INFO → TLS broker. `check` также включает
 этот сценарий. Temporary ACL даёт одному device login только явно provisioned
 PeerId1/2; это не automatic ID allocation и не credential isolation между ними.
 

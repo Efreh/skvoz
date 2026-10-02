@@ -209,7 +209,7 @@ ID в той же peer session повторно не используется; �
 
 Runner выдаёт раздельные временные credentials обычным runtime/TCP участникам.
 Daemon qualification также проверяет два provisioned device PeerId с общим login
-и явно ограниченным ACL набором; credential не изолирует эти две identities друг от друга. CA, ключи и пароли создаются заново; NATS принимает TLS-first соединения.
+и явно ограниченным ACL набором; credential не изолирует эти две identities друг от друга. CA, ключи и пароли создаются заново; NATS принимает INFO → TLS соединения.
 Подробности: [первый запуск](getting-started.md).
 
 Round-robin выдаёт один frame на ready peer, вращая streams внутри peer.

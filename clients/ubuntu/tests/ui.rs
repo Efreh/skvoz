@@ -37,6 +37,16 @@ fn native_window_settings_and_backend_error() {
     adw::init().expect("Adwaita initialization failed");
     let directory = std::env::temp_dir().join(format!("skvoz-ui-{}", token().unwrap()));
     let settings = Arc::new(Mutex::new(Settings::open(directory.clone()).unwrap()));
+    {
+        let mut settings = settings.lock().unwrap();
+        let mut value = settings.value.clone();
+        value.host = "localhost".into();
+        value.username = "shared".into();
+        value
+            .remember_password("localhost", 4222, "shared", "saved-test-password".into())
+            .unwrap();
+        settings.save(value).unwrap();
+    }
     let app = adw::Application::builder()
         .application_id("org.skvoz.Qualification")
         .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
@@ -57,6 +67,11 @@ fn native_window_settings_and_backend_error() {
             .block_on(run(engine, rx, status_tx));
     });
     let view = View::build(&app, settings.clone(), tx.clone()).unwrap();
+    assert_eq!(view.password.text(), "saved-test-password");
+    view.port.set_text("4223");
+    assert!(view.password.text().is_empty());
+    view.port.set_text("4222");
+    assert_eq!(view.password.text(), "saved-test-password");
     view.window.present();
     tick(Duration::from_millis(400));
     assert_eq!(view.status.text(), "Отключено");
@@ -107,7 +122,7 @@ fn native_window_settings_and_backend_error() {
     assert_eq!(view.state.get(), "error");
     assert!(view.error.is_visible());
     assert!(view.error.text().contains("IP-адрес"));
-    assert!(view.password.text().is_empty());
+    assert_eq!(view.password.text(), "process-test-password");
     tick(Duration::from_millis(400));
     if let Some(path) = std::env::var_os("SKVOZ_UI_XWD") {
         assert!(

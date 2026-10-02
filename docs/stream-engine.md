@@ -196,7 +196,7 @@ Feature `nats` экспортирует `nats::NatsNode`, `NatsConfig`, `PeerRou
 `FailureKind`. Host задаёт url/CA/credentials, namespace, local identity/session,
 точные peer/session routes, queue capacities и per-turn limits. Для каждого
 lifetime требуется новая generation. Routing envelope описан в [wire](wire.md).
-CA-проверка, TLS-first и аутентификация обязательны; broker ACL должен разрешать
+CA-проверка, TLS и аутентификация обязательны; порядок INFO/TLS задаёт профиль runtime; broker ACL должен разрешать
 publish только с credential-bound sender и нужными recipient identities.
 
 Subscription/client capacities — 1…65 536 сообщений/commands; input/output

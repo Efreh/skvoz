@@ -171,7 +171,7 @@ module Skvoz
         @nats = @core = nil
         renew(initial: true) unless @tls.valid?
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
-        validate_binary(@config['core_binary'], 'skvoz-core-daemon 1.2.0 ipc=1')
+        validate_binary(@config['core_binary'], 'skvoz-core-daemon 1.3.0 ipc=1')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         validate_nats(@nats_path)
@@ -228,7 +228,7 @@ module Skvoz
             raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
             candidate, id = @state.enroll(login, token)
             apply(candidate) if candidate
-            { v: 1, namespace: @config['namespace'], peer_id: id, daemon: '1.2.0', ipc: 1 }
+            { v: 1, namespace: @config['namespace'], peer_id: id, daemon: '1.3.0', ipc: 1 }
           end
         end.start(@task)
       end
@@ -272,14 +272,7 @@ module Skvoz
       def probe(login: State::INTERNAL, password: @state.value.fetch('internal_password'), serial: nil)
         Async::Task.current.with_timeout(2) do
           socket = TCPSocket.new('127.0.0.1', @config['port'])
-          context = OpenSSL::SSL::SSLContext.new
-          context.set_params(verify_mode: OpenSSL::SSL::VERIFY_PEER)
-          context.ca_file = @state.value.fetch('tls')['ca'] if @state.value.fetch('tls')['ca']
-          tls = OpenSSL::SSL::SSLSocket.new(socket, context)
-          tls.sync_close = true
-          tls.hostname = @config['address']
-          tls.connect
-          tls.post_connection_check(@config['address'])
+          tls = BrokerTLS.connect(socket, identity: @config['address'], ca: @state.value.fetch('tls')['ca'])
           raise Error, 'NATS certificate apply unconfirmed' if serial && tls.peer_cert.serial.to_s != serial
           tls.write('CONNECT ' + JSON.generate(user: login, pass: password, verbose: false, protocol: 1) + "\r\nPING\r\n")
           loop do

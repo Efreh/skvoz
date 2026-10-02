@@ -20,6 +20,8 @@ pub struct Preferences {
     pub socks_port: u16,
     pub ca_file: String,
     pub devices: BTreeMap<String, String>,
+    #[serde(default)]
+    pub passwords: BTreeMap<String, String>,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -32,7 +34,53 @@ impl Default for Preferences {
             socks_port: 1080,
             ca_file: String::new(),
             devices: BTreeMap::new(),
+            passwords: BTreeMap::new(),
         }
+    }
+}
+
+impl Preferences {
+    pub fn saved_password(&self, host: &str, port: u16, user: &str) -> String {
+        let Ok(host) = host_name(host) else {
+            return String::new();
+        };
+        let Ok(key) = serde_json::to_string(&(host, port, user)) else {
+            return String::new();
+        };
+        self.passwords.get(&key).cloned().unwrap_or_default()
+    }
+    pub fn remember_password(
+        &mut self,
+        host: &str,
+        port: u16,
+        user: &str,
+        password: String,
+    ) -> Result<()> {
+        let key = serde_json::to_string(&(host_name(host)?, port, user))
+            .map_err(|_| Error("unsafe_settings"))?;
+        if !login(user) || port == 0 || !(12..=72).contains(&password.len()) {
+            return Err(Error("invalid_password"));
+        }
+        if !self.passwords.contains_key(&key) && self.passwords.len() >= 64 {
+            return Err(Error("device_limit"));
+        }
+        self.passwords.insert(key, password);
+        Ok(())
+    }
+    fn valid_passwords(&self) -> bool {
+        self.passwords.len() <= 64
+            && self.passwords.iter().all(|(key, password)| {
+                if !(12..=72).contains(&password.len()) {
+                    return false;
+                }
+                let Ok((host, port, user)) = serde_json::from_str::<(String, u16, String)>(key)
+                else {
+                    return false;
+                };
+                port != 0
+                    && login(&user)
+                    && host_name(&host).is_ok_and(|normalized| normalized == host)
+            })
     }
 }
 
@@ -219,6 +267,7 @@ impl Settings {
         };
         if value.v != 1
             || value.port == 0
+            || !value.valid_passwords()
             || value.devices.len() > 64
             || value.devices.values().any(|token| !valid_token(token))
             || value.host.len() > 253
@@ -243,6 +292,9 @@ impl Settings {
     }
     pub fn save(&mut self, candidate: Preferences) -> Result<()> {
         ports(candidate.http_port, candidate.socks_port)?;
+        if !candidate.valid_passwords() {
+            return Err(Error("unsafe_settings"));
+        }
         let bytes = serde_json::to_vec(&candidate).map_err(|_| Error("unsafe_settings"))?;
         if bytes.len() > 32768 {
             return Err(Error("unsafe_settings"));
@@ -302,20 +354,79 @@ mod tests {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
-    fn token_lock_persistence_and_secret_exclusion() {
+    fn legacy_settings_and_private_secret_validation() {
+        let directory = std::env::temp_dir().join(format!("skvoz-settings-{}", token().unwrap()));
+        let settings = Settings::open(directory.clone()).unwrap();
+        let mut legacy = serde_json::to_value(&settings.value).unwrap();
+        legacy.as_object_mut().unwrap().remove("passwords");
+        write_private(
+            &directory.join("settings.json"),
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        drop(settings);
+        let mut settings = Settings::open(directory.clone()).unwrap();
+        assert!(settings.value.passwords.is_empty());
+        let mut candidate = settings.value.clone();
+        candidate
+            .passwords
+            .insert("invalid-key".into(), "process-test-password".into());
+        assert!(settings.save(candidate).is_err());
+        drop(settings);
+        fs::set_permissions(
+            directory.join("settings.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(Settings::open(directory.clone()).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn token_lock_password_persistence_and_endpoint_isolation() {
         let directory = std::env::temp_dir().join(format!("skvoz-settings-{}", token().unwrap()));
         let mut settings = Settings::open(directory.clone()).unwrap();
         let id = settings.device("localhost", 4222, "shared").unwrap();
         assert!(Settings::open(directory.clone()).is_err());
-        assert!(
-            !fs::read_to_string(directory.join("settings.json"))
+        let mut value = settings.value.clone();
+        value
+            .remember_password("LOCALHOST.", 4222, "shared", "process-test-password".into())
+            .unwrap();
+        settings.save(value).unwrap();
+        assert_eq!(
+            fs::metadata(directory.join("settings.json"))
                 .unwrap()
-                .contains("password")
+                .mode()
+                & 0o777,
+            0o600
         );
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
         drop(settings);
         let mut settings = Settings::open(directory.clone()).unwrap();
         assert_eq!(settings.device("localhost", 4222, "shared").unwrap(), id);
+        assert_eq!(
+            settings.value.saved_password("LOCALHOST.", 4222, "shared"),
+            "process-test-password"
+        );
+        assert!(
+            settings
+                .value
+                .saved_password("other.example", 4222, "shared")
+                .is_empty()
+        );
+        assert!(
+            settings
+                .value
+                .saved_password("localhost", 4223, "shared")
+                .is_empty()
+        );
+        assert!(
+            settings
+                .value
+                .saved_password("localhost", 4222, "other")
+                .is_empty()
+        );
         drop(settings);
         fs::remove_dir_all(directory).unwrap();
     }

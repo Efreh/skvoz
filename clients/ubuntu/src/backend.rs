@@ -85,6 +85,7 @@ impl Engine {
         preferences.host = host.clone();
         preferences.port = port;
         preferences.username = user.to_owned();
+        preferences.remember_password(&host, port, user, password.clone())?;
         settings.save(preferences)?;
         Ok(Credentials {
             host,

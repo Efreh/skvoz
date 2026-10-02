@@ -474,7 +474,6 @@ impl NatsRuntime {
             self.config.authentication.password.clone(),
         )
         .require_tls(true)
-        .tls_first()
         .connection_timeout(self.config.io_timeout)
         .max_reconnects(1)
         .ignore_discovered_servers()

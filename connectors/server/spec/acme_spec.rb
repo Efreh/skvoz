@@ -3,6 +3,29 @@ require_relative 'spec_helper'
 require_relative 'support/system'
 require 'net/http'
 
+RSpec.describe 'ACME certificate request contract' do
+  ['203.0.113.9', '2001:db8::9', 'server.example.org'].each do |identity|
+    it "preserves a signed SAN for #{identity} without an IP Common Name" do
+      key = OpenSSL::PKey::EC.generate('prime256v1')
+      issuer = Skvoz::Server::CertificateIssuer.new({}, nil)
+      request = issuer.send(:certificate_request, identity, key).csr
+      expect(request.verify(key)).to be(true)
+      names = request.subject.to_a.select { |name, _value, _type| name == 'CN' }.map { |_name, value, _type| value }
+      if identity == 'server.example.org'
+        expect(names).to eq([identity])
+      else
+        expect(names).to be_empty
+      end
+      extension_request = request.attributes.find { |attribute| attribute.oid == 'extReq' }.value
+      extensions = extension_request.value.first.value
+      san = extensions.map { |extension| OpenSSL::X509::Extension.new(extension.to_der) }.find { |extension| extension.oid == 'subjectAltName' }
+      values = OpenSSL::ASN1.decode(OpenSSL::ASN1.decode(san.to_der).value.last.value).value
+      expected = identity == 'server.example.org' ? [2, identity] : [7, IPAddr.new(identity).hton]
+      expect(values.map { |value| [value.tag, value.value] }).to eq([expected])
+    end
+  end
+end
+
 RSpec.describe 'Automatic ACME certificate lifecycle', integration: true do
   include ServerSystem
 

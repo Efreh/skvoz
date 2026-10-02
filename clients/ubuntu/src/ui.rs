@@ -123,7 +123,40 @@ impl View {
             .build();
         let password = adw::PasswordEntryRow::builder()
             .title("Пароль NATS")
+            .text(value.saved_password(&value.host, value.port, &value.username))
             .build();
+        for row in [&host, &port, &username] {
+            let host = host.downgrade();
+            let port = port.downgrade();
+            let username = username.downgrade();
+            let password = password.downgrade();
+            let settings = Arc::downgrade(&settings);
+            row.connect_changed(move |_| {
+                let (Some(host), Some(port), Some(username), Some(password)) = (
+                    host.upgrade(),
+                    port.upgrade(),
+                    username.upgrade(),
+                    password.upgrade(),
+                ) else {
+                    return;
+                };
+                let Some(settings) = settings.upgrade() else {
+                    return;
+                };
+                let saved = settings
+                    .lock()
+                    .ok()
+                    .and_then(|settings| {
+                        crate::settings::port(&port.text(), false).ok().map(|port| {
+                            settings
+                                .value
+                                .saved_password(&host.text(), port, &username.text())
+                        })
+                    })
+                    .unwrap_or_default();
+                password.set_text(&saved);
+            });
+        }
         login.add(&host);
         login.add(&port);
         login.add(&username);
@@ -157,7 +190,7 @@ impl View {
         addresses.add(&socks);
         body.append(&addresses);
         body.append(&label(
-            "Пароль хранится только до отключения.\nИзменение системного прокси не требуется.",
+            "Пароль сохраняется на этом устройстве.\nИзменение системного прокси не требуется.",
             "dim-label",
         ));
         let clamp = adw::Clamp::builder()
@@ -200,11 +233,9 @@ impl View {
                 return;
             };
             if ["connecting", "connected", "reconnecting"].contains(&captured.state.get()) {
-                captured.password.set_text("");
                 let _ = captured.commands.try_send(Control::Disconnect);
             } else {
                 let password = captured.password.text().to_string();
-                captured.password.set_text("");
                 match crate::settings::port(&captured.port.text(), false) {
                     Ok(port) => {
                         captured.apply(&Status {

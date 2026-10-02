@@ -1,6 +1,6 @@
 # Core daemon и локальный IPC v1
 
-Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.2.0.
+Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.3.0.
 Он встраивает ту же [универсальную Core library/NatsRuntime](nats-runtime.md),
 которую можно использовать из Rust. Python/Ruby/другие host languages общаются
 через pathname Unix socket; отдельного client/server Core или native bindings нет.
@@ -18,7 +18,7 @@ python3 testbench/run.py daemon
 ```
 
 Runner запускает независимые release daemons, Python acceptor и Python/Ruby
-binary clients через pinned TLS-first NATS с временными CA/паролями/ACL. Нужны
+binary clients через pinned NATS с INFO → TLS и временными CA/паролями/ACL. Нужны
 Linux, Rust1.92+, Python3.9+, Ruby3.4+, Docker/OpenSSL. Для cached dependencies/image
 добавьте `--offline`. `check` включает этот же сценарий после остальных проверок.
 Dependencies и image digest закреплены в Cargo.lock и runner; IPCv1 отличается
@@ -326,8 +326,8 @@ queues; эти caller budgets не входят в daemon counters.
 
 ## Проверка сертификата при отдельном адресе подключения
 
-Демон 1.2.0 и Core 1.3.0 добавляют необязательный параметр профиля
-`tls_server_name`: доменное имя в ASCII или IP-адрес без скобок.
+Необязательный параметр профиля `tls_server_name` задаёт доменное имя в ASCII
+или IP-адрес без скобок.
 URL по-прежнему выбирает адрес подключения, а TLS проверяет явно заданное
 имя или IP-адрес в SAN сертификата с настроенными корнями доверия.
 Без этого параметра, как и раньше, проверяется имя из URL.
@@ -339,3 +339,13 @@ URL по-прежнему выбирает адрес подключения, а
 для защищённого подключения к NATS через loopback с проверкой публичного
 имени или IP-адреса сертификата. Подробности — в
 [контракте доверия runtime](nats-runtime.md).
+
+## Порядок TLS handshake
+
+Демон 1.3.0 (Core 3.0.0, IPC по-прежнему v1) использует `INFO → TLS → CONNECT`
+без дополнительного поля профиля. Брокер должен отправлять приветствие NATS
+перед TLS (`tls.handshake_first: false`). Проверка сертификата обязательна;
+учётные данные и данные потоков отправляются только после TLS. Порядок применяется
+ко всем соединениям runtime, включая join, transport lanes и восстановление.
+Старый TLS-first брокер требует обновления конфигурации вместе с демоном;
+подробности — в [контракте runtime](nats-runtime.md).

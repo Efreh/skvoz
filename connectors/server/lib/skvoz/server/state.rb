@@ -180,7 +180,7 @@ module Skvoz
           tls {
             cert_file: #{JSON.generate(tls.fetch('certificate'))}
             key_file: #{JSON.generate(tls.fetch('key'))}
-            handshake_first: true
+            handshake_first: false
           }
           authorization { users: #{JSON.generate(users)} }
         CONF

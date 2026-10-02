@@ -29,14 +29,7 @@ module Skvoz
       def start(task)
         task.with_timeout(5) do
           raw = TCPSocket.new('127.0.0.1', @config['port'])
-          context = OpenSSL::SSL::SSLContext.new
-          context.set_params(verify_mode: OpenSSL::SSL::VERIFY_PEER)
-          context.ca_file = @state.value.fetch('tls')['ca'] if @state.value.fetch('tls')['ca']
-          @socket = OpenSSL::SSL::SSLSocket.new(raw, context)
-          @socket.sync_close = true
-          @socket.hostname = @config['address']
-          @socket.connect
-          @socket.post_connection_check(@config['address'])
+          @socket = BrokerTLS.connect(raw, identity: @config['address'], ca: @state.value.fetch('tls')['ca'])
           send_bytes('CONNECT ' + JSON.generate(user: State::INTERNAL, pass: @state.value.fetch('internal_password'), verbose: false, protocol: 1) + "\r\nSUB skvoz.enroll.v1.* 1\r\nPING\r\n")
           loop do
             line = @socket.gets("\r\n", 4096)

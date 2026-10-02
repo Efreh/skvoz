@@ -118,7 +118,13 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     expect(Timeout.timeout(10) { socket.read }).to eq('after-fin:6vpi')
     socket.close
     id = first.ready['peer_id']; first.close
-    expect(application('one').ready['peer_id']).to eq(id)
+    restored = application('one', password: nil)
+    expect(restored.ready['peer_id']).to eq(id)
+    expect(curl(restored, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+    settings = restored.directory.join('settings.json')
+    expect(settings.stat.mode & 0o777).to eq(0o600)
+    expect(restored.directory.stat.mode & 0o777).to eq(0o700)
+    expect(JSON.parse(settings.read).fetch('passwords').values).to include('process-test-password')
   end
 
   it 'preserves binary half-close with slow consumers and isolates a tiny event budget' do
@@ -195,7 +201,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
       listener.close
     end
     fake = @directory.join('delayed-core')
-    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-core-daemon 1.2.0 ipc=1'; else exec sleep 60; fi\n")
+    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-core-daemon 1.3.0 ipc=1'; else exec sleep 60; fi\n")
     fake.chmod(0o700)
     parent = UbuntuSystem::Application.new(@directory.join('crash'), @server, daemon: fake.to_s, wait_ready: false)
     @applications << parent

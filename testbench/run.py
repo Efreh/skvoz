@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run SKVOZ checks/demo with one disposable, authenticated TLS-first NATS."""
+"""Run SKVOZ checks/demo with one disposable, authenticated INFO-before-TLS NATS."""
 
 import argparse
 import json
@@ -144,7 +144,7 @@ tls {{
   cert_file: "/bench/server.pem"
   key_file: "/bench/server.key"
   ca_file: "/bench/ca.pem"
-  handshake_first: true
+  handshake_first: false
   timeout: 2
 }}
 authorization {{
@@ -183,7 +183,7 @@ authorization {{
                 ready(monitor)
                 with urllib.request.urlopen(monitor + "/varz", timeout=2) as response:
                     version = json.load(response)["version"]
-                print(f"Real NATS {version}: TLS-first, provisioned identities, loopback port {port}", flush=True)
+                print(f"Real NATS {version}: INFO before TLS, provisioned identities, loopback port {port}", flush=True)
                 env = os.environ | {
                     "SKVOZ_NATS_URL": f"tls://127.0.0.1:{port}", "SKVOZ_NATS_CA": str(directory / "ca.pem"),
                     "SKVOZ_NATS_WRONG_CA": str(directory / "wrong-ca.pem"),

@@ -14,7 +14,7 @@ python3 testbench/run.py daemon
 ```
 
 Последняя команда квалифицирует независимые release daemons и Python/Ruby
-процессы через временный TLS-first NATS. Нужны Linux, Rust1.92+, Python3.9+,
+процессы через временный INFO → TLS NATS. Нужны Linux, Rust1.92+, Python3.9+,
 Ruby3.4+, Docker и OpenSSL. `--offline` использует заранее cached зависимости/image.
 
 Для собственного брокера provisioner выдаёт private profile; переменная

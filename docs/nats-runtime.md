@@ -40,15 +40,23 @@ Ok(NatsRuntime::connect(config, limits).await?)
 использует тот же runtime для приложений на других языках.
 
 `Trust::System` использует native trust store. `ManagedCa(PathBuf)` использует
-проверенный app-specific PEM bundle, без глобальной установки корня. TLS-first,
-проверка цепочки, срока и hostname сохраняются. Runtime принимает provisioned
+проверенный app-specific PEM bundle, без глобальной установки корня.
+Проверка цепочки, срока и hostname обязательна. Runtime принимает provisioned
 username/password; JWT/NKey credentials в этом профиле не поддерживаются.
 Передача профиля, хранение/отзыв credentials, первоначальное доверие и обновление
 сертификата — обязанности provisioner/host. TLS не выдаёт сертификаты и не
 позволяет доверять произвольному скачанному CA. URL с embedded userinfo запрещён;
 Debug конфигурации и typed errors не раскрывают endpoint или пароль.
 
-Core 1.3.0 добавляет `RuntimeConfig.tls_server_name: Option<String>`
+Core 3.0.0 использует единый порядок NATS `INFO → TLS → CONNECT` во всех
+соединениях: join, transport lanes и восстановление. Открытым остаётся только
+начальный `INFO` с метаданными брокера. Пароль и payload передаются после
+проверенного TLS; `require_tls(true)` запрещает открытый транспорт.
+Брокер должен отправлять `INFO` до TLS (`tls.handshake_first: false`).
+TLS-first брокеры с этим runtime несовместимы: обновляйте конфигурацию брокера
+вместе с Core. Переключателей и автоматического downgrade нет.
+
+Core 1.3.0 добавил `RuntimeConfig.tls_server_name: Option<String>`
 со значением `None` по умолчанию. Приложение может подключаться к
 `tls://127.0.0.1:4222`, проверяя явно заданный публичный IP-адрес или домен
 в SAN сертификата. Штатный `WebPkiServerVerifier` по-прежнему проверяет

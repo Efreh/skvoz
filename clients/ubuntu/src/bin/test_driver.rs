@@ -25,6 +25,16 @@ fn main() {
     preferences.http_port = config["http_port"].as_u64().unwrap() as u16;
     preferences.socks_port = config["socks_port"].as_u64().unwrap() as u16;
     preferences.ca_file = config["ca_file"].as_str().unwrap_or("").to_owned();
+    let password = config["password"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            preferences.saved_password(
+                config["host"].as_str().unwrap(),
+                config["port"].as_u64().unwrap() as u16,
+                config["username"].as_str().unwrap(),
+            )
+        });
     settings.save(preferences).unwrap();
     let budgets = Budgets {
         connections: config["budgets"]["max_connections"].as_u64().unwrap_or(62) as usize,
@@ -63,7 +73,6 @@ fn main() {
     let host = config["host"].as_str().unwrap().to_owned();
     let port = config["port"].as_u64().unwrap() as u16;
     let user = config["username"].as_str().unwrap().to_owned();
-    let password = config["password"].as_str().unwrap().to_owned();
     tx.blocking_send(Control::Connect {
         host,
         port,

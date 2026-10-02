@@ -6,15 +6,10 @@ RSpec.describe 'Authenticated device enrollment', integration: true do
   include ServerSystem
 
   def enrollment(server, login, password, token, payload: nil, reply_login: login, request_login: login, reply_target: nil)
-    context = OpenSSL::SSL::SSLContext.new
-    context.ca_file = server.directory.join('ca.pem').to_s
-    context.verify_mode = OpenSSL::SSL::VERIFY_PEER
     raw = TCPSocket.new('127.0.0.1', server.port)
-    tls = OpenSSL::SSL::SSLSocket.new(raw, context)
-    tls.sync_close = true
-    tls.hostname = 'localhost'
+    tls = nil
     Timeout.timeout(20) do
-      tls.connect; tls.post_connection_check('localhost')
+      tls = Skvoz::Server::BrokerTLS.connect(raw, identity: 'localhost', ca: server.directory.join('ca.pem').to_s)
       reply = "skvoz.enroll.reply.#{reply_login}.#{SecureRandom.hex(16)}"
       tls.write("CONNECT #{JSON.generate(user: login, pass: password, verbose: false)}\r\nSUB #{reply} 1\r\nPING\r\n")
       loop do

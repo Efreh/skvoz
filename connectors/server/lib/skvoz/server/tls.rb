@@ -8,6 +8,27 @@ require_relative 'process'
 
 module Skvoz
   module Server
+    module BrokerTLS
+      def self.connect(raw, identity:, ca:)
+        line = raw.gets("\r\n", 4096)
+        raise Error, 'Invalid NATS greeting' unless line && line.start_with?('INFO ') && line.end_with?("\r\n")
+        info = JSON.parse(line.delete_prefix('INFO '))
+        raise Error, 'NATS TLS required' unless info.is_a?(Hash) && info['tls_required'] == true
+        context = OpenSSL::SSL::SSLContext.new
+        context.ca_file = ca if ca
+        context.set_params(verify_mode: OpenSSL::SSL::VERIFY_PEER)
+        tls = OpenSSL::SSL::SSLSocket.new(raw, context)
+        tls.sync_close = true
+        tls.hostname = identity
+        tls.connect
+        tls.post_connection_check(identity)
+        tls
+      rescue StandardError
+        tls ? tls.close : raw.close
+        raise
+      end
+    end
+
     class AcmeTransport < Acme::Client
       private
 
@@ -167,7 +188,7 @@ module Skvoz
           server.remove(challenge.token)
         end
         leaf_key = OpenSSL::PKey::EC.generate('prime256v1')
-        csr = Acme::Client::CertificateRequest.new(names: [identity], private_key: leaf_key)
+        csr = certificate_request(identity, leaf_key)
         order.finalize(csr: csr)
         poll(deadline) { order.reload; order.status }
         generation = File.join(@state_dir, 'tls-' + SecureRandom.hex(8))
@@ -184,6 +205,16 @@ module Skvoz
       end
 
       private
+
+      def certificate_request(identity, key)
+        csr = Acme::Client::CertificateRequest.new(names: [identity], private_key: key)
+        literal = IPAddr.new(identity) rescue nil
+        if literal
+          csr.csr.subject = OpenSSL::X509::Name.new
+          csr.csr.sign(key, OpenSSL::Digest::SHA256.new)
+        end
+        csr
+      end
 
       def poll(deadline)
         loop do

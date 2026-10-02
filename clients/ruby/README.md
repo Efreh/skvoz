@@ -20,7 +20,7 @@ version/kinds/request IDs и ограничивает retained events4096 slots/
 Terminal `consume` может вернуть4: handle уже освобождён, acknowledgment не применён.
 
 Из корня репозитория полная независимая Ruby/Python qualification с временным
-TLS-first NATS и provisioned IDs:
+INFO → TLS NATS и provisioned IDs:
 
 ```sh
 python3 testbench/run.py daemon

@@ -43,7 +43,6 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             credentials.password.clone(),
         )
         .require_tls(true)
-        .tls_first()
         .connection_timeout(Duration::from_secs(5))
         .max_reconnects(0)
         .ignore_discovered_servers()

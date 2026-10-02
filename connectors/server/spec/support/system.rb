@@ -263,16 +263,10 @@ module ServerSystem
   end
 
   def credentials_work(server, username, password, subject: nil)
-    context = OpenSSL::SSL::SSLContext.new
-    context.ca_file = server.directory.join('ca.pem').to_s
-    context.verify_mode = OpenSSL::SSL::VERIFY_PEER
     raw = TCPSocket.new('127.0.0.1', server.port)
-    tls = OpenSSL::SSL::SSLSocket.new(raw, context)
-    tls.sync_close = true
-    tls.hostname = 'localhost'
+    tls = nil
     Timeout.timeout(5) do
-      tls.connect
-      tls.post_connection_check('localhost')
+      tls = Skvoz::Server::BrokerTLS.connect(raw, identity: 'localhost', ca: server.directory.join('ca.pem').to_s)
       request = "CONNECT #{JSON.generate(user: username, pass: password, verbose: false)}\r\n"
       request << "SUB #{subject} 1\r\n" if subject
       tls.write(request + "PING\r\n")

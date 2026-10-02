@@ -32,7 +32,7 @@ RSpec.describe 'Verified broker TLS identity', integration: true do
     config.write(<<~CONF)
       listen: "127.0.0.1:#{@port}"
       max_payload: 65588
-      tls { cert_file: #{JSON.generate(leaf.to_s)}, key_file: #{JSON.generate(@directory.join('server.key').to_s)}, handshake_first: true }
+      tls { cert_file: #{JSON.generate(leaf.to_s)}, key_file: #{JSON.generate(@directory.join('server.key').to_s)}, handshake_first: false }
       authorization { users: [{user: "tls-check", password: #{JSON.generate(@password)}}] }
     CONF
     config.chmod(0o600)

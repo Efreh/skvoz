@@ -34,7 +34,7 @@ Cargo-зависимости. Образ закреплён версией и di
 python3 testbench/run.py demo
 ```
 
-Runner создаёт NATS с TLS-first, временными сертификатами и отдельными правами
+Runner создаёт NATS с INFO → TLS, временными сертификатами и отдельными правами
 пользователя и потребителя. Порты выбираются динамически и публикуются только
 на loopback. Демонстрация передаёт по 32 768 байт в каждом направлении каждого
 из четырёх потоков; потоки инициируются обеими ролями.
@@ -203,7 +203,7 @@ cargo build --release -p skvoz-daemon --locked
 python3 testbench/run.py daemon
 ```
 
-`daemon` использует dedicated pinned TLS-first NATS, независимые release processes,
+`daemon` использует dedicated pinned INFO → TLS NATS, независимые release processes,
 Python incoming host, Ruby/Python stdlib clients и общий login для двух явно
 provisioned PeerId. Проверяет exact binary bytes/EOF/credits, owner/stale handles,
 nonreading owner isolation, private endpoint/config, TLS/auth negatives и real
