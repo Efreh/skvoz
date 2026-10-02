@@ -1,0 +1,114 @@
+name: Ubuntu client
+on:
+  push:
+    branches: [main, master]
+    tags: ['ubuntu-v*']
+    paths:
+      - 'clients/ubuntu/**'
+      - 'core/**'
+      - 'daemon/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'connectors/server/lib/**'
+      - 'connectors/server/bin/**'
+      - 'connectors/server/Gemfile'
+      - 'connectors/server/Gemfile.lock'
+      - 'connectors/server/spec/support/**'
+      - 'connectors/server/spec/spec_helper.rb'
+      - 'clients/ruby/**'
+      - '.github/workflows/ubuntu-client.yml'
+  pull_request:
+    paths:
+      - 'clients/ubuntu/**'
+      - 'core/**'
+      - 'daemon/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'connectors/server/lib/**'
+      - 'connectors/server/bin/**'
+      - 'connectors/server/Gemfile'
+      - 'connectors/server/Gemfile.lock'
+      - 'connectors/server/spec/support/**'
+      - 'connectors/server/spec/spec_helper.rb'
+      - 'clients/ruby/**'
+      - '.github/workflows/ubuntu-client.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ubuntu-client-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Native UI build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev pkg-config xvfb xauth dbus-x11 x11-apps adwaita-icon-theme librsvg2-common curl openssl
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.92.0
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: '4.0.7'
+          bundler: '4.0.22'
+          bundler-cache: true
+          working-directory: connectors/server
+      - name: Native Rust contracts and bundled Core
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p skvoz-ubuntu-client --all-targets --features qualification -- -D warnings
+          cargo build --release --locked -p skvoz-ubuntu-client --features qualification -p skvoz-daemon
+          cargo test --release --locked -p skvoz-ubuntu-client --lib
+          SKVOZ_UI_TEST=1 dbus-run-session -- xvfb-run -a cargo test --release --locked -p skvoz-ubuntu-client --test ui -- --nocapture
+      - name: Pinned real NATS for independent client process tests
+        run: |
+          image=nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
+          docker pull "$image"
+          container=$(docker create "$image")
+          trap 'docker rm -v "$container" >/dev/null' EXIT
+          mkdir -p "$RUNNER_TEMP/skvoz-bin"
+          docker cp "$container:/usr/local/bin/nats-server" "$RUNNER_TEMP/skvoz-bin/nats-server"
+      - name: Real HTTP, TLS CONNECT, SOCKS and recovery
+        env:
+          SKVOZ_INTEGRATION: '1'
+        run: |
+          export SKVOZ_TEST_CORE="$GITHUB_WORKSPACE/target/release/skvoz-core-daemon"
+          export SKVOZ_TEST_CLIENT="$GITHUB_WORKSPACE/target/release/skvoz-client-test-driver"
+          export SKVOZ_TEST_NATS="$RUNNER_TEMP/skvoz-bin/nats-server"
+          cd connectors/server
+          bundle exec rspec ../../clients/ubuntu/spec
+      - name: Build and install deb
+        run: |
+          cargo build --release --locked -p skvoz-ubuntu-client --bin skvoz-client
+          clients/ubuntu/packaging/build-deb.sh
+          sudo apt-get install -y ./clients/ubuntu/dist/skvoz-client_*_amd64.deb
+          /usr/bin/skvoz-client --version
+          /usr/lib/skvoz-client/skvoz-core-daemon --version
+          sudo dpkg -i clients/ubuntu/dist/skvoz-client_*_amd64.deb
+          sudo apt-get remove -y skvoz-client
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: skvoz-ubuntu-amd64
+          path: |
+            clients/ubuntu/dist/*.deb
+            clients/ubuntu/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish versioned client release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ubuntu-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          package=$(find clients/ubuntu/dist -name '*.deb' -print -quit)
+          version=$(dpkg-deb -f "$package" Version)
+          test "$GITHUB_REF_NAME" = "ubuntu-v$version"
+          printf '%s\n' 'SKVOZ: клиент Ubuntu 24.04+ amd64. Установите deb через apt; контрольная сумма SHA256 приложена.' > "$RUNNER_TEMP/release-notes.txt"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "SKVOZ Ubuntu $version" --notes-file "$RUNNER_TEMP/release-notes.txt"
+          fi
+          gh release upload "$GITHUB_REF_NAME" clients/ubuntu/dist/*.deb clients/ubuntu/dist/*.sha256 --clobber

@@ -87,8 +87,8 @@ SKVOZ выделяет из него более общую идею:
 реальный сокет через выделенный node. Один Core используется всеми коннекторами
 и обеими сторонами. Dynamic NatsRuntime реализует authenticated join/rejoin/liveness/recovery для новых
 streams. `daemon/` поставляет Linux executable той же library с private IPC v1,
-`clients/python` и `clients/ruby` — stdlib examples. Полноценные клиентские приложения,
-native FFI и мобильные адаптеры пока не реализованы. Точные текущие интерфейсы:
+`clients/python` и `clients/ruby` — stdlib examples. [Клиент Ubuntu](ubuntu-client.md) — нативное приложение Rust с HTTP/HTTPS CONNECT и SOCKS5 CONNECT.
+Native FFI, VPN и мобильные адаптеры пока не реализованы. Точные текущие интерфейсы:
 [stream-engine.md](stream-engine.md), [wire.md](wire.md), [NATS runtime](nats-runtime.md),
 [daemon/IPC v1](daemon-ipc.md).
 

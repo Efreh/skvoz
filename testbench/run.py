@@ -99,7 +99,7 @@ def main():
     extra = ["--locked"] + (["--offline"] if args.offline else [])
     if args.mode == "check":
         command(cargo + ["fmt", "--all", "--", "--check"])
-        command(cargo + ["clippy", "--workspace", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra, "--", "-D", "warnings"])
+        command(cargo + ["clippy", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra, "--", "-D", "warnings"])
     if args.mode in ("check", "daemon"):
         command(cargo + ["build", "--release", "-p", "skvoz-daemon", *extra])
     if args.mode == "qualify":
@@ -195,7 +195,7 @@ authorization {{
                 }
                 env.update({f"SKVOZ_NATS_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(mesh_passwords)})
                 if args.mode == "check":
-                    command(cargo + ["test", "--workspace", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra,
+                    command(cargo + ["test", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra,
                         "--", "--test-threads=1", "--nocapture"], env=env)
                     qualify_daemon(ROOT, directory, env, args)
                 elif args.mode == "daemon":

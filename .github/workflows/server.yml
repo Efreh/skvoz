@@ -3,7 +3,31 @@ on:
   push:
     branches: [main, master]
     tags: ['v*']
+    paths:
+      - 'core/**'
+      - 'daemon/**'
+      - 'connectors/server/**'
+      - 'connectors/tcp/**'
+      - 'testbench/**'
+      - 'clients/ruby/**'
+      - 'clients/ubuntu/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.dockerignore'
+      - '.github/workflows/server.yml'
   pull_request:
+    paths:
+      - 'core/**'
+      - 'daemon/**'
+      - 'connectors/server/**'
+      - 'connectors/tcp/**'
+      - 'testbench/**'
+      - 'clients/ruby/**'
+      - 'clients/ubuntu/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.dockerignore'
+      - '.github/workflows/server.yml'
   workflow_dispatch:
 permissions:
   contents: read

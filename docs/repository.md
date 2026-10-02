@@ -74,3 +74,5 @@ python3 testbench/run.py demo
 
 Сервер TCP со всеми компонентами, единый Dockerfile для локальной сборки и CI/GHCR:
 [серверный коннектор](server-connector.md).
+
+Нативный [клиент Ubuntu](ubuntu-client.md) входит в общую Cargo workspace и Cargo.lock, но собирается и проверяется отдельным workflow; основной стенд исключает GUI-пакет. Серверный Docker-build читает только его manifest и не собирает GTK.

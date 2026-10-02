@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=SKVOZ
+Comment=Локальный HTTP и SOCKS5 прокси через NATS
+Exec=/usr/bin/skvoz-client
+Icon=org.skvoz.Client
+Terminal=false
+Type=Application
+Categories=Network;
+StartupNotify=true

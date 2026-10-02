@@ -5,6 +5,7 @@ require 'uri'
 require 'net/http'
 require_relative 'state'
 require_relative 'tcp_connector'
+require_relative 'enrollment'
 
 module Skvoz
   module Server
@@ -38,7 +39,15 @@ module Skvoz
             start_runtime
             retry_delay = 1
             while !@stopping && children_alive? && @connector.ready?
-              @healthy = @tls.valid? && @failure.nil?
+              unless @enrollment&.ready?
+                @enrollment&.stop(graceful: true)
+                begin
+                  start_enrollment if monotonic >= (@next_enrollment || 0)
+                rescue StandardError
+                  @next_enrollment = monotonic + 1
+                end
+              end
+              @healthy = @tls.valid? && @failure.nil? && @enrollment&.ready?
               unless @tls.valid?
                 @connector.stop
                 break
@@ -58,6 +67,7 @@ module Skvoz
             warn(error.is_a?(Error) ? 'SKVOZ recovering: ' + error.message : 'SKVOZ recovering: runtime_start_failed')
           ensure
             @healthy = false
+            @enrollment&.stop
             @connector&.stop
             stop_children
           end
@@ -74,7 +84,7 @@ module Skvoz
       end
 
       def healthy?
-        @healthy && !@failure && !@stopping && @tls&.valid? && children_alive? && @connector&.ready?
+        @healthy && !@failure && !@stopping && @tls&.valid? && children_alive? && @connector&.ready? && @enrollment&.ready?
       end
 
       private
@@ -204,11 +214,23 @@ module Skvoz
         policy = Policy.new(allow: @config['allow'], deny: @config['deny'], own_endpoints: own)
         streams = @config['max_streams']
         @connector = TCPConnector.new(path: @core_path, policy:, limits: { streams:, tcp_buffer_bytes: @config['tcp_buffer_bytes'], stream_frames: @config['stream_queue_frames'], stream_bytes: @config['stream_queue_bytes'], event_frames: streams * @config['stream_queue_frames'], event_bytes: streams * @config['stream_queue_bytes'] }).start(@task)
+        start_enrollment
         @failure = nil
         clear_candidate
         prune_tls
         @healthy = @tls.valid?
         warn 'SKVOZ ready'
+      end
+
+      def start_enrollment
+        @enrollment = Enrollment.new(@config, @state) do |login, token|
+          @mutation.acquire do
+            raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
+            candidate, id = @state.enroll(login, token)
+            apply(candidate) if candidate
+            { v: 1, namespace: @config['namespace'], peer_id: id, daemon: '1.2.0', ipc: 1 }
+          end
+        end.start(@task)
       end
 
       def capture_command(argv)
@@ -319,6 +341,7 @@ module Skvoz
         @failure = 'configuration_apply_uncertain'
         @healthy = false
         @connector&.stop
+        @enrollment&.stop
         PrivateFiles.write(@nats_path, previous_config) if previous_config
         @nats&.signal('HUP')
         raise if error.is_a?(Async::Stop)

@@ -143,7 +143,7 @@ cargo run --locked -p skvoz-core --example in_memory
 Legacy demo/load использует finite buffers в одном процессе и статический
 NatsNode; минимальный TCP relay требует выделенного node. Dynamic runtime
 поддерживает join/rejoin и новые streams после recovery. Готовый proxy/VPN,
-клиентские приложения и transparent stream resumption пока не реализованы. Подробнее:
+VPN/мобильные клиенты и transparent stream resumption пока не реализованы. [Клиент Ubuntu](ubuntu-client.md) поставляется отдельно через deb. Подробнее:
 [архитектура](architecture.md), [контракт](stream-engine.md),
 [формат пакетов](wire.md).
 

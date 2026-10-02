@@ -158,11 +158,12 @@ module Skvoz
         raise Error, 'TLS material missing' unless tls
         namespace = @config['namespace']
         server_permissions = { 'publish' => ["#{namespace}.join.*.0", "#{namespace}.lane.*.*.0.*.0.*"],
-                               'subscribe' => ["#{namespace}.join.0.*", "#{namespace}.lane.0.*.*.*.*.*"] }
+                               'subscribe' => ["#{namespace}.join.0.*", "#{namespace}.lane.0.*.*.*.*.*", 'skvoz.enroll.v1.*'] }
+        server_permissions['publish'] << 'skvoz.enroll.reply.*.*'
         users = [{ 'user' => INTERNAL, 'password' => state.fetch('internal_hash'), 'permissions' => server_permissions }]
         state.fetch('users').each do |login, user|
-          publish, subscribe = [], []
-          user.fetch('ids').each do |id|
+          publish, subscribe = ["skvoz.enroll.v1.#{login}"], ["skvoz.enroll.reply.#{login}.*"]
+          user.fetch('assigned').each do |id|
             publish.concat(["#{namespace}.join.0.#{id}", "#{namespace}.lane.0.*.#{id % 8}.*.#{id}.*"])
             subscribe.concat(["#{namespace}.join.#{id}.*", "#{namespace}.lane.#{id}.*.*.*.*.*"])
           end
@@ -208,6 +209,21 @@ module Skvoz
           'password' => password, 'namespace' => @config['namespace'], 'peer_id' => id,
           'allowed_peers' => [0], 'initiate' => [0], 'shards' => 8,
           'trust' => @value.fetch('tls')['ca'] ? 'managed_ca' : 'system' }
+      end
+
+      # The caller derives login from the broker-authorized request subject.
+      def enroll(login, token)
+        raise Error, 'Invalid device token' unless token.is_a?(String) && token.match?(/\A[0-9a-f]{32}\z/)
+        current = candidate
+        user = current.fetch('users').fetch(login) { raise Error, 'Login does not exist' }
+        devices = user['devices'] ||= {}
+        return [nil, devices.fetch(token)] if devices.key?(token)
+        id = (user.fetch('ids') - user.fetch('assigned')).first
+        raise Error, 'Device pool exhausted' unless id
+        user.fetch('assigned') << id
+        devices[token] = id
+        current['revision'] += 1
+        [current, id]
       end
 
       private

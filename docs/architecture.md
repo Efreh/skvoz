@@ -19,6 +19,8 @@ NATS и профили устройств, поддерживает жизнен
 позволяют строить мосты к частным и локальным сервисам.
 Граница коннектора не зависит от языка и допускает другую реализацию в будущем.
 
+[Клиент Ubuntu](ubuntu-client.md) — нативный Rust-процесс с GTK4/libadwaita и локальными HTTP/HTTPS CONNECT/SOCKS5 адаптерами. Он автоматически выделяет устройство через broker-authorized enrollment и управляет комплектным Core daemon через закрытый IPC; прикладной TLS CONNECT остаётся непрозрачными байтами.
+
 Manager привязывает поток к `(PeerId, stream_id)`, при допуске резервирует всё
 объявленное окно приёма, ограничивает число активных и закрывающихся потоков,
 а также объём ожидающих DATA глобально и по участникам.
@@ -43,9 +45,9 @@ Manager привязывает поток к `(PeerId, stream_id)`, при до�
 ```mermaid
 flowchart TB
     subgraph clients["Клиентские процессы"]
-        host["Коннекторы и буферы приложения"]
-        runtime["Та же библиотека Core: NatsRuntime / Manager / Streams"]
-        host <-->|"API / события с проверкой поколения"| runtime
+        host["Клиент Ubuntu Rust: GTK, HTTP / CONNECT / SOCKS5"]
+        runtime["Дочерний Core daemon: та же библиотека NatsRuntime / Manager / Streams"]
+        host <-->|"Закрытый IPC 1 / события с проверкой поколения"| runtime
     end
     subgraph remote["Сервер: отдельные процессы и их ресурсы"]
         server["Коннектор Ruby: TCP, пользователи, ACME, управление процессами"]
