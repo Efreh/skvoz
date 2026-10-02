@@ -159,23 +159,16 @@ async fn actual_broker_restart_recovers_new_streams_without_reviving_old() {
     let (old, _) = r::handshake(&mut client, &mut server).await.unwrap();
     let generation = client.generation();
     let container = std::env::var("SKVOZ_NATS_CONTAINER").unwrap();
-    assert!(
-        std::process::Command::new("docker")
-            .args(["restart", &container])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
     let start = Instant::now();
+    docker(&["restart", &container]);
     let mut closed = 0;
     while client.generation() == generation
         || !client.peer_ready(PeerId(0))
         || !server.peer_ready(PeerId(1))
     {
         assert!(start.elapsed() < Duration::from_secs(15));
-        client.turn(Duration::from_millis(2)).await.unwrap();
-        server.turn(Duration::from_millis(2)).await.unwrap();
+        recovery_turn(&mut client).await;
+        recovery_turn(&mut server).await;
         for e in client.poll_events(256) {
             if e.key == old
                 && matches!(
@@ -203,6 +196,24 @@ async fn actual_broker_restart_recovers_new_streams_without_reviving_old() {
     .unwrap();
     client.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
+}
+async fn recovery_turn(node: &mut NatsRuntime) {
+    if let Err(error) = node.turn(Duration::from_millis(2)).await {
+        // A socket can fail before its asynchronous disconnect callback runs.
+        assert!(
+            matches!(error, RuntimeError::Transport | RuntimeError::Timeout),
+            "unexpected recovery error: {error:?}; status: {:?}",
+            node.status()
+        );
+    }
+    assert!(
+        matches!(
+            node.status().lifecycle,
+            Lifecycle::Ready | Lifecycle::Recovering
+        ),
+        "terminal recovery status: {:?}",
+        node.status()
+    );
 }
 #[tokio::test]
 async fn injected_loss_of_final_data_without_callback_fails_watermark() {

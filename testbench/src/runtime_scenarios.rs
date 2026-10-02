@@ -71,19 +71,34 @@ pub async fn handshake(
     client: &mut NatsRuntime,
     server: &mut NatsRuntime,
 ) -> Result<(RuntimeKey, RuntimeKey), BenchError> {
-    let key = client.open(PeerId(0), b"opaque destination")?;
+    let key = client
+        .open(PeerId(0), b"opaque destination")
+        .map_err(|error| handshake_error("client OPEN", error, client, server))?;
     let mut remote = None;
     let mut opened = false;
     let start = Instant::now();
     while !opened {
         if start.elapsed() > Duration::from_secs(4) {
-            return Err(std::io::Error::other("stream handshake deadline").into());
+            return Err(std::io::Error::other(format!(
+                "stream handshake deadline; client={:?}; server={:?}",
+                client.status(),
+                server.status()
+            ))
+            .into());
         }
-        client.turn(Duration::ZERO).await?;
-        server.turn(Duration::from_millis(1)).await?;
+        client
+            .turn(Duration::ZERO)
+            .await
+            .map_err(|error| handshake_error("client turn", error, client, server))?;
+        server
+            .turn(Duration::from_millis(1))
+            .await
+            .map_err(|error| handshake_error("server turn", error, client, server))?;
         for e in server.poll_events(256) {
             if let Event::IncomingOpen { .. } = e.event {
-                server.accept(e.key, b"")?;
+                server
+                    .accept(e.key, b"")
+                    .map_err(|error| handshake_error("server ACCEPT", error, client, server))?;
                 remote = Some(e.key);
             }
         }
@@ -94,6 +109,19 @@ pub async fn handshake(
         }
     }
     Ok((key, remote.unwrap()))
+}
+fn handshake_error(
+    phase: &str,
+    error: skvoz_core::runtime::RuntimeError,
+    client: &NatsRuntime,
+    server: &NatsRuntime,
+) -> BenchError {
+    std::io::Error::other(format!(
+        "stream handshake {phase}: {error}; client={:?}; server={:?}",
+        client.status(),
+        server.status()
+    ))
+    .into()
 }
 pub async fn bytes(
     client: &mut NatsRuntime,
