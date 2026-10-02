@@ -76,10 +76,11 @@ RSpec.describe 'Automatic ACME certificate lifecycle', integration: true do
     expect(@server.command('list').length).to eq(2)
     expect(@server.state.glob('tls-*').length).to be <= 3
     users = committed_certificate.first.fetch('users')
-    wait_until(timeout: 20) { @server.state.join('candidate.json').exist? }
     nats = child_pid(@server.process, 'nats-server')
     Process.kill('STOP', nats)
     begin
+      # Hold the broker before reload so the pending candidate cannot commit between polls.
+      wait_until(timeout: 20) { @server.state.join('candidate.json').exist? }
       wait_until(timeout: 12) { @server.command('health')['failure'] == 'configuration_apply_uncertain' }
       committed = committed_certificate.first
       pending = JSON.parse(@server.state.join('candidate.json').read)
