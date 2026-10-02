@@ -43,3 +43,21 @@ Runner поднимает отдельный pinned NATS с TLS-first/време
 processes, bounded transport delay/slow-credit/churn и отдельные process metrics.
 Команды, finite workload bounds и measurement scope: [qualification guide](../docs/getting-started.md#независимые-процессы-runtime).
 Сырые metrics/credentials временные; capacity/SLA не заявляются.
+
+## Standalone daemon и foreign languages
+
+```sh
+python3 testbench/run.py daemon --offline
+```
+
+Нужны Linux/Ruby3.4+ помимо основных prerequisites. Runner строит release
+`skvoz-core-daemon`, запускает independent daemons и Python acceptor/Ruby/Python
+stdlib clients через тот же dedicated TLS-first broker. `check` также включает
+этот сценарий. Temporary ACL даёт одному device login только явно provisioned
+PeerId1/2; это не automatic ID allocation и не credential isolation между ними.
+
+[IPC contract](../docs/daemon-ipc.md) описывает finite profiles, watermark/credit,
+owner admission/isolation и startup/lifecycle. Qualification проверяет tiny local
+output queues отдельно от NATS subscription overflow tests, делает real broker
+stop/start и daemon/client kill; source-only fixtures находятся в daemon/tests.
+RSS/idle samples имеют ограниченный workload scope и не являются SLA.

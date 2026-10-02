@@ -13,8 +13,14 @@ skvoz/
 │   ├── src/
 │   ├── tests/
 │   └── examples/
+├── daemon/             # process/IPC wrapper той же Core library
+│   ├── Cargo.toml      # skvoz-daemon / skvoz-core-daemon binary
+│   ├── src/
+│   └── tests/fixtures/ # public IPC vectors
 ├── clients/            # каждый клиент — clients/<name>/
-│   └── README.md       # правила; реализации пока нет
+│   ├── python/         # stdlib IPC helper/echo example
+│   ├── ruby/           # stdlib IPC helper/echo example
+│   └── README.md       # правила; полных клиентских приложений пока нет
 ├── connectors/         # коннекторы внешнего I/O
 │   └── tcp/            # package skvoz-tcp, relay одного сокета
 │       ├── Cargo.toml
@@ -24,7 +30,7 @@ skvoz/
 │   ├── Cargo.toml      # package skvoz-testbench
 │   ├── src/
 │   ├── tests/
-│   └── run.py          # контейнер NATS и check/demo/tcp/load
+│   └── run.py          # контейнер NATS: check/demo/tcp/load/qualify/daemon
 ├── docs/               # архитектура и контракты
 └── README.md           # вход в общий проект
 ```
@@ -59,3 +65,5 @@ python3 testbench/run.py demo
 архитектуру и контракты. [Концепция](concept.md) описывает направления развития.
 
 Dynamic runtime/control contract: [NATS runtime](nats-runtime.md). Independent release-process qualification and its measurement scope: [getting started](getting-started.md#независимые-процессы-runtime).
+
+Standalone executable/source configuration and Unix socket contract: [daemon/IPC](daemon-ipc.md).

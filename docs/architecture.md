@@ -65,6 +65,32 @@ TCP пример создаёт два выделенных NatsNode того ж
 и удалённый target. Он проверяет bytes/FIN/ответ после EOF. Для many-socket proxy
 нужен connector dispatcher; текущий relay не является таким proxy.
 
+## Standalone Core process
+
+[Daemon](daemon-ipc.md) встраивает тот же NatsRuntime и владеет его turn/event loop.
+Foreign language host передаёт bytes/metadata через framed private Unix socket.
+IPC session owns stream handles; incoming OPEN назначается одному acceptor lease.
+Другие local sessions открывают outbound streams. Full DATA write только продвигает
+IPC delivered watermark; реальный credit возвращает host CONSUME после обработки.
+Slow/overflow owner отменяется отдельно, в том числе среди owners одного NATS peer.
+
+```mermaid
+flowchart TB
+    python["Python or Ruby connector process"]
+    subgraph daemon["Linux Core daemon process"]
+        ipc["Private IPC v1 and local owners"]
+        same["Same universal NatsRuntime and Manager"]
+        ipc <-->|"Generation-safe keys and consumed prefixes"| same
+    end
+    remote["TLS NATS and remote same Core"]
+    python <-->|"Framed commands and raw DATA"| ipc
+    same <-->|"Join and bounded lanes"| remote
+```
+
+Private0700 parent/socket0600 и UID peer credentials ограничивают local OS
+principal. Это не защита между произвольными same-UID процессами, не automatic
+per-connector incoming routing и не network credential provisioning.
+
 ## Открытие и возврат кредита
 
 Обе стороны могут инициировать поток. Ниже один цикл для инициатора A и
@@ -159,8 +185,9 @@ ID в той же peer session повторно не используется; �
 
 ## Изоляция и пределы реализации
 
-Runner выдаёт раздельные временные credentials каждой стороне и каждому
-клиенту. CA, ключи и пароли создаются заново; NATS принимает TLS-first соединения.
+Runner выдаёт раздельные временные credentials обычным runtime/TCP участникам.
+Daemon qualification также проверяет два provisioned device PeerId с общим login
+и явно ограниченным ACL набором; credential не изолирует эти две identities друг от друга. CA, ключи и пароли создаются заново; NATS принимает TLS-first соединения.
 Подробности: [первый запуск](getting-started.md).
 
 Round-robin выдаёт один frame на ready peer, вращая streams внутри peer.
@@ -192,4 +219,5 @@ loopback эксперимент не доказывает WAN, mobile или who
 Исходники: [Stream](../core/src/stream.rs), [Manager](../core/src/manager.rs),
 [codec](../core/src/wire.rs), [NatsNode](../core/src/nats.rs),
 [NatsRuntime](../core/src/runtime.rs),
+[daemon](../daemon/src/driver.rs), [IPC protocol](../daemon/src/protocol.rs),
 [TCP relay](../connectors/tcp/src/lib.rs), [нагрузка](../testbench/src/mesh.rs).

@@ -38,3 +38,6 @@ certificate management принадлежат host/provisioner; runtime подд
 [указатель документации](../docs/README.md).
 
 [Dynamic NATS runtime: join, recovery, trust, queues and embedding](../docs/nats-runtime.md).
+
+Для host languages доступен [standalone daemon/IPC v1](../docs/daemon-ipc.md),
+который встраивает эту же Core library; Rust embedding API сохраняется.

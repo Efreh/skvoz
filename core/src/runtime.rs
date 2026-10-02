@@ -362,7 +362,8 @@ impl RuntimeConfig {
             terminal_drain_timeout: Duration::from_secs(10),
         }
     }
-    fn validate(&self, limits: ManagerConfig) -> Result<usize, RuntimeError> {
+    /// Validate an embedding profile without I/O; returns its transport payload bound.
+    pub fn validate_profile(&self, limits: ManagerConfig) -> Result<usize, RuntimeError> {
         let address: async_nats::ServerAddr = self.url.parse().map_err(|_| RuntimeError::Config)?;
         if address.username().is_some()
             || address.password().is_some()
@@ -422,7 +423,7 @@ impl NatsRuntime {
         config: RuntimeConfig,
         limits: ManagerConfig,
     ) -> Result<Self, RuntimeError> {
-        let transport_bound = config.validate(limits)?;
+        let transport_bound = config.validate_profile(limits)?;
         let now = Instant::now();
         let mut node = Self {
             manager: Manager::new(limits)?,

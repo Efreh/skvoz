@@ -35,6 +35,9 @@ Ok(NatsRuntime::connect(config, limits).await?)
 
 Компилируемый embedding example: [runtime_profile.rs](../core/examples/runtime_profile.rs).
 Host drives `turn` and drains events before relying on `peer_ready`.
+`RuntimeConfig::validate_profile(limits)` проверяет profile без I/O и возвращает
+configured transport payload bound. [Standalone daemon/IPC](daemon-ipc.md)
+использует тот же runtime для host languages.
 
 `Trust::System` использует native trust store. `ManagedCa(PathBuf)` использует
 проверенный app-specific PEM bundle, без глобальной установки корня. TLS-first,
@@ -80,6 +83,12 @@ bytes плюс runtime envelope 24 bytes. Runtime отвергает и мень
 абсолютную конечную позицию действительно обработанных байтов. `finish` допускает
 ответ второй стороны после EOF; `close` отменяет поток. Подробный byte-credit/EOF
 контракт определён в [движке](stream-engine.md).
+
+`join_peer` идемпотентен для pending flight. Для уже ready peer прямой Core API
+начинает новую negotiation: подтверждённая pair session replacement закрывает
+старые streams. Host не должен считать повторный `join_peer` harmless connect.
+IPC JOIN, напротив, обеспечивает готовность и является no-op для ready peer,
+чтобы другой local owner не прерывал текущий обмен.
 
 ## Provisioning и доверенная identity
 

@@ -187,3 +187,25 @@ Qualification queue profile вычисляется для его собстве�
 (min256). Для129×2 server profile512; это не гарантия для arbitrary tiny DATA.
 Derived capacity выше65536 отклоняется как workload-limit error. Маленькие queues
 отдельно проверяются на честное failure/isolation; профиль не скрывает overflow.
+
+## Standalone daemon из исходников
+
+Для language-independent Core executable нужны дополнительно Ruby3.4+ и Linux.
+Из корня:
+
+```sh
+cargo build --release -p skvoz-daemon --locked
+./target/release/skvoz-core-daemon --help
+python3 testbench/run.py daemon
+```
+
+`daemon` использует dedicated pinned TLS-first NATS, независимые release processes,
+Python incoming host, Ruby/Python stdlib clients и общий login для двух явно
+provisioned PeerId. Проверяет exact binary bytes/EOF/credits, owner/stale handles,
+nonreading owner isolation, private endpoint/config, TLS/auth negatives и real
+broker/daemon/client restarts. `check` включает эту qualification. С кэшами
+добавьте `--offline`. Profiles/CA/socket/metrics остаются временными вне checkout.
+
+Собственный запуск через provisioned private profile, socket policy/ошибки/лимиты
+и точный binary contract: [daemon/IPC v1](daemon-ipc.md). Binary не выдаёт
+credentials/PeerId, не разбирает HTTP/SOCKS и не возобновляет прежние streams.

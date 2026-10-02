@@ -2,12 +2,13 @@
 
 SKVOZ объединяет ядро двунаправленных байтовых потоков, клиенты и вспомогательные
 компоненты. Сейчас реализованы универсальный Core, multi-peer менеджер, опциональный
-NATS runtime и минимальный TCP relay; клиентских приложений пока нет.
+NATS runtime, standalone daemon/IPC и минимальный TCP relay; клиентских приложений пока нет.
 
 | Задача читателя | Документ |
 | --- | --- |
 | Запустить пример и проверить проект | [Первый запуск](getting-started.md). |
 | Понять существующие компоненты и обмен данными | [Текущая архитектура](architecture.md). |
+| Подключить приложение любого языка к Core executable | [Daemon/IPC v1](daemon-ipc.md), [Python](../clients/python/README.md), [Ruby](../clients/ruby/README.md). |
 | Найти операции, состояния, события и ограничения ядра | [Контракт движка](stream-engine.md). |
 | Проверить бинарный формат пакетов | [Экспериментальный wire v1](wire.md). |
 | Найти исходники или добавить подпроект | [Структура репозитория](repository.md). |
@@ -15,7 +16,7 @@ NATS runtime и минимальный TCP relay; клиентских прил�
 | Воспроизвести сценарии и сверить бинарные пакеты | [Fixtures и vectors](../core/tests/fixtures/README.md). |
 
 Для работы с конкретным компонентом начните с его README:
-[core](../core/README.md), [testbench](../testbench/README.md),
+[core](../core/README.md), [daemon](../daemon/README.md), [testbench](../testbench/README.md),
 [clients](../clients/README.md), [TCP relay](../connectors/tcp/README.md). В концепции описаны и будущие возможности;
 текущие интерфейсы определяют документы движка и wire.
 
