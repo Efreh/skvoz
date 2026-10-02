@@ -57,3 +57,5 @@ python3 testbench/run.py demo
 
 [Указатель документации](README.md) связывает инструкции запуска, текущую
 архитектуру и контракты. [Концепция](concept.md) описывает направления развития.
+
+Dynamic runtime/control contract: [NATS runtime](nats-runtime.md). Independent release-process qualification and its measurement scope: [getting started](getting-started.md#независимые-процессы-runtime).

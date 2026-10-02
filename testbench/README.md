@@ -3,8 +3,8 @@
 Отдельный экспериментальный подпроект: package `skvoz-testbench`, adapters/demo/load
 в `src/`, реальные сценарии в `tests/`, контейнерный runner в `run.py`.
 Использует [ядро](../core/README.md) через path dependency, reusable NatsNode. В legacy demo два участника; multi-owner сценарии создают
-один server и несколько client nodes с отдельными credentials. Все app nodes
-работают в одном Rust-процессе; брокер находится в отдельном контейнере.
+один server и несколько client nodes с отдельными credentials. В прежнем `load` app nodes работают в одном Rust-процессе; `qualify` запускает
+независимые release server/client processes. Брокер находится в отдельном контейнере.
 
 Из корня общего репозитория:
 
@@ -38,3 +38,8 @@ Runner поднимает отдельный pinned NATS с TLS-first/време
 [Текущая архитектура и схемы](../docs/architecture.md),
 [первый запуск и диагностика](../docs/getting-started.md),
 [указатель документации](../docs/README.md).
+
+`qualify` проверяет dynamic NatsRuntime, authenticated new generations, independent
+processes, bounded transport delay/slow-credit/churn и отдельные process metrics.
+Команды, finite workload bounds и measurement scope: [qualification guide](../docs/getting-started.md#независимые-процессы-runtime).
+Сырые metrics/credentials временные; capacity/SLA не заявляются.

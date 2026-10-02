@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-core"
-version = "1.0.0"
+version = "1.1.0"
 description = "Deterministic, bounded byte-stream state engine for SKVOZ"
 edition.workspace = true
 rust-version.workspace = true
@@ -12,9 +12,16 @@ workspace = true
 
 [features]
 default = []
-nats = ["dep:async-nats", "dep:futures-util", "dep:tokio"]
+fault-injection = ["nats"]
+nats = ["dep:async-nats", "dep:futures-util", "dep:tokio", "dep:getrandom"]
 
 [dependencies]
 async-nats = { version = "=0.50.0", default-features = false, features = ["ring"], optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"], optional = true }
 tokio = { version = "=1.53.1", features = ["time", "sync", "macros"], optional = true }
+
+getrandom = { version = "=0.4.3", optional = true }
+
+[[example]]
+name = "runtime_profile"
+required-features = ["nats"]

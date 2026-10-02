@@ -24,12 +24,17 @@ python3 testbench/run.py check
 NatsNode находится в библиотеке Core; [TCP relay](../connectors/tcp/README.md)
 использует его как embedding host.
 По умолчанию crate не имеет внешних зависимостей. Feature `nats` включает
-reusable NatsNode с явно заданными peer/session routes и TLS-first credentials.
+статический NatsNode с явными routes и динамический NatsRuntime с authenticated
+join/rejoin, lane readiness/liveness и generation-safe connector keys.
 [Контракт Manager/NatsNode](../docs/stream-engine.md#менеджер-множества-потоков)
 описывает admission, планирование и границы памяти.
-Стабильный wire, динамическая идентификация и FFI остаются будущей работой.
+Стабильный wire и FFI остаются будущей работой. Credential issuance/revocation и
+certificate management принадлежат host/provisioner; runtime поддерживает
+проверенные System/ManagedCa trust и provisioned username/password.
 Общие правила: [структура репозитория](../docs/repository.md).
 
 [Текущая архитектура и схемы](../docs/architecture.md),
 [первый запуск и диагностика](../docs/getting-started.md),
 [указатель документации](../docs/README.md).
+
+[Dynamic NATS runtime: join, recovery, trust, queues and embedding](../docs/nats-runtime.md).

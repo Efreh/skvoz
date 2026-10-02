@@ -225,9 +225,9 @@ fn broker_snapshot(phase: &str) -> Result<(), BenchError> {
 }
 pub async fn run(case: &str, o: LoadOptions) -> Result<(), BenchError> {
     if o.clients == 0
-        || o.clients > 100
+        || o.clients > 512
         || o.streams_per_client == 0
-        || o.streams_per_client > 100
+        || o.streams_per_client > 512
         || o.active_per_client > o.streams_per_client
         || o.bytes > 2 * 1024 * 1024
     {

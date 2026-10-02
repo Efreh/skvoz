@@ -7,7 +7,7 @@ SKVOZ — модульный проект для двунаправленных 
 
 | Компонент | Назначение |
 | --- | --- |
-| [core/](core/README.md) | Stream/Manager без I/O, codec и опциональный reusable NatsNode; общий контракт для всех коннекторов. |
+| [core/](core/README.md) | Stream/Manager без I/O, codec, статический NatsNode и dynamic NatsRuntime; общий контракт для всех коннекторов. |
 | [testbench/](testbench/README.md) | Реальные NATS/TCP сценарии, много клиентов, измерение нагрузки. |
 | [connectors/tcp/](connectors/tcp/README.md) | Экспериментальный relay одного TCP-сокета через встроенный Core. |
 | [clients/](clients/README.md) | Каталог клиентских подпроектов; реализации пока нет. |
@@ -35,6 +35,9 @@ fmt/clippy, движок/codec и реальные транспортные сц
 [контракт движка](docs/stream-engine.md), [wire v1](docs/wire.md),
 [структура репозитория](docs/repository.md) и [концепция](docs/concept.md).
 
-Клиентские приложения, готовый TCP/VPN proxy, динамические identity/discovery,
-активный liveness/resumption, FFI/IPC и мобильные адаптеры ещё не реализованы.
+Dynamic NatsRuntime поддерживает broker-authorized join/rejoin, peer liveness и
+recovery для новых streams. Готовые клиентские приложения/HTTP-SOCKS-VPN proxy,
+transparent byte resumption, FFI/IPC и мобильные адаптеры ещё не реализованы.
 Логические бюджеты Core не являются гарантией RSS всего процесса. Текущие типы и wire остаются экспериментальными.
+
+[Dynamic NATS runtime: join, recovery, trust, queues and embedding](docs/nats-runtime.md).

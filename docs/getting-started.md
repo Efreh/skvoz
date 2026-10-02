@@ -82,7 +82,7 @@ python3 testbench/run.py load --offline --clients 100 --streams-per-client 10 --
 python3 testbench/run.py load --offline --clients 100 --streams-per-client 100 --active-per-client 2 --bytes 65536
 ```
 
-Параметры: clients 1…100, streams-per-client 1…100,
+Параметры: clients 1…512, streams-per-client 1…512, total streams ≤65536,
 active-per-client 0…streams-per-client, bytes 0…2 097 152 на направление каждого
 активного потока. Это предел runner experiment, не предел продукта. Для idle
 sweep задайте `--active-per-client 0 --bytes 0`. Phase deadline — 60 секунд;
@@ -136,8 +136,54 @@ cargo run --locked -p skvoz-core --example in_memory
 | Не хватает image/crates при `--offline` | Повторите без `--offline` при доступной сети. |
 | Ошибка TLS или готовности брокера | Повторите через runner, который создаёт согласованные CA, конфигурацию и credentials; проверьте работоспособность Docker. |
 
-Стенд использует конечные буферы в одном процессе. Минимальный TCP relay
-требует выделенного node; готовый proxy/VPN, клиентские приложения,
-автоматическое обновление routes и возобновление потоков пока не реализованы. Подробнее:
+Legacy demo/load использует finite buffers в одном процессе и статический
+NatsNode; минимальный TCP relay требует выделенного node. Dynamic runtime
+поддерживает join/rejoin и новые streams после recovery. Готовый proxy/VPN,
+клиентские приложения и transparent stream resumption пока не реализованы. Подробнее:
 [архитектура](architecture.md), [контракт](stream-engine.md),
 [формат пакетов](wire.md).
+
+## Независимые процессы runtime
+
+```sh
+python3 testbench/run.py qualify --offline --clients 129 --streams-per-client 2 --active-per-client 1 --bytes 32768 --duration 3
+python3 testbench/run.py qualify --offline --clients 8 --streams-per-client 4 --active-per-client 2 --bytes 32768 --duration 1 --delay-ms 40 --slow-reader-delay-ms 250 --churn-rounds 2
+```
+
+`qualify` строит release binary, запускает один server и отдельный client process
+на identity с provisioned recipient/sender/shard ACL. Credentials генерируются по
+workload, фиксированного набора101 больше нет. И `load`, и `qualify` ограничены
+1..512 clients/streams-per-client и65536 total streams; это bounds стенда, не Core
+ceiling. Профили, лимиты и embedding API: [runtime contract](nats-runtime.md).
+
+`--duration 1..60` удерживает idle streams/heartbeats после active transfer;
+`--churn-rounds 1..10` перезапускает client processes при живом server.
+`--delay-ms 0..200` передаёт настоящий TLS traffic через bounded TCP delay
+forwarder с половиной указанной задержки в каждую сторону и одним held8KiB chunk;
+chunk pacing влияет на результат. `--slow-reader-delay-ms 0..2000` задерживает
+consume-through у client1, сохраняя его driver/heartbeats; совокупное расчётное
+окно задержки ограничено60s. Это позволяет сравнить progress остальных peers.
+`--max-app-rss-mib 64..4096` (default1024) — stop limit суммарного sampled app RSS.
+Controller имеет конечные phase/total deadlines и уничтожает всех child processes
+при failure/timeout. Runtime output/credentials и metrics files остаются temporary.
+
+`QUALIFY` печатает JSON с отдельными server app, aggregate client samples,
+broker peaks, completion p50/p95/p99 и final stream/reservation counters.
+CPU — observed ticks с указанным clock rate; RSS sample interval25ms не доказывает
+полный allocation peak. Сумма process peaks, особенно через churn waves, не является
+одновременно занятой RAM. Broker имеет отдельные1CPU/128MiB limits; application/
+whole host ими не ограничены. Числа workload не являются product users/CPU/RAM SLA.
+
+`check` проверяет dynamic runtime перед legacy suite, которая в конце останавливает
+брокер. TLS negatives используют temporary wrong-name/expired/untrusted certificates;
+System trust positive запускается в isolated child с временным SSL_CERT_FILE,
+без изменения системного trust store. Credential revocation/reprovision проверяется
+reload настоящего брокера. Для обычного endpoint Core доверяет native roots;
+эта isolated проверка квалифицирует путь native loader, не публичного CA issuer.
+
+Qualification queue profile вычисляется для его собственного sender pattern:
+8192-byte window как8×1024-byte frames плюс4 lifecycle/coalesced-credit slots,
+умноженные на streams и максимальное число peers в shard, округлённые до power-of-two
+(min256). Для129×2 server profile512; это не гарантия для arbitrary tiny DATA.
+Derived capacity выше65536 отклоняется как workload-limit error. Маленькие queues
+отдельно проверяются на честное failure/isolation; профиль не скрывает overflow.

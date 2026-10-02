@@ -40,11 +40,14 @@ Unknown non-OPEN packets игнорируются. При overload допуск�
 pending REJECT на peer; остальные OPEN могут завершиться remote timeout.
 
 Decoder выполняет только bounded allocations после проверки wire limits. Более
-узкие stream/Manager limits проверяются следующим слоем. Static routes не
-обновляются автоматически: смена configured session требует пересоздания node.
-Disconnect не возобновляет stream; active liveness/discovery/resumption остаются
-отдельной работой.
+узкие stream/Manager limits проверяются следующим слоем. У fixed-route NatsNode
+static routes не обновляются автоматически: смена configured session требует
+пересоздания node. Dynamic NatsRuntime поддерживает authenticated join, новые
+generations и active peer liveness, как описано в [его контракте](nats-runtime.md).
+Disconnect не возобновляет прерванные stream bytes ни в одном runtime.
 
 Language-neutral hex vectors находятся в
 [core/tests/fixtures/wire-v1.tsv](../core/tests/fixtures/wire-v1.tsv);
 их формат описан в [README](../core/tests/fixtures/README.md).
+
+The optional [dynamic NATS runtime](nats-runtime.md) adds its own pair-token/sequence envelope and bounded control packets around these unchanged wire v1 bytes. The stream vectors remain valid; static NatsNode uses the original packet without that runtime envelope.

@@ -2,6 +2,8 @@
 
 pub mod mesh;
 mod node;
+pub mod process_workload;
+pub mod runtime_scenarios;
 pub mod scenarios;
 pub mod tcp_demo;
 

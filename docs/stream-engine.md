@@ -235,3 +235,5 @@ NATS очереди имеют message-count caps. Для Core publish/подп�
 проверки sender; authentication/ACL остаются обязательной границей доверия.
 Это не полный предел RSS. [Нагрузочный режим](getting-started.md#нагрузочный-эксперимент)
 показывает измеряемую область и её ограничения.
+
+`Manager.aggregate()` returns constant-time slot/reservation/send/ready counters; `resources()` is explicit detailed O(stream count) buffer inspection. Dynamic authenticated session lifecycle, generation-safe RuntimeKey and transport watermark are defined in the [NATS runtime contract](nats-runtime.md), above the unchanged Stream engine.

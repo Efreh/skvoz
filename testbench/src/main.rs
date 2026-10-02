@@ -1,8 +1,9 @@
 use skvoz_testbench::{mesh, scenarios};
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), skvoz_testbench::BenchError> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("demo") {
+        "runtime-worker" => skvoz_testbench::process_workload::worker(&args[2..]).await,
         "load" => {
             mesh::run(
                 "load",

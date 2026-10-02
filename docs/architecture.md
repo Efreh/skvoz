@@ -7,7 +7,7 @@
 
 `skvoz-core` — одна универсальная Rust-библиотека для любых коннекторов,
 client и server приложений. Stream/Manager/codec не выполняют I/O;
-опциональный feature `nats` добавляет reusable NatsNode на Tokio/async-nats.
+опциональный feature `nats` добавляет статический NatsNode и динамический NatsRuntime на Tokio/async-nats.
 Роль приложения не меняет реализацию или контракт ядра.
 
 Manager привязывает поток к `(PeerId, stream_id)`, резервирует полное объявленное
@@ -16,24 +16,32 @@ bytes глобально и по peer. Receive payload buffer выделяетс
 у idle streams capacity равен нулю. Драйвер обслуживает ready queues и индекс
 opening deadlines; нормальный turn не сканирует все idle streams.
 
-В many-client стенде все client/server приложения находятся в одном процессе,
+Динамический [NatsRuntime](nats-runtime.md) поддерживает authenticated join/rejoin,
+новые поколения после transport loss и lane PING/PONG proof перед peer-ready.
+Он использует одну join connection и bounded lazy transport shards, без задач на
+каждый stream. `qualify` запускает отдельный release server и client processes;
+перегрузка одной lane закрывает её peers, а остальные shards продолжают работу.
+
+В прежнем `load` many-client стенде все client/server приложения находятся в одном процессе,
 а брокер — в отдельном контейнере. В развёртывании приложения могут находиться
 на разных машинах. Server application со встроенным Core и NATS могут делить
 одну машину и её ресурсы. Стенд не доказывает capacity такой машины.
 
 ```mermaid
 flowchart TB
-    subgraph apps["Один процесс нагрузочного стенда"]
-        clients["Client applications 1..N<br/>буферные коннекторы"]
-        clientNodes["NatsNode на каждого клиента<br/>Manager + Streams + codec"]
-        serverApp["Server application<br/>буферный коннектор"]
-        serverNode["Тот же NatsNode<br/>Manager + Streams + codec"]
-        clients <-->|"API / events"| clientNodes
-        serverApp <-->|"API / events"| serverNode
+    subgraph clients["Отдельные client application processes"]
+        host["Коннекторы и caller buffers"]
+        runtime["Та же Core library: NatsRuntime / Manager / Streams"]
+        host <-->|"API / generation-safe events"| runtime
     end
-    broker["Core NATS<br/>отдельный контейнер"]
-    clientNodes <-->|"TLS-first / publish / subscribe"| broker
-    serverNode <-->|"TLS-first / publish / subscribe"| broker
+    subgraph remote["Server host: процессы имеют отдельные ресурсы"]
+        server["Server application: коннектор + та же Core library"]
+        broker["Core NATS: TLS, credentials, sender/recipient/shard ACL"]
+        server <-->|"Join connection + bounded lazy lanes"| broker
+    end
+    runtime <-->|"TLS: join connection + lazy lane connections"| broker
+    legacy["Legacy demo/load: статические NatsNode в одном процессе"]
+    legacy <-->|"TLS / статические routes"| broker
 ```
 
 Каждый NatsNode владеет одним NATS client и одной подпиской, без отдельного
@@ -102,7 +110,9 @@ sequenceDiagram
 Событие `Writable` может также возникнуть после освобождения места в исходящей
 очереди. Драйвер вызывает `poll_frames`, чтобы извлечь фреймы; этот вызов
 передаёт владение драйверу и ещё не означает доставку peer. NATS `flush`
-подтверждает серверный барьер, а не потребление данных на стороне B.
+завершает локальную запись socket buffers; он не подтверждает broker-installed
+subscriptions или потребление данных B. Динамический runtime подтверждает готовность
+lane настоящим matching PING/PONG.
 
 ## Решение об отправке
 
@@ -168,10 +178,12 @@ API/poll закрывает node; idle input wait можно отменять б
 Статические routes не обновляются во время работы: смена session generation
 клиента требует пересоздания/перенастройки принимающего node. Старые recipient
 subjects не доставляются новой subscription; stale sender session игнорируется.
-Автоматическое restart/rejoin, discovery и resumption не реализованы.
+Эти ограничения относятся к статическому NatsNode. Динамический NatsRuntime
+поддерживает authenticated join/rejoin и bounded recovery для новых streams;
+transparent byte resumption не реализовано.
 
-Потеря последней публикации при формально живом транспорте и тихий исчезнувший
-peer требуют отдельного liveness механизма. Логические byte counters не включают
+Статический NatsNode не обнаруживает тихий исчезнувший peer или потерю последней
+публикации. NatsRuntime обнаруживает их nonce heartbeat и applied-frame watermark. Логические byte counters не включают
 allocator overhead, externally retained frames/events, connector queues,
 NATS/TLS/runtime buffers или broker. RSS нагрузки включает все clients и server
 в одном процессе; ограничения контейнера относятся только к брокеру. Короткий
@@ -179,4 +191,5 @@ loopback эксперимент не доказывает WAN, mobile или who
 
 Исходники: [Stream](../core/src/stream.rs), [Manager](../core/src/manager.rs),
 [codec](../core/src/wire.rs), [NatsNode](../core/src/nats.rs),
+[NatsRuntime](../core/src/runtime.rs),
 [TCP relay](../connectors/tcp/src/lib.rs), [нагрузка](../testbench/src/mesh.rs).

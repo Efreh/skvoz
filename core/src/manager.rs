@@ -91,6 +91,15 @@ pub struct Resources {
     pub ready_event_peers: usize,
     pub pending_rejections: usize,
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Aggregate {
+    pub peers: usize,
+    pub streams: usize,
+    pub reserved_receive_bytes: usize,
+    pub pending_send_bytes: usize,
+    pub ready_output_peers: usize,
+    pub ready_event_peers: usize,
+}
 struct Entry {
     stream: Stream,
     deadline: Option<u64>,
@@ -607,6 +616,20 @@ impl Manager {
     }
     pub fn snapshot(&self, key: StreamKey) -> Option<Snapshot> {
         self.streams.get(&key).map(|e| e.stream.snapshot())
+    }
+    /// Constant-time counters; buffer occupancy remains a detailed diagnostic.
+    pub fn aggregate(&self) -> Aggregate {
+        Aggregate {
+            peers: self.peers.len(),
+            streams: self.streams.len(),
+            reserved_receive_bytes: self.streams.len() * self.config.stream.receive_window as usize,
+            pending_send_bytes: self.pending_send,
+            ready_output_peers: self.output_set.len(),
+            ready_event_peers: self.event_set.len(),
+        }
+    }
+    pub fn peer_streams(&self, id: PeerId) -> Option<usize> {
+        self.peers.get(&id).map(|p| p.count)
     }
     /// Resource inspection is explicit and O(stream count), never a driver turn.
     pub fn resources(&self) -> Resources {

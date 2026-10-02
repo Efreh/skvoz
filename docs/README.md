@@ -18,3 +18,5 @@ NATS runtime и минимальный TCP relay; клиентских прил�
 [core](../core/README.md), [testbench](../testbench/README.md),
 [clients](../clients/README.md), [TCP relay](../connectors/tcp/README.md). В концепции описаны и будущие возможности;
 текущие интерфейсы определяют документы движка и wire.
+
+[Dynamic NATS runtime: join, recovery, trust, queues and embedding](nats-runtime.md).
