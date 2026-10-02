@@ -2,19 +2,22 @@
 
 SKVOZ — модульный проект для двунаправленных байтовых потоков через NATS.
 Репозиторий объединяет переносимое ядро, будущие клиенты и вспомогательные
-компоненты. Сейчас реализованы универсальная Rust-библиотека Core с multi-peer менеджером,
-опциональным NATS runtime, standalone Linux daemon с единым IPC и минимальный TCP relay.
+компоненты. Сейчас реализованы универсальная Rust-библиотека Core с менеджером
+множества участников, опциональной средой выполнения NATS, отдельный демон Linux
+с единым IPC, серверный коннектор с NATS, TLS и выдачей учётных данных,
+а также минимальный ретранслятор TCP.
 
 | Компонент | Назначение |
 | --- | --- |
-| [core/](core/README.md) | Stream/Manager без I/O, codec, статический NatsNode и dynamic NatsRuntime; общий контракт для всех коннекторов. |
-| [daemon/](daemon/README.md) | Standalone host той же Core library: private Unix socket и language-independent IPC v1. |
-| [testbench/](testbench/README.md) | Реальные NATS/TCP сценарии, много клиентов, измерение нагрузки. |
-| [connectors/tcp/](connectors/tcp/README.md) | Экспериментальный relay одного TCP-сокета через встроенный Core. |
-| [clients/](clients/README.md) | Python/Ruby standard-library IPC examples; законченных клиентских приложений пока нет. |
+| [core/](core/README.md) | Stream/Manager без I/O, кодек, статический NatsNode и динамический NatsRuntime; общий контракт для всех коннекторов. |
+| [daemon/](daemon/README.md) | Отдельный процесс с той же библиотекой Core: закрытый Unix-сокет и независимый от языка IPC v1. |
+| [testbench/](testbench/README.md) | Реальные NATS/TCP-сценарии, много клиентов, измерение нагрузки. |
+| [connectors/server/](connectors/server/README.md) | Сервер TCP на Ruby с тем же демоном Core, единым Docker-образом для GHCR и локальной сборки, пользователями NATS и ACME. |
+| [connectors/tcp/](connectors/tcp/README.md) | Экспериментальный ретранслятор одного TCP-сокета через встроенный Core. |
+| [clients/](clients/README.md) | Примеры IPC на стандартных библиотеках Python/Ruby; законченных клиентских приложений пока нет. |
 
-Rust-компоненты используют общий Cargo workspace и Cargo.lock. Каждый подпроект
-хранит свои исходники, тесты и инструменты в собственном каталоге.
+Rust-компоненты используют общую рабочую область Cargo и Cargo.lock.
+Каждый подпроект хранит свои исходники, тесты и инструменты в собственном каталоге.
 
 Для стенда нужны Linux, Rust 1.92+, Python 3.9+, Ruby 3.4+, Docker и OpenSSL.
 Из корня репозитория:
@@ -26,21 +29,27 @@ python3 testbench/run.py tcp
 python3 testbench/run.py daemon
 ```
 
-Runner поднимает отдельный NATS-контейнер с TLS-first, временными сертификатами
-и credentials, затем удаляет его. `demo` запускает обмен; `check` проверяет
-fmt/clippy, движок/codec и реальные транспортные сценарии.
+Стенд поднимает отдельный NATS-контейнер с TLS с самого начала соединения
+(TLS-first), временными сертификатами и учётными данными, затем удаляет его.
+`demo` запускает обмен; `check` проверяет fmt/clippy, движок, кодек
+и реальные транспортные сценарии.
 [Первый запуск](docs/getting-started.md) содержит подготовку, ожидаемый результат,
 режим с кэшем и диагностику.
 
 В [документации](docs/README.md) есть
 [архитектура со схемами](docs/architecture.md),
-[контракт движка](docs/stream-engine.md), [wire v1](docs/wire.md),
+[контракт движка](docs/stream-engine.md), [формат пакетов wire v1](docs/wire.md),
 [структура репозитория](docs/repository.md) и [концепция](docs/concept.md).
 
-Dynamic NatsRuntime поддерживает broker-authorized join/rejoin, peer liveness и
-recovery для новых streams. Готовые клиентские приложения/HTTP-SOCKS-VPN proxy,
-transparent byte resumption, native FFI и мобильные адаптеры ещё не реализованы.
-[Daemon/IPC v1](docs/daemon-ipc.md) реализован для Linux; выдача network identity/credentials остаётся host provisioning.
-Логические бюджеты Core не являются гарантией RSS всего процесса. Текущие типы и wire остаются экспериментальными.
+Динамический NatsRuntime поддерживает присоединение и повторное присоединение
+с проверкой прав брокером, контроль живости участников и восстановление
+для новых потоков. Готовые клиентские приложения, прокси HTTP/SOCKS/VPN,
+прозрачное возобновление передачи байтов, нативный FFI и мобильные адаптеры
+ещё не реализованы.
+[Демон и IPC v1](docs/daemon-ipc.md) реализованы для Linux;
+[серверный коннектор](docs/server-connector.md) выдаёт учётные данные пользователей
+NATS и управляет жизненным циклом TLS. Полных клиентских приложений пока нет.
+Логические бюджеты Core не гарантируют RSS всего процесса.
+Текущие типы и формат пакетов остаются экспериментальными.
 
-[Dynamic NATS runtime: join, recovery, trust, queues and embedding](docs/nats-runtime.md).
+[Динамический NATS runtime: присоединение, восстановление, доверие, очереди и встраивание](docs/nats-runtime.md).

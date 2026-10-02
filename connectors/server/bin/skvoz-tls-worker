@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+require 'bundler/setup'
+require_relative '../lib/skvoz/server/tls'
+config_path, directory, result_path = ARGV
+begin
+  config = JSON.parse(Skvoz::Server::PrivateFiles.read(config_path))
+  material = Skvoz::Server::CertificateIssuer.new(config, directory).issue
+  Skvoz::Server::PrivateFiles.write(result_path, JSON.generate('ok' => true, 'material' => material))
+rescue StandardError
+  Skvoz::Server::PrivateFiles.write(result_path, JSON.generate('ok' => false))
+  exit 1
+end

@@ -46,6 +46,8 @@ pub enum Membership {
 #[derive(Clone)]
 pub struct RuntimeConfig {
     pub url: String,
+    /// Optional certificate identity override; dialing and SNI still follow `url`.
+    pub tls_server_name: Option<String>,
     pub trust: Trust,
     pub authentication: Authentication,
     pub namespace: String,
@@ -340,6 +342,7 @@ impl RuntimeConfig {
     ) -> Self {
         Self {
             url: url.into(),
+            tls_server_name: None,
             trust,
             authentication,
             namespace: namespace.into(),
@@ -365,7 +368,11 @@ impl RuntimeConfig {
     /// Validate an embedding profile without I/O; returns its transport payload bound.
     pub fn validate_profile(&self, limits: ManagerConfig) -> Result<usize, RuntimeError> {
         let address: async_nats::ServerAddr = self.url.parse().map_err(|_| RuntimeError::Config)?;
-        if address.username().is_some()
+        if self
+            .tls_server_name
+            .as_deref()
+            .is_some_and(|name| crate::runtime_tls::identity(name).is_err())
+            || address.username().is_some()
             || address.password().is_some()
             || self.namespace.len() > 256
             || self.namespace.split('.').any(|t| !valid_token(t))
@@ -489,7 +496,10 @@ impl NatsRuntime {
                 }
             }
         });
-        if let Trust::ManagedCa(ca) = &self.config.trust {
+        if let Some(name) = self.config.tls_server_name.as_deref() {
+            options =
+                options.tls_client_config(crate::runtime_tls::config(&self.config.trust, name)?);
+        } else if let Trust::ManagedCa(ca) = &self.config.trust {
             options = options.add_root_certificates(ca.clone());
         }
         let client = tokio::time::timeout(

@@ -1,0 +1,90 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+abort 'Ruby 4.0.7 is required' unless RUBY_VERSION == '4.0.7'
+require 'bundler/setup'
+require 'optparse'
+require 'io/console'
+require_relative '../lib/skvoz/server/service'
+
+module Skvoz
+  module Server
+    module CLI
+      def self.main(arguments)
+        command = arguments.shift
+        return puts('skvoz-server 0.1.0') if command == '--version'
+        if command.nil? || %w[-h --help].include?(command)
+          puts 'Usage: skvoz-server serve [--config FILE] | health [--state DIR] | user add|list|show|device-add|reset-password|remove [LOGIN] [--state DIR] [--password-stdin|--prompt-password]'
+          return
+        end
+        options = { state: ENV.fetch('SKVOZ_STATE_DIR', '/var/lib/skvoz') }
+        if command == 'serve'
+          OptionParser.new { |parser| parser.on('--config FILE') { |path| options[:config] = path } }.parse!(arguments)
+          raise Error, 'Unexpected arguments' unless arguments.empty?
+          value = if options[:config]
+            JSON.parse(PrivateFiles.read(File.expand_path(options[:config])))
+          else
+            { 'state_dir' => options[:state], 'address' => ENV['SKVOZ_ADDRESS'],
+              'port' => Integer(ENV.fetch('SKVOZ_PORT', '4222')),
+              'advertised_port' => Integer(ENV.fetch('SKVOZ_ADVERTISED_PORT', ENV.fetch('SKVOZ_PORT', '4222'))),
+              'core_binary' => ENV.fetch('SKVOZ_CORE_BINARY', 'skvoz-core-daemon'),
+              'nats_binary' => ENV.fetch('SKVOZ_NATS_BINARY', 'nats-server'),
+              'allow' => ENV.fetch('SKVOZ_ALLOW_CIDRS', '').split(',').reject(&:empty?),
+              'tls' => { 'email' => ENV['SKVOZ_ACME_EMAIL'], 'terms_agreed' => ENV['SKVOZ_ACME_TERMS_AGREED'] == 'true' } }
+          end
+          config = Configuration.new(value)
+          service = Service.new(config)
+          previous = %w[INT TERM].to_h { |name| [name, Signal.trap(name) { service.stop }] }
+          Async { |task| service.run(task) }.wait
+          previous.each { |name, handler| Signal.trap(name, handler) }
+        else
+          operation = command == 'health' ? 'health' : arguments.shift
+          raise Error, 'Unsupported command' unless command == 'health' || command == 'user'
+          login = arguments.shift unless %w[health list].include?(operation)
+          parser = OptionParser.new do |flags|
+            flags.on('--state DIR') { |path| options[:state] = path }
+            flags.on('--password-stdin') { options[:stdin] = true }
+            flags.on('--prompt-password') { options[:prompt] = true }
+          end
+          parser.parse!(arguments)
+          raise Error, 'Unexpected arguments' unless arguments.empty? && !(options[:stdin] && options[:prompt])
+          password = if options[:stdin]
+            input = STDIN.read(1025)
+            raise Error, 'Password input exceeds limit' if input.bytesize > 1024
+            input.delete_suffix("\n").delete_suffix("\r")
+          elsif options[:prompt]
+            raise Error, 'Interactive terminal required' unless IO.console
+            IO.console.getpass('Password: ')
+          end
+          raise Error, 'device-add requires password stdin or prompt' if operation == 'device-add' && password.nil?
+          result = request(File.expand_path(options[:state]), operation:, login:, password:)
+          puts JSON.pretty_generate(result)
+          exit 1 if operation == 'health' && result['healthy'] != true
+        end
+      rescue StandardError
+        warn 'SKVOZ command failed: invalid configuration, unavailable service, or rejected operation'
+        exit 1
+      end
+
+      def self.request(directory, **request)
+        PrivateFiles.directory(directory)
+        path = File.join(directory, 'admin.sock')
+        stat = File.lstat(path)
+        raise Error, 'Unsafe admin endpoint' unless stat.socket? && stat.uid == Process.euid && stat.mode & 0o777 == 0o600
+        Timeout.timeout(30) do
+          socket = UNIXSocket.new(path)
+          socket.write(JSON.generate(request.transform_keys(&:to_s)) + "\n")
+          line = socket.gets("\n", 65_537)
+          raise Error, 'Administration response invalid' unless line && line.bytesize <= 65_536 && line.end_with?("\n")
+          response = JSON.parse(line)
+          raise Error, 'Administration operation rejected' unless response['ok'] == true
+          response.fetch('result')
+        ensure
+          socket&.close
+        end
+      rescue Timeout::Error
+        raise Error, 'Administration deadline exceeded'
+      end
+    end
+  end
+end
+Skvoz::Server::CLI.main(ARGV)

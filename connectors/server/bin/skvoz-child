@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+parent = Integer(ARGV.shift, 10)
+exit 70 unless Process.ppid == parent
+command = ARGV.shift
+exit 70 if command.nil? || Process.ppid != parent
+exec(command, *ARGV, close_others: true)

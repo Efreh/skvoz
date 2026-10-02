@@ -11,6 +11,7 @@ use std::{
 pub fn config(id: u64, case: &str) -> Result<RuntimeConfig, BenchError> {
     Ok(RuntimeConfig {
         url: std::env::var("SKVOZ_NATS_URL")?,
+        tls_server_name: None,
         trust: Trust::ManagedCa(std::env::var("SKVOZ_NATS_CA")?.into()),
         authentication: Authentication {
             username: format!("p{id}"),

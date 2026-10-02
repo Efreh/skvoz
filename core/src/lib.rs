@@ -10,6 +10,8 @@ mod manager;
 pub mod nats;
 #[cfg(feature = "nats")]
 pub mod runtime;
+#[cfg(feature = "nats")]
+mod runtime_tls;
 mod stream;
 mod types;
 pub mod wire;

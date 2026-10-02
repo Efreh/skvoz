@@ -1,0 +1,7 @@
+services:
+  server:
+    image: skvoz-server:source
+    build:
+      context: ../..
+      dockerfile: connectors/server/Dockerfile
+      target: deploy

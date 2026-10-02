@@ -33,11 +33,11 @@ Ok(NatsRuntime::connect(config, limits).await?)
 }
 ```
 
-Компилируемый embedding example: [runtime_profile.rs](../core/examples/runtime_profile.rs).
-Host drives `turn` and drains events before relying on `peer_ready`.
-`RuntimeConfig::validate_profile(limits)` проверяет profile без I/O и возвращает
-configured transport payload bound. [Standalone daemon/IPC](daemon-ipc.md)
-использует тот же runtime для host languages.
+Компилируемый пример встраивания: [runtime_profile.rs](../core/examples/runtime_profile.rs).
+Приложение вызывает `turn` и извлекает события, прежде чем полагаться на `peer_ready`.
+`RuntimeConfig::validate_profile(limits)` проверяет профиль без I/O и возвращает
+настроенную границу транспортной нагрузки. [Отдельный демон с IPC](daemon-ipc.md)
+использует тот же runtime для приложений на других языках.
 
 `Trust::System` использует native trust store. `ManagedCa(PathBuf)` использует
 проверенный app-specific PEM bundle, без глобальной установки корня. TLS-first,
@@ -47,6 +47,22 @@ username/password; JWT/NKey credentials в этом профиле не подд
 сертификата — обязанности provisioner/host. TLS не выдаёт сертификаты и не
 позволяет доверять произвольному скачанному CA. URL с embedded userinfo запрещён;
 Debug конфигурации и typed errors не раскрывают endpoint или пароль.
+
+Core 1.3.0 добавляет `RuntimeConfig.tls_server_name: Option<String>`
+со значением `None` по умолчанию. Приложение может подключаться к
+`tls://127.0.0.1:4222`, проверяя явно заданный публичный IP-адрес или домен
+в SAN сертификата. Штатный `WebPkiServerVerifier` по-прежнему проверяет
+цепочку сертификатов, срок действия, SAN и подписи при установлении соединения;
+меняется только ожидаемое имя или IP-адрес. `System` загружает системные корни
+и прекращает подключение при ошибке загрузки. `ManagedCa` проверяет доверие
+только по переданным корням PEM; пустые, недоверенные или некорректные корни
+приводят к отказу. В текущем async-nats 0.50 загрузка системных корней
+выполняется также до применения собственной конфигурации TLS, поэтому
+повреждённое системное хранилище может помешать даже режиму `ManagedCa`.
+Это безопасный отказ без перехода к посторонним корням доверия.
+Параметр не меняет SNI из URL и не добавляет маршрутизацию TLS
+по виртуальным хостам. Без параметра сохраняется проверка имени из URL.
+[Профили демона](daemon-ipc.md) предоставляют то же необязательное поле.
 
 NATS должен объявлять `max_payload: 65588`: максимальный wire v1 packet 65564
 bytes плюс runtime envelope 24 bytes. Runtime отвергает и меньший, и больший
@@ -99,7 +115,7 @@ Broker permissions должны связывать sender PeerId, recipient Peer
 включая pending joins. Это явный контракт доверия к provisioning брокера;
 пересоздавать сервер для нового разрешённого клиента не требуется.
 
-Subjects:
+Темы NATS:
 
 ```text
 <namespace>.join.<recipient>.<sender>

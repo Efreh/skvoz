@@ -1,47 +1,62 @@
 # Текущая архитектура
 
-Документ описывает реализованные компоненты SKVOZ. Цели для production-узла,
+Документ описывает реализованные компоненты SKVOZ. Цели для рабочего серверного узла,
 клиентов и мобильных адаптеров находятся отдельно в [концепции](concept.md).
 
 ## Компоненты и границы
 
 `skvoz-core` — одна универсальная Rust-библиотека для любых коннекторов,
-client и server приложений. Stream/Manager/codec не выполняют I/O;
-опциональный feature `nats` добавляет статический NatsNode и динамический NatsRuntime на Tokio/async-nats.
-Роль приложения не меняет реализацию или контракт ядра.
+клиентских и серверных приложений. Stream, Manager и кодек не выполняют I/O;
+опциональная возможность `nats` добавляет статический NatsNode и динамический
+NatsRuntime на Tokio/async-nats. Роль приложения не меняет реализацию или контракт ядра.
 
-Manager привязывает поток к `(PeerId, stream_id)`, резервирует полное объявленное
-receive window при admission, ограничивает live/closing slots и pending DATA
-bytes глобально и по peer. Receive payload buffer выделяется только при DATA;
-у idle streams capacity равен нулю. Драйвер обслуживает ready queues и индекс
-opening deadlines; нормальный turn не сканирует все idle streams.
+[Серверный коннектор](server-connector.md) сейчас реализован на Ruby и управляет
+отдельными процессами NATS и демона Core, выдаёт учётные данные пользователей
+NATS и профили устройств, поддерживает жизненный цикл TLS. Через IPC он получает
+метаданные назначения с версией формата и разбирает их, затем передаёт прикладные
+байты TCP-сервисам, включая HTTP, без разбора прикладного протокола.
+По умолчанию разрешены публичные адреса Интернета; явные правила доступа
+позволяют строить мосты к частным и локальным сервисам.
+Граница коннектора не зависит от языка и допускает другую реализацию в будущем.
 
-Динамический [NatsRuntime](nats-runtime.md) поддерживает authenticated join/rejoin,
-новые поколения после transport loss и lane PING/PONG proof перед peer-ready.
-Он использует одну join connection и bounded lazy transport shards, без задач на
-каждый stream. `qualify` запускает отдельный release server и client processes;
-перегрузка одной lane закрывает её peers, а остальные shards продолжают работу.
+Manager привязывает поток к `(PeerId, stream_id)`, при допуске резервирует всё
+объявленное окно приёма, ограничивает число активных и закрывающихся потоков,
+а также объём ожидающих DATA глобально и по участникам.
+Буфер полезной нагрузки приёма выделяется только при DATA; у простаивающих
+потоков его ёмкость равна нулю. Драйвер обслуживает очереди готовых потоков
+и индекс сроков открытия; обычный цикл не просматривает все простаивающие потоки.
 
-В прежнем `load` many-client стенде все client/server приложения находятся в одном процессе,
-а брокер — в отдельном контейнере. В развёртывании приложения могут находиться
-на разных машинах. Server application со встроенным Core и NATS могут делить
-одну машину и её ресурсы. Стенд не доказывает capacity такой машины.
+Динамический [NatsRuntime](nats-runtime.md) поддерживает аутентифицированное
+присоединение и повторное присоединение, новые поколения после потери транспорта
+и подтверждение готовности транспортного канала через PING/PONG.
+Он использует одно соединение присоединения и ограниченное число транспортных
+сегментов, создаваемых по необходимости, без отдельной задачи на каждый поток.
+`qualify` запускает отдельные серверные и клиентские процессы сборки release;
+перегрузка канала закрывает его участников, а остальные сегменты продолжают работу.
+
+В прежнем многоклиентском стенде `load` все клиентские и серверные приложения
+находятся в одном процессе, а брокер — в отдельном контейнере.
+При развёртывании приложения могут находиться на разных машинах.
+Серверное приложение со встроенным Core и NATS могут делить одну машину
+и её ресурсы. Стенд не доказывает ёмкость такой машины.
 
 ```mermaid
 flowchart TB
-    subgraph clients["Отдельные client application processes"]
-        host["Коннекторы и caller buffers"]
-        runtime["Та же Core library: NatsRuntime / Manager / Streams"]
-        host <-->|"API / generation-safe events"| runtime
+    subgraph clients["Клиентские процессы"]
+        host["Коннекторы и буферы приложения"]
+        runtime["Та же библиотека Core: NatsRuntime / Manager / Streams"]
+        host <-->|"API / события с проверкой поколения"| runtime
     end
-    subgraph remote["Server host: процессы имеют отдельные ресурсы"]
-        server["Server application: коннектор + та же Core library"]
-        broker["Core NATS: TLS, credentials, sender/recipient/shard ACL"]
-        server <-->|"Join connection + bounded lazy lanes"| broker
+    subgraph remote["Сервер: отдельные процессы и их ресурсы"]
+        server["Коннектор Ruby: TCP, пользователи, ACME, управление процессами"]
+        daemon["Демон сервера: та же библиотека Core / NatsRuntime"]
+        target["TCP-сервис / назначение в Интернете"]
+        server <-->|"Закрытый IPC 1 / ограниченные очереди событий"| daemon
+        server <-->|"Прикладные байты TCP"| target
+        broker["NATS: TLS, учётные данные, ACL отправителя / получателя / сегмента"]
+        daemon <-->|"Соединение присоединения и каналы по необходимости"| broker
     end
-    runtime <-->|"TLS: join connection + lazy lane connections"| broker
-    legacy["Legacy demo/load: статические NatsNode в одном процессе"]
-    legacy <-->|"TLS / статические routes"| broker
+    runtime <-->|"TLS: присоединение и транспортные каналы"| broker
 ```
 
 Каждый NatsNode владеет одним NATS client и одной подпиской, без отдельного
@@ -65,31 +80,36 @@ TCP пример создаёт два выделенных NatsNode того ж
 и удалённый target. Он проверяет bytes/FIN/ответ после EOF. Для many-socket proxy
 нужен connector dispatcher; текущий relay не является таким proxy.
 
-## Standalone Core process
+## Отдельный процесс ядра Core
 
-[Daemon](daemon-ipc.md) встраивает тот же NatsRuntime и владеет его turn/event loop.
-Foreign language host передаёт bytes/metadata через framed private Unix socket.
-IPC session owns stream handles; incoming OPEN назначается одному acceptor lease.
-Другие local sessions открывают outbound streams. Full DATA write только продвигает
-IPC delivered watermark; реальный credit возвращает host CONSUME после обработки.
-Slow/overflow owner отменяется отдельно, в том числе среди owners одного NATS peer.
+[Демон](daemon-ipc.md) встраивает тот же NatsRuntime и управляет циклом
+обслуживания транспорта и событий. Приложение на другом языке передаёт
+байты и метаданные фреймами через закрытый Unix-сокет.
+Сессия IPC владеет дескрипторами потоков; входящие OPEN назначаются одному
+эксклюзивному получателю. Другие локальные сессии открывают исходящие потоки.
+Полная запись DATA продвигает только отметку доставки через IPC;
+реальный кредит возвращает коннектор через CONSUME после обработки байтов.
+Медленный владелец или владелец с переполненной очередью отменяется отдельно,
+в том числе среди владельцев одного участника NATS.
 
 ```mermaid
-flowchart TB
-    python["Python or Ruby connector process"]
-    subgraph daemon["Linux Core daemon process"]
-        ipc["Private IPC v1 and local owners"]
-        same["Same universal NatsRuntime and Manager"]
-        ipc <-->|"Generation-safe keys and consumed prefixes"| same
+flowchart LR
+    python["Процесс коннектора на Python или Ruby"]
+    subgraph daemon["Процесс демона Core в Linux"]
+        ipc["Закрытый IPC v1 и локальные владельцы"]
+        same["Те же универсальные NatsRuntime и Manager"]
+        ipc <-->|"Ключи с поколениями и потреблённые префиксы"| same
     end
-    remote["TLS NATS and remote same Core"]
-    python <-->|"Framed commands and raw DATA"| ipc
-    same <-->|"Join and bounded lanes"| remote
+    remote["TLS NATS и такое же удалённое ядро Core"]
+    python <-->|"Команды во фреймах и байты DATA"| ipc
+    same <-->|"Присоединение и ограниченные каналы"| remote
 ```
 
-Private0700 parent/socket0600 и UID peer credentials ограничивают local OS
-principal. Это не защита между произвольными same-UID процессами, не automatic
-per-connector incoming routing и не network credential provisioning.
+Закрытый родительский каталог с правами `0700`, сокет с правами `0600`
+и проверка UID участников ограничивают доступ локальным пользователем ОС.
+Это не защищает от других произвольных процессов того же UID,
+не распределяет входящие потоки автоматически между коннекторами
+и не выдаёт сетевые учётные данные.
 
 ## Открытие и возврат кредита
 
@@ -211,7 +231,7 @@ transparent byte resumption не реализовано.
 
 Статический NatsNode не обнаруживает тихий исчезнувший peer или потерю последней
 публикации. NatsRuntime обнаруживает их nonce heartbeat и applied-frame watermark. Логические byte counters не включают
-allocator overhead, externally retained frames/events, connector queues,
+накладные расходы выделения памяти, удерживаемые приложением фреймы и события, очереди коннектора,
 NATS/TLS/runtime buffers или broker. RSS нагрузки включает все clients и server
 в одном процессе; ограничения контейнера относятся только к брокеру. Короткий
 loopback эксперимент не доказывает WAN, mobile или whole-machine SLA.

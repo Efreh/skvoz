@@ -1,6 +1,6 @@
 # Core daemon и локальный IPC v1
 
-Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.1.0.
+Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.2.0.
 Он встраивает ту же [универсальную Core library/NatsRuntime](nats-runtime.md),
 которую можно использовать из Rust. Python/Ruby/другие host languages общаются
 через pathname Unix socket; отдельного client/server Core или native bindings нет.
@@ -131,7 +131,7 @@ Daemon не разбирает destination metadata и не dispatches прои�
 
 Все integers big-endian, без padding. Outer u32 length исключает4bytes самого
 prefix и включает body. Valid body32..65568bytes; size проверяется до allocation.
-Body header32bytes:
+Заголовок тела занимает 32 байта:
 
 | Поле | Размер |
 | --- | --- |
@@ -146,8 +146,8 @@ Body header32bytes:
 unknown command kind, EOF в partial frame и request replay закрывают только IPC
 owner. Версия1 fixed schema; новые major versions требуют явного negotiation и
 новой спецификации. Client обязан отвергать неизвестные версии/events.
-Public [vectors](../daemon/tests/fixtures/README.md),
-[Python helper](../clients/python/skvoz_ipc.py), [Ruby helper](../clients/ruby/skvoz_ipc.rb).
+Публичные [контрольные векторы](../daemon/tests/fixtures/README.md),
+[модуль Python](../clients/python/skvoz_ipc.py), [модуль Ruby](../clients/ruby/skvoz_ipc.rb).
 
 Первый command HELLO; request_id nonzero и строго возрастает для всех commands.
 События имеют request0. Handle0 для session/peer commands, nonzero для stream
@@ -174,16 +174,21 @@ local owner не закрывает его текущие streams. Pending join 
 HELLO response/error можно повторить с новым request до исходного hello timeout,
 например после освобождения acceptor lease; успешный HELLO повторно запрещён.
 
-Response kind0x8000, matching request; payload result_code u16, value u64, extra.
-OPEN возвращает новый handle в header. SEND value=accepted prefix length;
-WouldBlock value0. ACK value0. HELLO extra: negotiated version u16, session ID u64,
-daemon epoch u64, features u32=15 (duplex/consume/exclusive acceptor/status), затем
-шесть u32: max payload, max metadata, receive window, streams/owner, output frames,
-output bytes. PEER extra u8 ready. STATUS extra lifecycle u8(0Connecting,1Ready,
-2Recovering,3Failed,4ShuttingDown,5Closed), затем12u64: owners, mapped streams,
-queued frames, queued bytes, runtime streams, receive reserved bytes, pending send
-bytes, active peers, membership slots, connections, shard failures, peer timeouts.
-STATUS scans только bounded owner slots; detailed Core resources не сканируются.
+Ответ имеет kind `0x8000` и соответствующий запросу request_id;
+полезная нагрузка — result_code u16, value u64 и extra.
+OPEN возвращает новый handle в заголовке. У SEND value — длина принятого префикса;
+у WouldBlock и ACK value равен 0. HELLO extra содержит согласованную версию u16,
+ID сессии u64, эпоху демона u64, features u32=15
+(duplex/consume/exclusive acceptor/status), затем шесть u32:
+максимальный размер нагрузки, максимальный размер метаданных, окно приёма,
+потоки на владельца, число выходных фреймов и выходные байты.
+PEER extra — готовность u8. STATUS extra — жизненный цикл u8
+(0Connecting,1Ready,2Recovering,3Failed,4ShuttingDown,5Closed), затем 12 u64:
+владельцы, сопоставленные потоки, фреймы и байты в очереди, потоки runtime,
+зарезервированные байты приёма, ожидающие отправки байты, активные участники,
+слоты членства, соединения, отказы сегментов и тайм-ауты участников.
+STATUS просматривает только ограниченный набор слотов владельцев;
+подробные ресурсы Core не сканируются.
 
 | Result code | Значение |
 | --- | --- |
@@ -282,21 +287,27 @@ sequenceDiagram
 | join_frames | 128 | 1..65536 |
 | nats_commands | 16 | 1..65536 |
 
-Full allocated output frames count against slots AND bytes, including partially
-written frames; counters release only after full write. Each owner has at most
-one65568byte input body +4byte prefix, one command/pass,16KiB write/pass. Runtime
-events batch<=128; normal idle loop sleeps2ms, active loop yields. HELLO, partial
-frame and no-progress output have finite timeout; healthy idle session не истекает.
-Output capacity143 гарантирует место для mandatory STATUS143byte frame; DATA или
-metadata event крупнее выбранного cap вызывает owner cancellation.
+Выделенные выходные фреймы учитываются и в количестве, и в байтах,
+включая частично записанные фреймы; счётчики освобождаются только после полной
+записи. У каждого владельца не больше одного входного тела на 65 568 байт
+и префикса на 4 байта; за проход выполняются одна команда и запись до 16 КиБ.
+Пакет событий runtime ограничен 128 событиями; обычный цикл без работы ждёт
+2 мс, активный — передаёт управление планировщику. HELLO, частичный фрейм
+и запись без прогресса имеют конечный срок; здоровая простаивающая сессия не истекает.
+Выходная ёмкость 143 байта гарантирует место для обязательного фрейма STATUS
+на 143 байта. DATA или событие метаданных больше выбранного лимита отменяет владельца.
 
-Payload upper bound for IPC allocation: `owners*(output_bytes+65572)` plus
-one command body<=65568, one encoded transient<=65572 and up to128 event payloads
-`max(max_frame,512)` plus current event/response encoding<=65572 each. Это
-консервативная граница raw byte payload allocations, не RSS: container headers,
-BTree/VecDeque/node allocation, allocator slack, TLS/Tokio/kernel buffers и baseline
-отдельно. Runtime configured transport bound и Manager receive/send budgets
-из [runtime](nats-runtime.md) дополнительно конечны и не включены в IPC formula.
+Верхняя граница выделяемой полезной нагрузки IPC:
+`owners*(output_bytes+65572)`, плюс одно тело команды не больше 65 568 байт,
+один временный закодированный фрейм не больше 65 572 байт,
+до 128 полезных нагрузок событий размером `max(max_frame,512)`
+и текущие кодируемые событие и ответ не больше 65 572 байт каждый.
+Это консервативная граница памяти для байтов полезной нагрузки, а не RSS:
+заголовки контейнеров, выделения BTree/VecDeque/узлов, запас аллокатора,
+буферы TLS/Tokio/ядра ОС и базовая память учитываются отдельно.
+Настроенная граница транспортной нагрузки runtime и бюджеты приёма/отправки
+Manager из [контракта runtime](nats-runtime.md) также конечны
+и не включены в формулу IPC.
 
 Overflow/timeout закрывает только local IPC owner, никогда не terminate_peer:
 другой owner на том же peer сохраняет eligibility/progress. Большой owner не
@@ -312,3 +323,19 @@ queued-delivery proof отдельный bounded profile использует st
 output1MiB/2048frames; default64 incoming limit и отдельная tiny-queue failure
 не скрываются повышением cap. Foreign helpers имеют собственные4096events/8MiB
 queues; эти caller budgets не входят в daemon counters.
+
+## Проверка сертификата при отдельном адресе подключения
+
+Демон 1.2.0 и Core 1.3.0 добавляют необязательный параметр профиля
+`tls_server_name`: доменное имя в ASCII или IP-адрес без скобок.
+URL по-прежнему выбирает адрес подключения, а TLS проверяет явно заданное
+имя или IP-адрес в SAN сертификата с настроенными корнями доверия.
+Без этого параметра, как и раньше, проверяется имя из URL.
+Штатная проверка WebPKI сохраняет проверку цепочки, срока действия
+и подписей при установлении соединения. Параметр не меняет SNI из URL
+и не добавляет маршрутизацию TLS по виртуальным хостам.
+
+[Серверный коннектор](server-connector.md) использует эту возможность
+для защищённого подключения к NATS через loopback с проверкой публичного
+имени или IP-адреса сертификата. Подробности — в
+[контракте доверия runtime](nats-runtime.md).

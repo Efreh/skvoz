@@ -68,6 +68,11 @@ impl Profile {
         let ipc_path = PathBuf::from(string(&mut m, "ipc_path")?);
         endpoint::validate_endpoint_path(&ipc_path, uid).map_err(|_| "unsafe IPC path")?;
         let url = string(&mut m, "url")?;
+        let tls_server_name = match m.remove("tls_server_name") {
+            None => None,
+            Some(Value::String(name)) => Some(name),
+            _ => return Err("invalid TLS identity"),
+        };
         let username = string(&mut m, "username")?;
         let password = string(&mut m, "password")?;
         let namespace = string(&mut m, "namespace")?;
@@ -159,6 +164,7 @@ impl Profile {
             id,
             membership,
         );
+        runtime.tls_server_name = tls_server_name;
         runtime.initiate = initiate;
         runtime.shards = limit(&mut l, "shards", 8, 1, 32)?;
         runtime.subscription_capacity = limit(&mut l, "subscription_frames", 128, 1, 65536)?;

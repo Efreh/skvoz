@@ -22,6 +22,7 @@ skvoz/
 │   ├── ruby/           # stdlib IPC helper/echo example
 │   └── README.md       # правила; полных клиентских приложений пока нет
 ├── connectors/         # коннекторы внешнего I/O
+│   ├── server/         # Ruby host, Gemfile/lock, bin/lib/spec, Docker/Compose
 │   └── tcp/            # package skvoz-tcp, relay одного сокета
 │       ├── Cargo.toml
 │       ├── src/
@@ -35,7 +36,7 @@ skvoz/
 └── README.md           # вход в общий проект
 ```
 
-Каждый подпроект хранит свои исходники, manifest/build config, тесты и
+Каждый подпроект хранит свои исходники, манифест и конфигурацию сборки, тесты и
 компонентные инструменты в собственном каталоге. README описывает назначение,
 границы и команды. Общая документация описывает назначение компонентов,
 их интерфейсы, ограничения и способы сборки/проверки.
@@ -59,11 +60,17 @@ python3 testbench/run.py check
 python3 testbench/run.py demo
 ```
 
-Для запуска с заранее скачанными зависимостями/image добавьте `--offline`.
+Для запуска с заранее скачанными зависимостями и образами добавьте `--offline`.
 
 [Указатель документации](README.md) связывает инструкции запуска, текущую
 архитектуру и контракты. [Концепция](concept.md) описывает направления развития.
 
-Dynamic runtime/control contract: [NATS runtime](nats-runtime.md). Independent release-process qualification and its measurement scope: [getting started](getting-started.md#независимые-процессы-runtime).
+Контракт динамического runtime и управления: [NATS runtime](nats-runtime.md).
+Проверка в независимых процессах сборки release и границы измерений:
+[первый запуск](getting-started.md#независимые-процессы-runtime).
 
-Standalone executable/source configuration and Unix socket contract: [daemon/IPC](daemon-ipc.md).
+Сборка и конфигурация отдельного исполняемого ядра, контракт Unix-сокета:
+[демон и IPC](daemon-ipc.md).
+
+Сервер TCP со всеми компонентами, единый Dockerfile для локальной сборки и CI/GHCR:
+[серверный коннектор](server-connector.md).
