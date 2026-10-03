@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=SKVOZ
-Comment=Локальный HTTP и SOCKS5 прокси через NATS
+Comment=Соединение SKVOZ для ваших приложений
 Exec=/usr/bin/skvoz-client
 Icon=org.skvoz.Client
 Terminal=false

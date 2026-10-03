@@ -46,7 +46,13 @@ impl Drop for Guard {
     }
 }
 impl Proxies {
-    pub async fn start(path: PathBuf, http: u16, socks: u16, budget: Budgets) -> Result<Self> {
+    pub async fn start(
+        path: PathBuf,
+        http: u16,
+        socks: u16,
+        budget: Budgets,
+        telemetry: Arc<crate::telemetry::Telemetry>,
+    ) -> Result<Self> {
         if !(1..=62).contains(&budget.connections)
             || !(1..=128).contains(&budget.frames)
             || !(1024..=2 * crate::RECEIVE_WINDOW).contains(&budget.bytes)
@@ -70,10 +76,10 @@ impl Proxies {
                     _ = stop_rx.changed() => break,
                     Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     accepted = http.accept() => {
-                        if let Ok((socket, _)) = accepted { admit(&mut tasks, socket, false, &path, budget, &count); }
+                        if let Ok((socket, _)) = accepted { admit(&mut tasks, socket, false, &path, budget, &count, &telemetry); }
                     },
                     accepted = socks.accept() => {
-                        if let Ok((socket, _)) = accepted { admit(&mut tasks, socket, true, &path, budget, &count); }
+                        if let Ok((socket, _)) = accepted { admit(&mut tasks, socket, true, &path, budget, &count, &telemetry); }
                     },
                 }
             }
@@ -97,6 +103,7 @@ fn admit(
     path: &std::path::Path,
     budget: Budgets,
     active: &Arc<AtomicUsize>,
+    telemetry: &Arc<crate::telemetry::Telemetry>,
 ) {
     if active.load(Ordering::Relaxed) >= budget.connections {
         return;
@@ -104,9 +111,10 @@ fn admit(
     active.fetch_add(1, Ordering::Relaxed);
     let guard = Guard(active.clone());
     let path = path.to_owned();
+    let flow = telemetry.flow();
     tasks.spawn(async move {
         let _guard = guard;
-        let _ = connection(socket, socks, path, budget).await;
+        let _ = connection(socket, socks, path, budget, flow).await;
     });
 }
 
@@ -359,6 +367,7 @@ async fn connection(
     socks: bool,
     path: PathBuf,
     budget: Budgets,
+    mut flow: crate::telemetry::Flow,
 ) -> Result<()> {
     // Tokio writes directly into the finite OS send buffer; no application output queue.
     socket.set_nodelay(true)?;
@@ -375,6 +384,17 @@ async fn connection(
         } else {
             http_handshake(&mut socket).await?
         };
+        flow.destination(
+            if socks {
+                "SOCKS5"
+            } else if http.tunnel {
+                "CONNECT"
+            } else {
+                "HTTP"
+            },
+            &http.host,
+            http.port,
+        );
         let mut session = Owner::connect(&path, budget.frames, budget.bytes).await?;
         let mut metadata = 0u64.to_be_bytes().to_vec();
         metadata.extend_from_slice(
@@ -414,9 +434,11 @@ async fn connection(
                 };
                 let _ = tokio::time::timeout(Duration::from_secs(1), socket.write_all(bytes)).await;
             }
+            flow.finish(Err(error));
             return Err(error);
         }
     };
+    flow.opened();
     if socks {
         socket.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
     } else if http.tunnel {
@@ -424,7 +446,8 @@ async fn connection(
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
     }
-    let result = relay(&mut socket, &mut session, handle, http.initial).await;
+    let result = relay(&mut socket, &mut session, handle, http.initial, &flow).await;
+    flow.finish(result);
     let _ = session.commands.request(8, handle, &[], &[0, 4]).await;
     let _ = socket.shutdown().await;
     result
@@ -434,10 +457,11 @@ async fn relay(
     owner: &mut Owner,
     handle: u128,
     initial: Vec<u8>,
+    flow: &crate::telemetry::Flow,
 ) -> Result<()> {
     let (mut reader, mut writer) = socket.split();
     let commands = owner.commands.clone();
-    let send = async move {
+    let send = async {
         let mut pending = initial;
         let mut buffer = [0; crate::DATA_BLOCK];
         loop {
@@ -456,6 +480,7 @@ async fn relay(
             if reply.code == 4 || reply.value > part as u64 {
                 return Err(Error("ipc_failed"));
             }
+            flow.upload(reply.value);
             pending.drain(..reply.value as usize);
             if reply.value == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -486,7 +511,9 @@ async fn relay(
                         return Err(Error("ipc_failed"));
                     }
                     writer.write_all(&event.payload[8..]).await?;
-                    offset += event.payload.len() as u64 - 8;
+                    let bytes = event.payload.len() as u64 - 8;
+                    flow.download(bytes);
+                    offset += bytes;
                     commands
                         .request(6, handle, &offset.to_be_bytes(), &[0, 4])
                         .await?;
@@ -597,8 +624,16 @@ mod tests {
         let mut socket = accepted.unwrap().0;
         let mut owner = Owner::connect(&path, 32, 65536).await.unwrap();
         client.shutdown().await.unwrap();
-        let transfer =
-            tokio::spawn(async move { relay(&mut socket, &mut owner, 1, Vec::new()).await });
+        let transfer = tokio::spawn(async move {
+            relay(
+                &mut socket,
+                &mut owner,
+                1,
+                Vec::new(),
+                &crate::telemetry::Telemetry::new(false).flow(),
+            )
+            .await
+        });
         tokio::time::timeout(Duration::from_secs(5), failed)
             .await
             .unwrap()

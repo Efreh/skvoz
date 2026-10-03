@@ -22,6 +22,17 @@ pub struct Preferences {
     pub devices: BTreeMap<String, String>,
     #[serde(default)]
     pub passwords: BTreeMap<String, String>,
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default)]
+    pub auto_connect: bool,
+    #[serde(default)]
+    pub tray_speed: bool,
+    #[serde(default = "enabled")]
+    pub request_log: bool,
+}
+fn enabled() -> bool {
+    true
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -35,6 +46,10 @@ impl Default for Preferences {
             ca_file: String::new(),
             devices: BTreeMap::new(),
             passwords: BTreeMap::new(),
+            autostart: false,
+            auto_connect: false,
+            tray_speed: false,
+            request_log: true,
         }
     }
 }
@@ -360,7 +375,15 @@ mod persistence_tests {
         let directory = std::env::temp_dir().join(format!("skvoz-settings-{}", token().unwrap()));
         let settings = Settings::open(directory.clone()).unwrap();
         let mut legacy = serde_json::to_value(&settings.value).unwrap();
-        legacy.as_object_mut().unwrap().remove("passwords");
+        for name in [
+            "passwords",
+            "autostart",
+            "auto_connect",
+            "tray_speed",
+            "request_log",
+        ] {
+            legacy.as_object_mut().unwrap().remove(name);
+        }
         write_private(
             &directory.join("settings.json"),
             &serde_json::to_vec(&legacy).unwrap(),
@@ -369,6 +392,10 @@ mod persistence_tests {
         drop(settings);
         let mut settings = Settings::open(directory.clone()).unwrap();
         assert!(settings.value.passwords.is_empty());
+        assert!(
+            !settings.value.autostart && !settings.value.auto_connect && !settings.value.tray_speed
+        );
+        assert!(settings.value.request_log);
         let mut candidate = settings.value.clone();
         candidate
             .passwords

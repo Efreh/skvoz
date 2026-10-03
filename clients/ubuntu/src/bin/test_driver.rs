@@ -35,6 +35,7 @@ fn main() {
                 config["username"].as_str().unwrap(),
             )
         });
+    preferences.request_log = config["request_log"].as_bool().unwrap_or(true);
     settings.save(preferences).unwrap();
     let budgets = Budgets {
         connections: config["budgets"]["max_connections"].as_u64().unwrap_or(62) as usize,
@@ -54,6 +55,12 @@ fn main() {
     let (status_tx, status_rx) =
         std::sync::mpsc::sync_channel::<skvoz_ubuntu_client::backend::Status>(32);
     let control = tx.clone();
+    let reconnect = Control::Connect {
+        host: config["host"].as_str().unwrap().to_owned(),
+        port: config["port"].as_u64().unwrap() as u16,
+        username: config["username"].as_str().unwrap().to_owned(),
+        password: password.clone(),
+    };
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             let Ok(line) = line else {
@@ -66,6 +73,9 @@ fn main() {
                 Some("quit") => Control::Quit,
                 Some("info") => Control::Info,
                 Some("kill-core") => Control::KillCore,
+                Some("resume") => Control::Resume,
+                Some("disconnect") => Control::Disconnect,
+                Some("connect") => reconnect.clone(),
                 _ => continue,
             };
             if control.blocking_send(input).is_err() {
@@ -98,12 +108,6 @@ fn main() {
             }
             if status.state == "error" {
                 println!("{}", serde_json::json!({"failed":status.error}));
-            }
-            if status.info {
-                println!(
-                    "{}",
-                    serde_json::json!({"info":true,"peer_id":status.peer_id,"pid":status.pid,"runtime":status.runtime,"connections":status.connections})
-                );
             }
             io::stdout().flush().unwrap();
         }

@@ -1,8 +1,11 @@
 pub mod backend;
+pub mod desktop;
 pub mod enrollment;
 pub mod ipc;
 pub mod proxy;
 pub mod settings;
+pub mod telemetry;
+pub mod tray;
 pub mod ui;
 pub const DAEMON_VERSION: &str = "1.4.0";
 pub const RECEIVE_WINDOW: usize = 1024 * 1024;

@@ -36,8 +36,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ubuntu-client-${{ github.ref }}
-  cancel-in-progress: true
+  group: ubuntu-client-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   package:
     runs-on: ubuntu-24.04
@@ -49,7 +49,7 @@ jobs:
       - name: Native UI build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev pkg-config xvfb xauth dbus-x11 x11-apps adwaita-icon-theme librsvg2-common curl openssl
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev pkg-config xvfb xauth dbus-x11 x11-apps adwaita-icon-theme librsvg2-common curl openssl jq
           rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
           rustup default 1.92.0
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
@@ -91,24 +91,45 @@ jobs:
           /usr/lib/skvoz-client/skvoz-core-daemon --version
           sudo dpkg -i clients/ubuntu/dist/skvoz-client_*_amd64.deb
           sudo apt-get remove -y skvoz-client
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: skvoz-ubuntu-amd64
-          path: |
-            clients/ubuntu/dist/*.deb
-            clients/ubuntu/dist/*.sha256
-          if-no-files-found: error
-          retention-days: 14
-      - name: Publish versioned client release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ubuntu-v')
+      - name: Publish client release and retain five latest
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' ||
+          startsWith(github.ref, 'refs/tags/ubuntu-v'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
           package=$(find clients/ubuntu/dist -name '*.deb' -print -quit)
           version=$(dpkg-deb -f "$package" Version)
-          test "$GITHUB_REF_NAME" = "ubuntu-v$version"
-          printf '%s\n' 'SKVOZ: клиент Ubuntu 24.04+ amd64. Установите deb через apt; контрольная сумма SHA256 приложена.' > "$RUNNER_TEMP/release-notes.txt"
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" --verify-tag --title "SKVOZ Ubuntu $version" --notes-file "$RUNNER_TEMP/release-notes.txt"
+          (cd clients/ubuntu/dist && sha256sum -c ./*.sha256)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+            test "$tag" = "ubuntu-v$version"
+            tag_options=(--verify-tag)
+            title="SKVOZ Ubuntu $version"
+          else
+            tag="ubuntu-v$version-build.$GITHUB_RUN_NUMBER"
+            tag_options=(--target "$GITHUB_SHA")
+            title="SKVOZ Ubuntu $version (сборка $GITHUB_RUN_NUMBER)"
           fi
-          gh release upload "$GITHUB_REF_NAME" clients/ubuntu/dist/*.deb clients/ubuntu/dist/*.sha256 --clobber
+          printf '%s\n' 'SKVOZ: клиент Ubuntu 24.04+ amd64. Установите deb через apt; контрольная сумма SHA256 приложена.' > "$RUNNER_TEMP/release-notes.txt"
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
+            echo "Release already exists: $tag (draft=$draft)"
+          else
+            gh release create "$tag" --draft "${tag_options[@]}" --title "$title" --notes-file "$RUNNER_TEMP/release-notes.txt"
+            draft=true
+          fi
+          if [[ "$draft" == true ]]; then
+            gh release upload "$tag" clients/ubuntu/dist/*.deb clients/ubuntu/dist/*.sha256 --clobber
+            gh release edit "$tag" --draft=false --latest
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp > "$RUNNER_TEMP/releases.json"
+          jq -r '
+            add | map(select(.draft == false and (.tag_name | startswith("ubuntu-v"))))
+            | sort_by(.published_at, .id) | reverse | .[5:][] | .tag_name
+          ' "$RUNNER_TEMP/releases.json" > "$RUNNER_TEMP/obsolete-releases.txt"
+          while IFS= read -r obsolete; do
+            gh release delete "$obsolete" --yes
+          done < "$RUNNER_TEMP/obsolete-releases.txt"

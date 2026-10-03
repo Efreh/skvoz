@@ -130,7 +130,8 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
   end
 
   it 'preserves multi-window binary transfers through HTTP, TLS CONNECT and SOCKS with another device active' do
-    bulk, healthy = application('bulk'), application('healthy')
+    bulk, healthy = application('bulk', request_log: ENV.fetch('SKVOZ_REQUEST_LOG', '1') == '1'), application('healthy')
+    started = monotonic
     payload = (0..255).to_a.pack('C*') * 16_384
     transfers = Thread.new do
       [false, true].each do |socks|
@@ -141,6 +142,9 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     4.times { expect(curl(healthy, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response') }
     expect(transfers.join(60)).not_to be_nil
     transfers.value
+    if ENV['SKVOZ_CLIENT_BULK_REPORT']
+      File.write(ENV.fetch('SKVOZ_CLIENT_BULK_REPORT'), JSON.pretty_generate(bytes_per_direction: payload.bytesize * 3, seconds: monotonic - started, request_log: ENV.fetch('SKVOZ_REQUEST_LOG', '1') == '1', client_rss_kib: File.read("/proc/#{bulk.process.pid}/status")[/^VmRSS:\s+(\d+) kB/, 1].to_i, scope: 'loopback real HTTP/SOCKS/CONNECT, three 4MiB uploads and responses plus concurrent device; excludes startup'))
+    end
     [bulk, healthy].each { |app| wait_until { app.info['connections'].zero? } }
     limits = JSON.parse(@server.state.join('core-profile.json').read).fetch('limits')
     expect(limits.fetch('receive_window')).to eq(1_048_576)
@@ -184,6 +188,68 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     expect(curl(app, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
     runtime = app.info['runtime']; app.close
     expect(File.exist?(runtime)).to be(false)
+  end
+
+  it 'keeps connection intent across resume and initial offline startup, but leaves a disconnected application idle' do
+    app = application('wake')
+    id = app.ready['peer_id']
+    active = tunnel(app)
+    active.write('interrupted')
+    app.command('resume')
+    app.event { |value| value['state'] == 'reconnecting' }
+    app.event { |value| value['state'] == 'connected' }
+    expect(app.info['peer_id']).to eq(id)
+    expect(Timeout.timeout(5) { active.read }).to eq('')
+    active.close
+    expect(curl(app, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+    app.command('disconnect')
+    app.event { |value| value['state'] == 'disconnected' }
+    app.command('resume')
+    expect(app.info['state']).to eq('disconnected')
+    expect { TCPSocket.new('127.0.0.1', app.http) }.to raise_error(Errno::ECONNREFUSED)
+    @server.stop
+    offline = UbuntuSystem::Application.new(@directory.join('offline'), @server, wait_ready: false)
+    @applications << offline
+    offline.event { |value| value['state'] == 'reconnecting' }
+    # Info and resume notifications during a retry must not cancel intent.
+    offline.command('info'); offline.command('resume')
+    @server.start
+    offline.event(timeout: 45) { |value| value['state'] == 'connected' }
+    expect(curl(offline, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+    expect(app.info['state']).to eq('disconnected')
+  ensure
+    active&.close
+  end
+
+  it 'counts actual payload directions and records bounded destination metadata without content' do
+    app = application('observed')
+    [false, true].each do |socks|
+      before = app.info
+      socket = tunnel(app, socks:)
+      payload = 'private-payload-query=password' * 4096
+      socket.write(payload); socket.close_write
+      expect(Timeout.timeout(15) { socket.read }).to eq('after-fin:' + payload.reverse)
+      socket.close
+      wait_until { app.info['connections'].zero? }
+      info = app.info
+      expect(info.fetch('uploaded') - before.fetch('uploaded')).to eq(payload.bytesize)
+      expect(info.fetch('downloaded') - before.fetch('downloaded')).to eq(payload.bytesize + 'after-fin:'.bytesize)
+      requests = info.fetch('requests')
+      expect(requests.length).to be <= 500
+      expect(requests.last).to include('protocol' => socks ? 'SOCKS5' : 'CONNECT', 'host' => '127.0.0.1', 'port' => @echo.port, 'result' => 'finished', 'uploaded' => payload.bytesize)
+      expect(JSON.generate(requests)).not_to include('private-payload', 'query=password', 'process-test-password')
+    end
+    expect(curl(app, "http://localhost:#{@target.port}/private-path?secret=hidden")).to eq('skvoz-real-http-response')
+    wait_until { app.info['connections'].zero? }
+    requests = app.info.fetch('requests')
+    expect(requests.last).to include('protocol' => 'HTTP', 'host' => 'localhost')
+    expect(JSON.generate(requests)).not_to include('private-path', 'hidden')
+    quiet = application('unobserved', request_log: false)
+    expect(curl(quiet, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+    info = quiet.info
+    expect(info.fetch('uploaded')).to be > 0
+    expect(info.fetch('downloaded')).to be > 0
+    expect(info.fetch('requests', [])).to eq([])
   end
 
   it 'rejects bad credentials/trust, ambiguous framing, forbidden targets and excessive local handshakes' do

@@ -23,6 +23,10 @@ pub struct Status {
     pub runtime: Option<PathBuf>,
     pub connections: usize,
     pub info: bool,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<crate::telemetry::Request>,
 }
 pub type SharedSettings = Arc<Mutex<Settings>>;
 pub struct Engine {
@@ -34,10 +38,18 @@ pub struct Engine {
     pub peer_id: Option<u64>,
     pub state: &'static str,
     pub budgets: Budgets,
+    pub telemetry: Arc<crate::telemetry::Telemetry>,
 }
 impl Engine {
     pub fn new(settings: SharedSettings, daemon: PathBuf, budgets: Budgets) -> Self {
+        let telemetry = crate::telemetry::Telemetry::new(
+            settings
+                .lock()
+                .map(|s| s.value.request_log)
+                .unwrap_or(false),
+        );
         Self {
+            telemetry,
             settings,
             daemon,
             child: None,
@@ -56,6 +68,9 @@ impl Engine {
             pid: self.child.as_ref().and_then(Child::id),
             runtime: self.runtime.clone(),
             info: false,
+            uploaded: self.telemetry.uploaded.load(Ordering::Relaxed),
+            downloaded: self.telemetry.downloaded.load(Ordering::Relaxed),
+            requests: Vec::new(),
             connections: self
                 .proxies
                 .as_ref()
@@ -194,6 +209,7 @@ impl Engine {
                 preferences.http_port,
                 preferences.socks_port,
                 self.budgets,
+                self.telemetry.clone(),
             )
             .await?,
         );
@@ -391,6 +407,7 @@ pub fn bundled_daemon() -> Result<PathBuf> {
     Ok(directory.join("skvoz-core-daemon"))
 }
 
+#[derive(Clone)]
 pub enum Control {
     Connect {
         host: String,
@@ -400,9 +417,33 @@ pub enum Control {
     },
     Disconnect,
     Info,
+    Resume,
+    NetworkAvailable,
     #[cfg(feature = "qualification")]
     KillCore,
     Quit,
+}
+async fn attempt_start(
+    engine: &mut Engine,
+    input: &Credentials,
+    commands: &mut tokio::sync::mpsc::Receiver<Control>,
+    status: &std::sync::mpsc::SyncSender<Status>,
+) -> (Option<Result<()>>, bool) {
+    let mut interim = engine.status(None);
+    interim.state = "connecting";
+    let startup = engine.start(input);
+    tokio::pin!(startup);
+    loop {
+        tokio::select! {
+            result = &mut startup => return (Some(result), false),
+            command = commands.recv() => match command {
+                Some(Control::Info) => { let mut value = interim.clone(); value.info = true; let _ = status.try_send(value); },
+                Some(Control::Resume | Control::NetworkAvailable) => {},
+                Some(Control::Quit) | None => return (None, true),
+                _ => return (None, false),
+            }
+        }
+    }
 }
 pub async fn run(
     mut engine: Engine,
@@ -413,6 +454,7 @@ pub async fn run(
     let mut retry = std::time::Instant::now();
     let mut delay = 1;
     let mut timer = tokio::time::interval(Duration::from_millis(500));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let emit = |engine: &Engine, error| {
         let _ = status.try_send(engine.status(error));
     };
@@ -427,20 +469,8 @@ pub async fn run(
                         Ok(input) => {
                             engine.state = "connecting";
                             emit(&engine, None);
-                            let attempt = tokio::select! {
-                                result = engine.start(&input) => Some(result),
-                                interrupt = commands.recv() => {
-                                    match interrupt {
-                                        Some(Control::Quit) | None => {
-                                            engine.cleanup().await;
-                                            engine.state = "stopped";
-                                            emit(&engine, None);
-                                            return;
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                            };
+                            let (attempt, quit) = attempt_start(&mut engine, &input, &mut commands, &status).await;
+                            if quit { engine.cleanup().await; engine.state = "stopped"; emit(&engine, None); return; }
                             match attempt {
                                 Some(Ok(())) => {
                                     credentials = Some(input);
@@ -448,7 +478,12 @@ pub async fn run(
                                 }
                                 Some(Err(error)) => {
                                     engine.cleanup().await;
-                                    engine.state = "error";
+                                    if retryable(error.0) {
+                                        credentials = Some(input);
+                                        engine.state = "reconnecting";
+                                        retry = std::time::Instant::now() + Duration::from_secs(1);
+                                        delay = 1;
+                                    } else { engine.state = "error"; }
                                     emit(&engine, Some(error.0));
                                 }
                                 None => {
@@ -471,7 +506,18 @@ pub async fn run(
                 Some(Control::Info) => {
                     let mut value = engine.status(None);
                     value.info = true;
+                    value.requests = engine.telemetry.history();
                     let _ = status.try_send(value);
+                }
+                Some(Control::NetworkAvailable) => { if credentials.is_some() && engine.state == "reconnecting" { retry = std::time::Instant::now(); } }
+                Some(Control::Resume) => {
+                    if credentials.is_some() {
+                        engine.cleanup().await;
+                        engine.state = "reconnecting";
+                        retry = std::time::Instant::now();
+                        delay = 1;
+                        emit(&engine, None);
+                    }
                 }
                 #[cfg(feature = "qualification")]
                 Some(Control::KillCore) => {
@@ -494,27 +540,16 @@ pub async fn run(
                         emit(&engine, None);
                     }
                     if engine.state == "reconnecting" && std::time::Instant::now() >= retry {
-                        let attempt = tokio::select! {
-                            result = engine.start(input) => Some(result),
-                            interrupt = commands.recv() => {
-                                match interrupt {
-                                    Some(Control::Quit) | None => {
-                                        engine.cleanup().await;
-                                        engine.state = "stopped";
-                                        emit(&engine, None);
-                                        return;
-                                    }
-                                    _ => None,
-                                }
-                            }
-                        };
+                        let (attempt, quit) = attempt_start(&mut engine, input, &mut commands, &status).await;
+                        if quit { engine.cleanup().await; engine.state = "stopped"; emit(&engine, None); return; }
                         match attempt {
                             Some(Ok(())) => {
                                 delay = 1;
                                 emit(&engine, None);
                             }
-                            Some(Err(_)) => {
+                            Some(Err(error)) => {
                                 engine.cleanup().await;
+                                if !retryable(error.0) { credentials = None; engine.state = "error"; emit(&engine, Some(error.0)); continue; }
                                 engine.state = "reconnecting";
                                 delay = (delay * 2).min(15);
                                 retry = std::time::Instant::now() + Duration::from_secs(delay);
@@ -531,6 +566,17 @@ pub async fn run(
             }
         }
     }
+}
+
+fn retryable(code: &str) -> bool {
+    matches!(
+        code,
+        "server_unavailable"
+            | "enrollment_failed"
+            | "core_unavailable"
+            | "io_failed"
+            | "ipc_failed"
+    )
 }
 
 pub fn read_ca(path: &Path) -> Result<Vec<u8>> {
