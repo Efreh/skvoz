@@ -1,17 +1,26 @@
 services:
   server:
-    image: ${SKVOZ_IMAGE:?Set SKVOZ_IMAGE to the reviewed GHCR image tag or digest}
+    # Replace the address and email before starting the server.
+    image: ghcr.io/efreh/skvoz/skvoz-server:latest
     init: true
     restart: unless-stopped
     environment:
-      SKVOZ_ADVERTISED_PORT: ${SKVOZ_LISTEN_PORT:-4222}
-      SKVOZ_ADDRESS: ${SKVOZ_ADDRESS:?Set the public IP address or DNS name}
-      SKVOZ_ACME_EMAIL: ${SKVOZ_ACME_EMAIL:?Set the certificate contact email}
-      SKVOZ_ACME_TERMS_AGREED: ${SKVOZ_ACME_TERMS_AGREED:?Set true after accepting issuer terms}
-      SKVOZ_ALLOW_CIDRS: ${SKVOZ_ALLOW_CIDRS:-}
+      SKVOZ_ADVERTISED_PORT: &listen_port "4222"
+      SKVOZ_ADDRESS: YOUR_PUBLIC_IP_OR_DNS_NAME
+      SKVOZ_ACME_EMAIL: YOUR_CERTIFICATE_CONTACT_EMAIL
+      # Set "true" only after accepting the certificate issuer's terms.
+      SKVOZ_ACME_TERMS_AGREED: "false"
+      SKVOZ_ALLOW_CIDRS: ""
     ports:
-      - "${SKVOZ_LISTEN_PORT:-4222}:4222"
+      - target: 4222
+        published: *listen_port
+        protocol: tcp
       - "80:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - state:/var/lib/skvoz
     read_only: true

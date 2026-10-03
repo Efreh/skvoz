@@ -5,7 +5,8 @@ set -euo pipefail
 if [[ "${1:-}" == '--run' ]]; then
     source "${2:-/etc/skvoz-auto-update/settings.sh}"
     for variable in ${!SKVOZ_@} ${!COMPOSE_@}; do unset "$variable"; done
-    compose=("$docker_bin" compose --env-file "$env_file" -p "$project_name" -f "$compose_file")
+    export COMPOSE_DISABLE_ENV_FILE=1
+    compose=("$docker_bin" compose -p "$project_name" -f "$compose_file")
     log=$(mktemp)
     trap 'rm -f "$log"' EXIT
     trap 'exit 143' TERM
@@ -33,21 +34,21 @@ if (( EUID != 0 )); then
     echo 'Run this script as root.' >&2
     exit 1
 fi
-if (( $# < 1 || $# > 3 )); then
-    echo 'Usage: auto-update-enable.sh ENV_FILE [COMPOSE_FILE [PROJECT_NAME]]' >&2
+if (( $# > 2 )); then
+    echo 'Usage: auto-update-enable.sh [COMPOSE_FILE [PROJECT_NAME]]' >&2
     exit 1
 fi
 
 directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-env_file=$(realpath -e -- "$1")
-compose_file=$(realpath -e -- "${2:-$directory/../compose.yaml}")
+compose_file=$(realpath -e -- "${1:-$directory/../compose.yaml}")
 docker_bin=$(command -v docker)
 docker_bin=$(realpath -e -- "$docker_bin")
-[[ -f "$env_file" && -f "$compose_file" ]]
-# The same env-file must work from a clean systemd environment.
+[[ -f "$compose_file" ]]
+# Use the same self-contained YAML from the shell and systemd.
 for variable in ${!SKVOZ_@} ${!COMPOSE_@}; do unset "$variable"; done
-compose=("$docker_bin" compose --env-file "$env_file" -f "$compose_file")
-if (( $# == 3 )); then compose+=(-p "$3"); fi
+export COMPOSE_DISABLE_ENV_FILE=1
+compose=("$docker_bin" compose -f "$compose_file")
+if (( $# == 2 )); then compose+=(-p "$2"); fi
 "${compose[@]}" config --quiet
 image=$("${compose[@]}" config --images server)
 if [[ "$image" == *@* ]]; then
@@ -73,8 +74,8 @@ if [[ -f /etc/systemd/system/skvoz-auto-update.timer ]]; then
     systemctl stop skvoz-auto-update.timer skvoz-auto-update.service
 fi
 install -m 0755 "${BASH_SOURCE[0]}" /usr/local/lib/skvoz-auto-update/auto-update.sh
-printf 'docker_bin=%q\nenv_file=%q\ncompose_file=%q\nproject_name=%q\n' \
-    "$docker_bin" "$env_file" "$compose_file" "$project_name" > /etc/skvoz-auto-update/settings.sh
+printf 'docker_bin=%q\ncompose_file=%q\nproject_name=%q\n' \
+    "$docker_bin" "$compose_file" "$project_name" > /etc/skvoz-auto-update/settings.sh
 chmod 0600 /etc/skvoz-auto-update/settings.sh
 
 cat > /etc/systemd/system/skvoz-auto-update.service <<'UNIT'

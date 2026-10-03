@@ -17,8 +17,8 @@ RSpec.describe 'Server auto-update command' do
       docker = File.join(directory, 'docker')
       FileUtils.cp(helper, docker)
       File.chmod(0700, docker)
-      settings = { docker_bin: docker, env_file: File.join(directory, 'deployment $01.env'),
-                   compose_file: File.join(directory, 'compose file.yaml'), project_name: 'existing-skvoz' }
+      settings = { docker_bin: docker, compose_file: File.join(directory, 'compose $01.yaml'),
+                   project_name: 'existing-skvoz' }
       File.write(@settings, settings.map { |key, value| "#{key}=#{Shellwords.escape(value)}\n" }.join)
       example.run
     end
@@ -38,8 +38,8 @@ RSpec.describe 'Server auto-update command' do
     expect(status.success?).to be(true)
     expect(stdout + stderr).to eq('')
     calls.each do |arguments|
-      expect(arguments).to include('existing-skvoz', File.join(@directory, 'deployment $01.env'),
-                                  File.join(@directory, 'compose file.yaml'))
+      expect(arguments).to include('existing-skvoz', File.join(@directory, 'compose $01.yaml'))
+      expect(arguments).not_to include('--env-file')
     end
     expect(calls.last.drop_while { |argument| argument != 'up' }).to eq(%w[up -d --no-deps --no-build --pull never server])
   end

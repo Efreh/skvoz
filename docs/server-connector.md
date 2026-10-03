@@ -18,19 +18,43 @@ HTTP-запросы, потоковые ответы и другие прото�
 [профиль короткоживущих сертификатов](https://letsencrypt.org/docs/profiles/#shortlived)
 поддерживает IP-адреса и доменные имена. Перед выпуском примите условия центра сертификации.
 
-Из корня репозитория задайте настройки развёртывания, не содержащие секретов:
+Из корня репозитория скопируйте шаблон в постоянный каталог установки:
 
 ```sh
-export SKVOZ_IMAGE='ghcr.io/OWNER/REPOSITORY/skvoz-server:REVIEWED_TAG'
-export SKVOZ_ADDRESS='YOUR_PUBLIC_IP_OR_DNS_NAME'
-export SKVOZ_ACME_EMAIL='YOUR_CERTIFICATE_CONTACT_EMAIL'
-export SKVOZ_ACME_TERMS_AGREED=true
-docker compose -f connectors/server/compose.yaml up -d
-docker compose -f connectors/server/compose.yaml exec -T server skvoz-server health
+sudo install -d -m 0700 /etc/skvoz
+sudo install -m 0600 connectors/server/compose.yaml /etc/skvoz/compose.yaml
 ```
 
-Вместо шаблона образа укажите опубликованный образ со страницы GitHub Packages
-этого репозитория или его неизменяемый digest. После успешных проверок процесс CI
+В копии `compose.yaml` укажите публичный адрес и email для сертификатов.
+После принятия условий центра сертификации задайте
+`SKVOZ_ACME_TERMS_AGREED: "true"`. Все параметры установки находятся в этом YAML.
+Переменные в секции `environment` передаются внутрь контейнера самим Compose.
+Пример изменяемой части файла:
+
+```yaml
+services:
+  server:
+    image: ghcr.io/efreh/skvoz/skvoz-server:latest
+    environment:
+      SKVOZ_ADVERTISED_PORT: &listen_port "4222"
+      SKVOZ_ADDRESS: YOUR_PUBLIC_IP_OR_DNS_NAME
+      SKVOZ_ACME_EMAIL: YOUR_CERTIFICATE_CONTACT_EMAIL
+      SKVOZ_ACME_TERMS_AGREED: "true"
+      SKVOZ_ALLOW_CIDRS: ""
+```
+
+Остальные поля сохраните из шаблона. Запустите готовый образ:
+
+```sh
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml config --quiet
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml up -d
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec -T server skvoz-server health
+```
+
+По умолчанию используется `ghcr.io/efreh/skvoz/skvoz-server:latest`. Этот тег
+обновляется после успешных проверок основной ветки и публикации версий.
+При необходимости замените его тегом выбранной версии или неизменяемым digest
+со страницы GitHub Packages этого репозитория. После успешных проверок процесс CI
 публикует образ в `ghcr.io/<owner>/<repository>/skvoz-server`; наличие файла CI
 само по себе не означает, что образ уже опубликован. Настройки видимости и доступа
 пакета должны разрешать серверу загрузку. Digest фиксирует точное содержимое образа.
@@ -44,11 +68,17 @@ docker compose -f connectors/server/compose.yaml exec -T server skvoz-server hea
 временным хранилищем и без дополнительных полномочий Linux capabilities.
 Сохраняйте том при обновлениях; его копия также содержит учётные данные и закрытые ключи.
 
-`SKVOZ_LISTEN_PORT` по умолчанию равен 4222 и задаёт внешний порт брокера.
-Экспортируемые профили клиентов содержат этот порт; внутри контейнера брокер
-продолжает слушать 4222. Внешний порт 80 направляется на внутренний 8080.
-`SKVOZ_ALLOW_CIDRS` — необязательный список разрешённых внутренних сетей через
-запятую; по умолчанию доступ разрешён только к публичным адресам Интернета.
+Значение `SKVOZ_ADVERTISED_PORT` с YAML-якорем `&listen_port` по умолчанию
+равно `"4222"`. Оно задаёт внешний порт в профилях клиентов и через `*listen_port`
+в секции `ports` — публикацию брокера на машине. Меняйте значение якоря в одном
+месте; внутри контейнера брокер продолжает слушать 4222. Внешний порт 80
+направляется на внутренний 8080. `SKVOZ_ALLOW_CIDRS` — необязательный список
+разрешённых внутренних сетей через запятую; по умолчанию доступ разрешён
+только к публичным адресам Интернета.
+
+Шаблон ограничивает контейнерные журналы через `json-file`: до трёх файлов
+по 10 MB. Это не ограничивает системные журналы и данные постоянного тома;
+их объём и резерв свободного места контролируются отдельно.
 
 Сборка в CI и локальная сборка используют один
 [Dockerfile](../connectors/server/Dockerfile). В нём демон ядра компилируется
@@ -70,11 +100,13 @@ Ruby уже входит в базовый образ. На машине сбо�
 Тот же образ можно собрать локально из публичных исходников:
 
 ```sh
-SKVOZ_IMAGE=skvoz-server:source docker compose \
-  -f connectors/server/compose.yaml -f connectors/server/compose.source.yaml up -d --build
+sudo docker compose -p skvoz --project-directory "$PWD/connectors/server" \
+  -f /etc/skvoz/compose.yaml -f connectors/server/compose.source.yaml up -d --build
 ```
 
-Используйте те же настройки адреса, почты и согласия с условиями. При сборке
+Используйте ту же настроенную копию YAML. `--project-directory` задаёт базовый
+каталог для относительного build context; дополнительный файл выбирает образ
+`skvoz-server:source` и этап `deploy`. При сборке
 зафиксированы digest образов сборщика, среды выполнения и брокера, а также
 версии зависимостей в Cargo/Gem lock-файлах. Проверенная платформа образа —
 `linux/amd64`; другие архитектуры требуют отдельной проверки.
@@ -88,45 +120,29 @@ Docker/Compose и права root. На одной машине поддержи
 для одного развёртывания SKVOZ. Это дополнение к запуску готового образа из
 registry; локальная сборка через `compose.source.yaml` обновляется отдельно.
 
-Сохраните полный набор настроек в постоянном закрытом файле, например
-`/etc/skvoz/deployment.env`. Каталог должен иметь права `0700`, файл — `0600`
-и принадлежать root. Используйте значения своего развёртывания:
+Используйте тот же настроенный YAML, с которым сервер уже запущен.
+Для отслеживания новых сборок укажите в поле `image` изменяемый тег,
+например используемый по умолчанию `ghcr.io/efreh/skvoz/skvoz-server:latest`. Digest и уникальный тег
+версии или commit не переключают сервер на следующий выпуск. Доступ к закрытому
+registry настраивается через `sudo docker login`: фоновые команды запускаются
+от root.
 
-```dotenv
-SKVOZ_IMAGE=ghcr.io/OWNER/REPOSITORY/skvoz-server:main
-SKVOZ_ADDRESS=YOUR_PUBLIC_IP_OR_DNS_NAME
-SKVOZ_ACME_EMAIL=YOUR_CERTIFICATE_CONTACT_EMAIL
-SKVOZ_ACME_TERMS_AGREED=true
-SKVOZ_LISTEN_PORT=4222
-SKVOZ_ALLOW_CIDRS=
-```
-
-Для автообновления нужен тег, содержимое которого меняется при публикации,
-например тег ветки `main`. Digest и уникальный тег версии или commit не
-переключают сервер на следующий выпуск. Доступ к закрытому registry настраивается
-через `sudo docker login`: фоновые команды запускаются от root.
-
-Запустите сервер с этим файлом настроек, затем включите автообновление.
-Команды выполняются из корня сохранённой на сервере копии репозитория:
+После запуска сервера включите автообновление из корня исходного репозитория:
 
 ```sh
-sudo docker compose --env-file /etc/skvoz/deployment.env \
-  -f connectors/server/compose.yaml up -d
-sudo bash connectors/server/deployment/auto-update-enable.sh \
-  /etc/skvoz/deployment.env
+sudo bash connectors/server/deployment/auto-update-enable.sh /etc/skvoz/compose.yaml skvoz
 ```
 
+Интерфейс скрипта — `auto-update-enable.sh [COMPOSE_FILE [PROJECT_NAME]]`.
+Без аргументов он использует `compose.yaml` рядом с каталогом `deployment/`;
+имя проекта можно опустить, если запуск Compose использовал имя по умолчанию.
+Для явно заданного при запуске `-p` передавайте то же имя вторым аргументом.
 Скрипт проверяет, что `server` уже запущен, сохраняет фактическое имя проекта
 Compose и устанавливает `skvoz-auto-update.service`/`skvoz-auto-update.timer`.
-Пути к YAML и env-файлу сохраняются как абсолютные; сохраните оба файла на машине.
-Фоновые команды читают env-файл заново и не зависят от `export` в интерактивном
-терминале. Включение повторяемо: повторный запуск заменяет настройки таймера.
-Для другого файла Compose или явно заданного при запуске имени проекта:
-
-```sh
-sudo bash connectors/server/deployment/auto-update-enable.sh \
-  /etc/skvoz/deployment.env /absolute/deployment/compose.yaml PROJECT_NAME
-```
+Путь к YAML сохраняется как абсолютный; сохраните файл на машине.
+Фоновые команды перечитывают YAML и отключают автоматическую загрузку `.env`;
+конфигурация должна быть полной и не зависеть от `export` в интерактивном терминале.
+Включение повторяемо: повторный запуск заменяет настройки таймера.
 
 Передавайте полную конфигурацию развёртывания одним YAML-файлом. Если используете
 переопределения `-f`, сначала подготовьте единый файл через
@@ -161,7 +177,7 @@ sudo bash connectors/server/deployment/auto-update-disable.sh
 
 Остановка задачи в момент пересоздания контейнера не отменяет уже выполненные
 Docker операции. Для последующей ручной остановки сервера сначала выключите
-автообновление. Перед изменениями YAML или env-файла также выключите таймер,
+автообновление. Перед изменениями YAML также выключите таймер,
 проверьте конфигурацию и включите его снова.
 
 ## Пользователи NATS и устройства
@@ -170,12 +186,12 @@ Docker операции. Для последующей ручной остано
 процессам с тем же UID. Для Compose:
 
 ```sh
-docker compose -f connectors/server/compose.yaml exec -T server skvoz-server user add alice
-docker compose -f connectors/server/compose.yaml exec -T server skvoz-server user list
-docker compose -f connectors/server/compose.yaml exec -T server skvoz-server user show alice
-docker compose -f connectors/server/compose.yaml exec server skvoz-server user device-add alice --prompt-password
-docker compose -f connectors/server/compose.yaml exec -T server skvoz-server user reset-password alice
-docker compose -f connectors/server/compose.yaml exec -T server skvoz-server user remove alice
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec -T server skvoz-server user add alice
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec -T server skvoz-server user list
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec -T server skvoz-server user show alice
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec server skvoz-server user device-add alice --prompt-password
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec -T server skvoz-server user reset-password alice
+sudo docker compose -p skvoz -f /etc/skvoz/compose.yaml exec -T server skvoz-server user remove alice
 ```
 
 При запуске без контейнера замените префикс Compose на собранную команду запуска
@@ -274,7 +290,7 @@ IP-адреса в скобках, сокращённые числовые за�
 `renewal_interval` (86 400 секунд, допустимы 1–86 400).
 Для локального центра сертификации можно указать закрытые файлы
 `issuer_ca` и `certificate_ca`. Учётная запись ACME привязана к каталогу
-своего центра; изменение каталога требует явного переноса учётной записи.
+своего центра; использование этой учётной записи с другим центром отклоняется.
 Сервер требует профиль `shortlived`, выполняет настоящую проверку HTTP01
 и перед активацией проверяет SAN, соответствие ключа, назначение серверного
 сертификата, цепочку и срок действия. Продление начинается при остатке
@@ -461,5 +477,5 @@ rm -rf "$test_bin"
 
 Брокер, внутренний Core, выделение устройств и проверки готовности используют
 общий [профиль транспорта](nats-runtime.md#профиль-транспорта) с обязательной
-проверкой TLS. Клиент Ubuntu и сервер также согласуют версию демона при
-выделении устройства; обновление этих компонентов должно сохранять совместимость.
+проверкой TLS. При выделении устройства клиент Ubuntu проверяет, что сервер
+сообщает ожидаемые версии протокола выделения, демона и IPC.

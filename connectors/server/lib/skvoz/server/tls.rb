@@ -161,7 +161,7 @@ module Skvoz
         account_path = File.join(@state_dir, 'acme-account.json')
         if File.exist?(account_path)
           record = JSON.parse(PrivateFiles.read(account_path))
-          raise Error, 'ACME issuer changed; explicit account migration required' unless record['directory'] == @config.fetch('directory')
+          raise Error, 'ACME account belongs to a different issuer' unless record['directory'] == @config.fetch('directory')
           client = AcmeTransport.new(private_key: account_key, kid: record.fetch('kid'), directory: @config.fetch('directory'), connection_options: options, bad_nonce_retry: 2)
         else
           account = client.new_account(contact: ["mailto:#{@config.fetch('email')}"], terms_of_service_agreed: true)

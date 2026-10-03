@@ -11,6 +11,20 @@ RSpec.describe 'Server deployment through Compose', compose: true do
     stdout.strip
   end
 
+  it 'reads installation settings from one YAML and publishes the advertised port' do
+    compose = ENV['SKVOZ_TEST_COMPOSE'] ? [ENV.fetch('SKVOZ_TEST_COMPOSE')] : %w[docker compose]
+    Dir.mktmpdir('skvoz-compose-settings-') do |directory|
+      file = File.join(directory, 'compose.yaml')
+      template = ServerSystem::COMPONENT.join('compose.yaml').read
+      File.write(file, template.sub('&listen_port "4222"', '&listen_port "31422"'))
+      config = JSON.parse(execute(*compose, '-p', 'skvoz-settings', '-f', file, 'config', '--format', 'json'))
+      server = config.fetch('services').fetch('server')
+      expect(server.fetch('environment').fetch('SKVOZ_ADVERTISED_PORT')).to eq('31422')
+      expect(server.fetch('ports').find { |port| port.fetch('target') == 4222 }.fetch('published')).to eq('31422')
+      expect(server.fetch('environment').fetch('SKVOZ_ACME_TERMS_AGREED')).to eq('false')
+    end
+  end
+
   [false, true].each do |source|
     it "preserves users and recovers its process tree with #{source ? 'a local source build' : 'the prebuilt image'}" do
       image = ENV.fetch('SKVOZ_TEST_IMAGE', 'skvoz-server:qualification')
@@ -21,8 +35,6 @@ RSpec.describe 'Server deployment through Compose', compose: true do
       devices = []
       base = nil
       directory = nil
-      env = ENV.to_h.merge('SKVOZ_IMAGE' => image, 'SKVOZ_ADDRESS' => 'localhost',
-                         'SKVOZ_ACME_EMAIL' => 'qualification@example.com', 'SKVOZ_ACME_TERMS_AGREED' => 'true')
       begin
         execute('docker', 'volume', 'create', volume)
         directory = Pathname.new(Dir.mktmpdir('skvoz-compose-'))
@@ -51,15 +63,15 @@ RSpec.describe 'Server deployment through Compose', compose: true do
         base = compose + ['--project-name', project, '-f', ServerSystem::COMPONENT.join('compose.yaml').to_s]
         base += ['-f', ServerSystem::COMPONENT.join('compose.source.yaml').to_s] if source
         base += ['-f', overlay.to_s]
-        command = ->(*arguments, timeout: 30) { execute(*base, *arguments, timeout:, env:) }
+        command = ->(*arguments, timeout: 30) { execute(*base, *arguments, timeout:) }
         health = lambda do
-          _, _, status = ServerSystem.capture(*base, 'exec', '-T', 'server', 'skvoz-server', 'health', timeout: 8, env:)
+          _, _, status = ServerSystem.capture(*base, 'exec', '-T', 'server', 'skvoz-server', 'health', timeout: 8)
           status.success?
         end
         admin = lambda do |operation, login = nil|
           argv = base + %w[exec -T server skvoz-server user] + [operation]
           argv << login if login
-          JSON.parse(execute(*argv, env:))
+          JSON.parse(execute(*argv))
         end
         execute('docker', 'run', '-d', '--name', helper, '--user', '0', '--entrypoint', 'sleep',
                 '-v', "#{volume}:/var/lib/skvoz", image, '120')
@@ -102,7 +114,7 @@ RSpec.describe 'Server deployment through Compose', compose: true do
         expect(transfer(device.path, target.port, 'kill', host: 'host.docker.internal')).to eq('after-fin:llik')
       rescue Exception
         if base
-          stdout, stderr, = ServerSystem.capture(*base, 'logs', '--tail', '30', env:)
+          stdout, stderr, = ServerSystem.capture(*base, 'logs', '--tail', '30')
           warn stdout + stderr
         end
         raise
@@ -110,7 +122,7 @@ RSpec.describe 'Server deployment through Compose', compose: true do
         original_error = $!
         cleanup_errors = []
         cleanups = devices.reverse.map { |device| -> { device.close } }
-        cleanups << -> { execute(*base, 'down', '--timeout', '15', env:) } if base
+        cleanups << -> { execute(*base, 'down', '--timeout', '15') } if base
         cleanups << -> { ServerSystem.capture('docker', 'rm', '-f', helper, timeout: 10) }
         cleanups << -> { execute('docker', 'volume', 'rm', volume) }
         cleanups << -> { target.close }

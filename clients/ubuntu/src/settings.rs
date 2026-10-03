@@ -20,19 +20,11 @@ pub struct Preferences {
     pub socks_port: u16,
     pub ca_file: String,
     pub devices: BTreeMap<String, String>,
-    #[serde(default)]
     pub passwords: BTreeMap<String, String>,
-    #[serde(default)]
     pub autostart: bool,
-    #[serde(default)]
     pub auto_connect: bool,
-    #[serde(default)]
     pub tray_speed: bool,
-    #[serde(default = "enabled")]
     pub request_log: bool,
-}
-fn enabled() -> bool {
-    true
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -371,10 +363,11 @@ mod persistence_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     #[test]
-    fn legacy_settings_and_private_secret_validation() {
+    fn current_settings_and_private_secret_validation() {
         let directory = std::env::temp_dir().join(format!("skvoz-settings-{}", token().unwrap()));
         let settings = Settings::open(directory.clone()).unwrap();
-        let mut legacy = serde_json::to_value(&settings.value).unwrap();
+        let current = serde_json::to_value(&settings.value).unwrap();
+        drop(settings);
         for name in [
             "passwords",
             "autostart",
@@ -382,14 +375,20 @@ mod persistence_tests {
             "tray_speed",
             "request_log",
         ] {
-            legacy.as_object_mut().unwrap().remove(name);
+            let mut incomplete = current.clone();
+            incomplete.as_object_mut().unwrap().remove(name);
+            write_private(
+                &directory.join("settings.json"),
+                &serde_json::to_vec(&incomplete).unwrap(),
+            )
+            .unwrap();
+            assert!(Settings::open(directory.clone()).is_err());
         }
         write_private(
             &directory.join("settings.json"),
-            &serde_json::to_vec(&legacy).unwrap(),
+            &serde_json::to_vec(&current).unwrap(),
         )
         .unwrap();
-        drop(settings);
         let mut settings = Settings::open(directory.clone()).unwrap();
         assert!(settings.value.passwords.is_empty());
         assert!(

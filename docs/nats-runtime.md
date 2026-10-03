@@ -4,8 +4,8 @@
 Core library. Он добавляет authenticated join, смену peer session, проверку
 живости и восстановление транспорта для новых byte streams. Включается feature
 `nats`; HTTP/SOCKS parsing, DNS, сокеты, GUI и выдача credentials принадлежат host.
-Статический [NatsNode](../core/src/nats.rs) остаётся совместимым с простым TCP
-relay и прежними экспериментами. У него нет автоматического join/recovery.
+Статический [NatsNode](../core/src/nats.rs) используется простым TCP relay
+и статическими сценариями стенда. У него нет автоматического join/recovery.
 
 ## Подключение из приложения
 

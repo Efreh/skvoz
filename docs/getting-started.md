@@ -141,7 +141,7 @@ cargo run --locked -p skvoz-core --example in_memory
 | Не хватает image/crates при `--offline` | Повторите без `--offline` при доступной сети. |
 | Ошибка TLS или готовности брокера | Повторите через runner, который создаёт согласованные CA, конфигурацию и credentials; проверьте работоспособность Docker. |
 
-Legacy demo/load использует finite buffers в одном процессе и статический
+Сценарии demo/load используют конечные буферы в одном процессе и статический
 NatsNode; минимальный TCP relay требует выделенного node. Dynamic runtime
 поддерживает join/rejoin и новые streams после recovery. Прерванные потоки
 не возобновляются. [Клиент Ubuntu](ubuntu-client.md) поставляется отдельно через deb. Подробнее:
@@ -179,7 +179,7 @@ CPU — observed ticks с указанным clock rate; RSS sample interval25ms
 одновременно занятой RAM. Broker имеет отдельные1CPU/128MiB limits; application/
 whole host ими не ограничены. Числа workload не являются product users/CPU/RAM SLA.
 
-`check` проверяет dynamic runtime перед legacy suite, которая в конце останавливает
+`check` проверяет dynamic runtime перед набором статических сценариев, который в конце останавливает
 брокер. TLS negatives используют temporary wrong-name/expired/untrusted certificates;
 System trust positive запускается в isolated child с временным SSL_CERT_FILE,
 без изменения системного trust store. Credential revocation/reprovision проверяется

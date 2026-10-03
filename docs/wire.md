@@ -16,7 +16,7 @@ Routing envelope вне binary packet:
 Host задаёт routes и новую session generation на каждый lifetime. Драйвер
 проверяет точное registered sender/session, ACL NATS связывает sender identity
 с credentials и разрешёнными получателями. Пакет не несёт самостоятельного
-proof identity; wildcard subscribe не заменяет ACL. Legacy fixed-pair demo
+proof identity; wildcard subscribe не заменяет ACL. Демонстрация фиксированной пары
 использует PeerId user=0 / consumer=1 поверх того же envelope.
 
 | kind | Фрейм | Body |
