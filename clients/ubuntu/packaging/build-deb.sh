@@ -7,8 +7,8 @@ binary=${1:-"$root/target/release/skvoz-client"}
 daemon=${2:-"$root/target/release/skvoz-core-daemon"}
 output=${3:-"$root/clients/ubuntu/dist"}
 [ "$(dpkg --print-architecture)" = amd64 ] || { echo 'Only amd64 packages are supported' >&2; exit 1; }
-[ "$("$daemon" --version)" = 'skvoz-core-daemon 1.3.0 ipc=1' ] || { echo 'Incompatible bundled daemon' >&2; exit 1; }
-[ "$("$binary" --version)" = "skvoz-client $version daemon=1.3.0 ipc=1" ] || { echo 'Incompatible client version' >&2; exit 1; }
+[ "$("$daemon" --version)" = 'skvoz-core-daemon 1.4.0 ipc=1' ] || { echo 'Incompatible bundled daemon' >&2; exit 1; }
+[ "$("$binary" --version)" = "skvoz-client $version daemon=1.4.0 ipc=1" ] || { echo 'Incompatible client version' >&2; exit 1; }
 mkdir -p "$output"
 stage=$(mktemp -d)
 chmod 755 "$stage"

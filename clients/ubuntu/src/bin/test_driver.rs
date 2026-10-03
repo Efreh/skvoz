@@ -38,8 +38,12 @@ fn main() {
     settings.save(preferences).unwrap();
     let budgets = Budgets {
         connections: config["budgets"]["max_connections"].as_u64().unwrap_or(62) as usize,
-        frames: config["budgets"]["event_frames"].as_u64().unwrap_or(32) as usize,
-        bytes: config["budgets"]["event_bytes"].as_u64().unwrap_or(16384) as usize,
+        frames: config["budgets"]["event_frames"]
+            .as_u64()
+            .map_or(Budgets::default().frames, |value| value as usize),
+        bytes: config["budgets"]["event_bytes"]
+            .as_u64()
+            .map_or(Budgets::default().bytes, |value| value as usize),
     };
     let engine = Engine::new(
         Arc::new(Mutex::new(settings)),

@@ -170,7 +170,7 @@ RSpec.describe 'Server TCP transport and administration', integration: true do
       socket.read
     end
     echo = target { |socket| after_fin(socket) }
-    device = start_bridge(stalled.port, echo.port)
+    device = start_bridge(stalled.port, echo.port, receive_window: 8192, stream_queue_frames: 32, stream_queue_bytes: 16_384, tcp_buffer_bytes: 16_384)
     client, handle = remember_client(device.path, stalled.port)
     Timeout.timeout(3) { entered.pop }
     sent = 0

@@ -28,7 +28,9 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
         socket = OpenSSL::SSL::SSLSocket.new(raw, context); socket.accept
         header = ''.b
         header << (socket.read(1) || raise(EOFError)) until header.end_with?("\r\n\r\n")
-        socket.write("HTTP/1.1 200 OK\r\nContent-Length: 24\r\nConnection: close\r\n\r\nskvoz-real-tls-response!")
+        length = header[/\r\nContent-Length: (\d+)/i, 1].to_i
+        body = length.positive? ? socket.read(length) : 'skvoz-real-tls-response!'.b
+        socket.write("HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n".b + body)
         socket.close
       end
       @echo = ServerSystem::Target.new { |socket| ServerSystem.after_fin(socket) }
@@ -127,6 +129,26 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     expect(JSON.parse(settings.read).fetch('passwords').values).to include('process-test-password')
   end
 
+  it 'preserves multi-window binary transfers through HTTP, TLS CONNECT and SOCKS with another device active' do
+    bulk, healthy = application('bulk'), application('healthy')
+    payload = (0..255).to_a.pack('C*') * 16_384
+    transfers = Thread.new do
+      [false, true].each do |socks|
+        expect(curl(bulk, "http://localhost:#{@target.port}/bulk", socks:, arguments: ['--data-binary', '@-'], input: payload)).to eq(payload)
+      end
+      expect(curl(bulk, "https://localhost:#{@tls_target.port}/bulk", arguments: ['--cacert', @directory.join('ca.pem'), '--data-binary', '@-'], input: payload)).to eq(payload)
+    end
+    4.times { expect(curl(healthy, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response') }
+    expect(transfers.join(60)).not_to be_nil
+    transfers.value
+    [bulk, healthy].each { |app| wait_until { app.info['connections'].zero? } }
+    limits = JSON.parse(@server.state.join('core-profile.json').read).fetch('limits')
+    expect(limits.fetch('receive_window')).to eq(1_048_576)
+    expect(limits.fetch('max_frame')).to eq(32_768)
+  ensure
+    transfers&.kill if transfers&.alive?
+  end
+
   it 'preserves binary half-close with slow consumers and isolates a tiny event budget' do
     healthy = application('one')
     [:http, :socks].each do |type|
@@ -201,7 +223,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
       listener.close
     end
     fake = @directory.join('delayed-core')
-    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-core-daemon 1.3.0 ipc=1'; else exec sleep 60; fi\n")
+    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-core-daemon 1.4.0 ipc=1'; else exec sleep 60; fi\n")
     fake.chmod(0o700)
     parent = UbuntuSystem::Application.new(@directory.join('crash'), @server, daemon: fake.to_s, wait_ready: false)
     @applications << parent

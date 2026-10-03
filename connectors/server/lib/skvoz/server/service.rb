@@ -171,7 +171,7 @@ module Skvoz
         @nats = @core = nil
         renew(initial: true) unless @tls.valid?
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
-        validate_binary(@config['core_binary'], 'skvoz-core-daemon 1.3.0 ipc=1')
+        validate_binary(@config['core_binary'], 'skvoz-core-daemon 1.4.0 ipc=1')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         validate_nats(@nats_path)
@@ -228,7 +228,7 @@ module Skvoz
             raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
             candidate, id = @state.enroll(login, token)
             apply(candidate) if candidate
-            { v: 1, namespace: @config['namespace'], peer_id: id, daemon: '1.3.0', ipc: 1 }
+            { v: 1, namespace: @config['namespace'], peer_id: id, daemon: '1.4.0', ipc: 1 }
           end
         end.start(@task)
       end

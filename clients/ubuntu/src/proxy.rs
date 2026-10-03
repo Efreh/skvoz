@@ -29,8 +29,8 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             connections: 62,
-            frames: 32,
-            bytes: 16384,
+            frames: 128,
+            bytes: 2 * crate::RECEIVE_WINDOW,
         }
     }
 }
@@ -49,7 +49,7 @@ impl Proxies {
     pub async fn start(path: PathBuf, http: u16, socks: u16, budget: Budgets) -> Result<Self> {
         if !(1..=62).contains(&budget.connections)
             || !(1..=128).contains(&budget.frames)
-            || !(1024..=131072).contains(&budget.bytes)
+            || !(1024..=2 * crate::RECEIVE_WINDOW).contains(&budget.bytes)
         {
             return Err(Error("invalid_budgets"));
         }
@@ -439,7 +439,7 @@ async fn relay(
     let commands = owner.commands.clone();
     let send = async move {
         let mut pending = initial;
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; crate::DATA_BLOCK];
         loop {
             if pending.is_empty() {
                 let count = reader.read(&mut buffer).await?;
@@ -449,7 +449,7 @@ async fn relay(
                 }
                 pending.extend_from_slice(&buffer[..count]);
             }
-            let part = pending.len().min(1024);
+            let part = pending.len().min(crate::DATA_BLOCK);
             let reply = commands
                 .request(5, handle, &pending[..part], &[0, 1, 4])
                 .await?;

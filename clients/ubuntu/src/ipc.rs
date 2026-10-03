@@ -195,7 +195,7 @@ impl Commands {
         payload: &[u8],
         allowed: &[u16],
     ) -> Result<Reply> {
-        if payload.len() > 1024 {
+        if payload.len() > 65536 {
             return Err(Error("ipc_failed"));
         }
         let (reply, answer) = oneshot::channel();
@@ -337,7 +337,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            for expected in [1, 5] {
+            for expected in [1, 5, 5] {
                 let (kind, sequence, handle, payload) = read_frame(&mut socket).await.unwrap();
                 assert_eq!(kind, expected);
                 let mut extra = Vec::new();
@@ -346,8 +346,8 @@ mod tests {
                     extra[1] = 1;
                     0u64
                 } else {
-                    assert_eq!(payload, b"hello");
-                    5u64
+                    assert!(payload == b"hello" || payload == vec![0xa5; 65536]);
+                    payload.len() as u64
                 };
                 let mut frame = Vec::new();
                 frame.extend_from_slice(&((42 + extra.len()) as u32).to_be_bytes());
@@ -373,6 +373,23 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(reply.value, 5);
+        let bulk = vec![0xa5; 65536];
+        assert_eq!(
+            owner
+                .commands
+                .request(5, 1, &bulk, &[0])
+                .await
+                .unwrap()
+                .value,
+            65536
+        );
+        assert!(
+            owner
+                .commands
+                .request(5, 1, &vec![0xa5; 65537], &[0])
+                .await
+                .is_err()
+        );
         drop(owner);
         server.abort();
         std::fs::remove_file(path).unwrap();

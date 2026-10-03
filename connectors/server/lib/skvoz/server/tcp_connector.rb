@@ -11,8 +11,8 @@ module Skvoz
 
       def initialize(path:, policy:, limits: {})
         @path, @policy = path, policy
-        @limits = { streams: 64, connecting: 8, tcp_buffer_bytes: 16384, connect_timeout: 3, command_timeout: 5,
-                    stream_frames: 32, stream_bytes: 16_384, event_frames: 2048, event_bytes: 1_048_576 }.merge(limits)
+        @limits = { streams: 64, connecting: 8, tcp_buffer_bytes: 262_144, connect_timeout: 3, command_timeout: 5,
+                    stream_frames: 128, stream_bytes: 2_097_152, event_frames: 8192, event_bytes: 134_217_728 }.merge(limits)
         @streams = {}
         @cleanups = {}
         @event_budget = Budget.new(count: @limits[:event_frames], bytes: @limits[:event_bytes])
@@ -182,7 +182,7 @@ module Skvoz
           enqueue(frame)
         elsif frame.kind == Protocol::DATA || frame.kind == Protocol::REMOTE_FINISHED
           raise ProtocolError, 'Stream data before local acceptance event' unless @opened
-          raise ProtocolError, 'Invalid DATA length' if frame.kind == Protocol::DATA && !frame.payload.bytesize.between?(9, 1032)
+          raise ProtocolError, 'Invalid DATA length' if frame.kind == Protocol::DATA && !frame.payload.bytesize.between?(9, Protocol::MAX_PAYLOAD)
           raise ProtocolError, 'Invalid FIN payload' if frame.kind == Protocol::REMOTE_FINISHED && !frame.payload.empty?
           enqueue(frame)
         else
@@ -274,7 +274,7 @@ module Skvoz
 
       def read_target
         until @closed
-          bytes = @socket.read_nonblock(1024, exception: false)
+          bytes = @socket.read_nonblock(32_768, exception: false)
           if bytes == :wait_readable
             @socket.wait_readable
           elsif bytes.nil?

@@ -8,12 +8,13 @@ module Skvoz
       RESPONSE = 0x8000
       INCOMING, OPENED, REJECTED, DATA, WRITABLE, REMOTE_FINISHED, CLOSED = (0x9001..0x9007).to_a
       MAX_BODY = 65_568
+      MAX_PAYLOAD = 65_536
       MAX_METADATA = 512
       Frame = Data.define(:kind, :request, :handle, :payload)
       Result = Data.define(:code, :value, :handle, :extra)
 
       def self.encode(kind, request, handle = 0, payload = ''.b)
-        raise ProtocolError, 'IPC payload exceeds limit' if payload.bytesize > 65_536
+        raise ProtocolError, 'IPC payload exceeds limit' if payload.bytesize > MAX_PAYLOAD
         body = ['SKI1', 1, kind, request, handle >> 64, handle & ((1 << 64) - 1)].pack('a4nnQ>Q>Q>') + payload.b
         [body.bytesize].pack('N') + body
       end

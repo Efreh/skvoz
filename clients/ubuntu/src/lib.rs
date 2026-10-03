@@ -4,7 +4,9 @@ pub mod ipc;
 pub mod proxy;
 pub mod settings;
 pub mod ui;
-pub const DAEMON_VERSION: &str = "1.3.0";
+pub const DAEMON_VERSION: &str = "1.4.0";
+pub const RECEIVE_WINDOW: usize = 1024 * 1024;
+pub const DATA_BLOCK: usize = 32 * 1024;
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error(pub &'static str);

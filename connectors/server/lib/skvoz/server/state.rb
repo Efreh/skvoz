@@ -10,7 +10,7 @@ module Skvoz
       DEFAULTS = { 'state_dir' => '/var/lib/skvoz', 'address' => nil, 'port' => 4222, 'advertised_port' => nil, 'bind' => '0.0.0.0',
                    'namespace' => 'skvoz.application', 'core_binary' => 'skvoz-core-daemon', 'nats_binary' => 'nats-server',
                    'monitor_port' => 8222, 'admin_timeout' => 5, 'stop_timeout' => 8,
-                   'max_streams' => 64, 'stream_queue_frames' => 32, 'stream_queue_bytes' => 16384, 'tcp_buffer_bytes' => 16384, 'max_identities' => 128, 'devices_per_user' => 8,
+                   'max_streams' => 64, 'receive_window' => 1_048_576, 'stream_queue_frames' => 128, 'stream_queue_bytes' => 2_097_152, 'tcp_buffer_bytes' => 262_144, 'max_identities' => 128, 'devices_per_user' => 8,
                    'allow' => [], 'deny' => [], 'tls' => {} }.freeze
       attr_reader :value
 
@@ -27,10 +27,11 @@ module Skvoz
         Destination.new(Protocol.metadata(v: 1, type: 'tcp', host: address, port: @value['port']))
         bind = IPAddr.new(@value['bind'])
         raise Error, 'Bind must accept the internal IPv4 loopback dial' unless bind.ipv4? && (bind.to_i.zero? || bind.to_s == '127.0.0.1')
-        { 'port' => 1..65_535, 'advertised_port' => 1..65_535, 'tcp_buffer_bytes' => 1024..262144, 'monitor_port' => 1..65_535, 'max_streams' => 1..1024, 'stream_queue_frames' => 1..128, 'stream_queue_bytes' => 8192..131072, 'max_identities' => 1..512,
+        { 'port' => 1..65_535, 'advertised_port' => 1..65_535, 'tcp_buffer_bytes' => 1024..262144, 'monitor_port' => 1..65_535, 'max_streams' => 1..1024, 'receive_window' => 8192..1_048_576, 'stream_queue_frames' => 1..128, 'stream_queue_bytes' => 8192..8_388_608, 'max_identities' => 1..512,
           'devices_per_user' => 1..64, 'admin_timeout' => 1..30, 'stop_timeout' => 1..60 }.each do |key, range|
           raise Error, 'Invalid server configuration limit' unless @value[key].is_a?(Integer) && range.cover?(@value[key])
         end
+        raise Error, 'Configured stream queue cannot hold receive window' if @value['stream_queue_bytes'] < @value['receive_window']
         raise Error, 'Identity allocation exceeds configured budget' if @value['devices_per_user'] > @value['max_identities']
         raise Error, 'Port settings conflict' if @value['port'] == @value['monitor_port']
         raise Error, 'Invalid namespace' unless @value['namespace'].match?(/\A[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\z/) && @value['namespace'].bytesize <= 256
@@ -188,7 +189,8 @@ module Skvoz
 
       def profile
         tls = @value.fetch('tls')
-        window, frame, streams = 8192, 1024, @config['max_streams']
+        window, streams = @config['receive_window'], @config['max_streams']
+        frame = [32_768, window].min
         profile = { 'ipc_path' => File.join(@directory, 'core.sock'), 'url' => "tls://127.0.0.1:#{@config['port']}",
                     'tls_server_name' => @config['address'], 'trust' => tls['ca'] ? 'managed_ca' : 'system',
                     'username' => INTERNAL, 'password' => @value.fetch('internal_password'), 'namespace' => @config['namespace'],
@@ -196,9 +198,9 @@ module Skvoz
                     'limits' => { 'owners' => 8, 'streams_per_owner' => [streams + 16, 1024].min, 'streams' => streams + 16,
                                   'streams_per_peer' => streams + 16, 'peers' => @config['max_identities'],
                                   'receive_window' => window, 'max_frame' => frame,
-                                  'receive_bytes' => window * (streams + 16), 'receive_bytes_per_peer' => window * (streams + 16),
-                                  'send_bytes' => 8192 * streams, 'send_bytes_per_peer' => 8192 * streams,
-                                  'output_frames' => [streams * 32, 4096].min, 'output_bytes' => [streams * 16_384, 8_388_608].min,
+                                  'receive_bytes' => [window * (streams + 16), 536_870_912].min, 'receive_bytes_per_peer' => [window * (streams + 16), 67_108_864].min,
+                                  'send_bytes' => [frame * 8 * streams, 67_108_864].min, 'send_bytes_per_peer' => [frame * 8 * streams, 8_388_608].min,
+                                  'output_frames' => [streams * 128, 4096].min, 'output_bytes' => [streams * @config['stream_queue_bytes'], 8_388_608].min,
                                   'subscription_frames' => [streams * (window / frame + 4), 128].max, 'join_frames' => 1024 } }
         profile['ca_file'] = tls['ca'] if tls['ca']
         profile

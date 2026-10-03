@@ -70,6 +70,13 @@ RSpec.describe 'Server destination and persistent identity contract' do
     end.wait
   end
 
+  it 'rejects a receive window that its bounded host queue cannot hold' do
+    value = { 'address' => 'example.org', 'tls' => { 'email' => 'test@example.com', 'terms_agreed' => true } }
+    expect { Skvoz::Server::Configuration.new(value.merge('stream_queue_bytes' => 8192)) }.to raise_error(Skvoz::Server::Error, 'Configured stream queue cannot hold receive window')
+    expect { Skvoz::Server::Configuration.new(value.merge('receive_window' => 8192, 'stream_queue_bytes' => 8192)) }.not_to raise_error
+    expect { Skvoz::Server::Configuration.new(value.merge('receive_window' => 1_048_577)) }.to raise_error(Skvoz::Server::Error, 'Invalid server configuration limit')
+  end
+
   it 'creates private state beneath a safe0755 parent and rejects symlink/writable ancestors' do
     Dir.mktmpdir do |temporary|
       parent = File.join(temporary, 'parent')

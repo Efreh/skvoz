@@ -47,7 +47,7 @@ module Skvoz
 
       def request(kind, handle = 0, payload = ''.b)
         raise Error, 'IPC session closed' if @closed
-        raise ProtocolError, 'Host command payload exceeds limit' if payload.bytesize > 1024 && kind != 1
+        raise ProtocolError, 'Host command payload exceeds limit' if payload.bytesize > Protocol::MAX_PAYLOAD
         item = Request.new(kind, handle, payload.b, Async::Condition.new)
         admitted = false
         Async::Task.current.with_timeout(@timeout) do

@@ -137,7 +137,7 @@ impl Engine {
         } else {
             credentials.host.clone()
         };
-        let mut profile = serde_json::json!({"ipc_path":path,"url":format!("tls://{host}:{}",credentials.port),"username":credentials.username,"password":credentials.password,"trust":if credentials.ca_file.is_empty(){"system"}else{"managed_ca"},"namespace":enrollment.namespace,"peer_id":enrollment.peer_id,"allowed_peers":[0],"initiate":[0],"limits":{"owners":64,"streams_per_owner":1,"streams":64,"streams_per_peer":64,"peers":1,"receive_window":8192,"max_frame":1024,"receive_bytes":524288,"receive_bytes_per_peer":524288,"send_bytes":524288,"send_bytes_per_peer":524288,"output_frames":32,"output_bytes":16384,"subscription_frames":768,"join_frames":128}});
+        let mut profile = serde_json::json!({"ipc_path":path,"url":format!("tls://{host}:{}",credentials.port),"username":credentials.username,"password":credentials.password,"trust":if credentials.ca_file.is_empty(){"system"}else{"managed_ca"},"namespace":enrollment.namespace,"peer_id":enrollment.peer_id,"allowed_peers":[0],"initiate":[0],"limits":{"owners":64,"streams_per_owner":1,"streams":64,"streams_per_peer":64,"peers":1,"receive_window":crate::RECEIVE_WINDOW,"max_frame":crate::DATA_BLOCK,"receive_bytes":64*crate::RECEIVE_WINDOW,"receive_bytes_per_peer":64*crate::RECEIVE_WINDOW,"send_bytes":8*1024*1024,"send_bytes_per_peer":8*1024*1024,"output_frames":128,"output_bytes":2*crate::RECEIVE_WINDOW,"subscription_frames":64*(crate::RECEIVE_WINDOW/crate::DATA_BLOCK+4),"join_frames":128}});
         if !credentials.ca_file.is_empty() {
             profile["ca_file"] = serde_json::json!(validated.ca_file);
         }

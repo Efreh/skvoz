@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-daemon"
-version = "1.3.0"
+version = "1.4.0"
 description = "Local IPC host for the universal SKVOZ Core"
 edition.workspace = true
 rust-version.workspace = true

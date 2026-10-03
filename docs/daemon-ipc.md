@@ -1,6 +1,6 @@
 # Core daemon и локальный IPC v1
 
-Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.3.0.
+Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.4.0.
 Он встраивает ту же [универсальную Core library/NatsRuntime](nats-runtime.md),
 которую можно использовать из Rust. Python/Ruby/другие host languages общаются
 через pathname Unix socket; отдельного client/server Core или native bindings нет.
@@ -274,8 +274,8 @@ sequenceDiagram
 | peers | 128 | 1..512 |
 | streams | 1024 | 1..8192 |
 | streams_per_peer | 128 | 1..8192 |
-| receive_window | 8192 | 1..65536 |
-| max_frame | 1024 | 1..16384 and <=receive_window |
+| receive_window | 8192 | 1..1048576 |
+| max_frame | 1024 | 1..32768 and <=receive_window |
 | pending_frames | 8 | 1..64 |
 | open_timeout_ms | 5000 | 100..60000 |
 | receive_bytes | 8388608 | 1..536870912, >=receive_window |
@@ -286,6 +286,14 @@ sequenceDiagram
 | subscription_frames | 128 | 1..65536 |
 | join_frames | 128 | 1..65536 |
 | nats_commands | 16 | 1..65536 |
+
+Нативный клиент Ubuntu и серверный коннектор явно задают окно 1 МиБ и кадры
+до 32 КиБ для WAN-передач. Общие defaults минимального профиля выше остаются
+неизменными. Увеличение одного окна без согласованных байтовых бюджетов и
+очередей событий может привести к отказу в допуске или переполнению владельца.
+Объявленное окно резервируется в `receive_bytes` и `receive_bytes_per_peer`;
+бюджеты продолжают ограничивать число одновременно допущенных потоков.
+Кадры DATA также содержат 8 байт смещения и должны помещаться в IPC payload.
 
 Выделенные выходные фреймы учитываются и в количестве, и в байтах,
 включая частично записанные фреймы; счётчики освобождаются только после полной
@@ -342,7 +350,7 @@ URL по-прежнему выбирает адрес подключения, а
 
 ## Порядок TLS handshake
 
-Демон 1.3.0 (Core 3.0.0, IPC по-прежнему v1) использует `INFO → TLS → CONNECT`
+Демон 1.4.0 (Core 3.0.0, IPC по-прежнему v1) использует `INFO → TLS → CONNECT`
 без дополнительного поля профиля. Брокер должен отправлять приветствие NATS
 перед TLS (`tls.handshake_first: false`). Проверка сертификата обязательна;
 учётные данные и данные потоков отправляются только после TLS. Порядок применяется
