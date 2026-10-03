@@ -1,9 +1,9 @@
-# SKVOZ Core daemon
+# Демон Core SKVOZ
 
-`skvoz-core-daemon` — Linux executable, встраивающий ту же универсальную
-[Core library](../core/README.md) и `NatsRuntime`. Приложения Ruby, Python и других
-языков используют один локальный [IPC v1](../docs/daemon-ipc.md), без native bindings.
-Каталог выделяет process/config/socket wrapper; отдельного client/server ядра нет.
+`skvoz-core-daemon` — исполняемый файл Linux с той же универсальной
+[библиотекой Core](../core/README.md) и `NatsRuntime`. Приложения других языков
+используют единый локальный [IPC v1](../docs/daemon-ipc.md) через закрытый Unix-сокет.
+Каталог содержит управление процессом, профилем, сокетом и владельцами IPC.
 
 Из корня репозитория:
 
@@ -13,23 +13,27 @@ cargo build --release -p skvoz-daemon --locked
 python3 testbench/run.py daemon
 ```
 
-Последняя команда квалифицирует независимые release daemons и Python/Ruby
-процессы через временный INFO → TLS NATS. Нужны Linux, Rust1.92+, Python3.9+,
-Ruby3.4+, Docker и OpenSSL. `--offline` использует заранее cached зависимости/image.
+Последняя команда проверяет независимые демоны сборки release и процессы
+Python/Ruby через временный NATS с TLS. Нужны Linux, Rust 1.92+, Python 3.9+,
+Ruby 3.4+, Docker и OpenSSL. `--offline` использует заранее скачанные зависимости
+и образ. [Подготовка стенда](../docs/getting-started.md).
 
-Для собственного брокера provisioner выдаёт private profile; переменная
-`SKVOZ_PROFILE` указывает на absolute private filename по [инструкции](../docs/daemon-ipc.md). Запуск:
+Для своего брокера подготовьте закрытый профиль по
+[инструкции](../docs/daemon-ipc.md#сборка-запуск-и-профиль). `SKVOZ_PROFILE`
+должен содержать абсолютный путь к нему:
 
 ```sh
 ./target/release/skvoz-core-daemon --check-config "$SKVOZ_PROFILE"
 ./target/release/skvoz-core-daemon --config "$SKVOZ_PROFILE"
 ```
 
-Конфигурация, filesystem policy, startup/shutdown, конечные бюджеты и полный
-бинарный контракт находятся в [daemon-ipc.md](../docs/daemon-ipc.md). Daemon
-не разбирает HTTP/SOCKS/адрес назначения, не выдаёт credentials/PeerId/сертификаты
-и не восстанавливает старые byte streams. Incoming opens получает один локальный
-acceptor; разные outbound IPC sessions владеют только собственными потоками.
+Демон можно запускать как внешнюю службу или управляемый дочерний процесс.
+Конфигурация, права файлов, запуск и остановка, бюджеты и бинарный контракт
+описаны в [руководстве IPC](../docs/daemon-ipc.md). Демон передаёт непрозрачные
+метаданные и байты; учётные данные, PeerId, сертификаты и политика назначения
+принадлежат приложению. Прерванные потоки не возобновляются.
 
-Публичные [vectors](tests/fixtures/ipc-v1.tsv), [Python](../clients/python/README.md)
-и [Ruby](../clients/ruby/README.md) позволяют реализовать другой клиент по контракту.
+Входящие открытия получает один эксклюзивный обработчик; остальные IPC-сессии
+владеют только своими исходящими потоками.
+[Векторы](tests/fixtures/README.md), [пример Python](../clients/python/README.md)
+и [пример Ruby](../clients/ruby/README.md) позволяют реализовать новый адаптер.

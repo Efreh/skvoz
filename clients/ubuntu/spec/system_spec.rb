@@ -57,7 +57,20 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
   def curl(app, url, socks: false, arguments: [], input: '')
     proxy = "#{socks ? 'socks5h' : 'http'}://127.0.0.1:#{socks ? app.socks : app.http}"
     stdout, stderr, status = capture('curl', '--silent', '--show-error', '--fail', '--max-time', '20', '--noproxy', '', '--proxy', proxy, *arguments, url, input:, timeout: 25)
-    expect(status.success?).to be(true), stderr
+    unless status.success?
+      diagnostics = [stderr]
+      [['Client status', -> { app.info(timeout: 3) }], ['Server health', -> { @server.command('health') }]].each do |name, read|
+        begin
+          diagnostics << "#{name}: #{JSON.generate(read.call)}"
+        rescue StandardError => error
+          diagnostics << "#{name} unavailable: #{error.class}: #{error.message}"
+        end
+      end
+      diagnostics << "Completed target requests: #{@requests.size}"
+      log = @server.log.read
+      diagnostics << "Server log:\n#{log.byteslice(-4096, 4096) || log}"
+      expect(status.success?).to be(true), diagnostics.join("\n")
+    end
     stdout.b
   end
 
@@ -176,11 +189,14 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
 
   it 'recovers new streams after child and broker loss without changing device identity' do
     app = application('one')
-    id = app.ready['peer_id']; app.command('kill-core')
-    app.event { |value| value['state'] == 'reconnecting' }
-    app.event { |value| value['state'] == 'connected' }
-    expect(app.info['peer_id']).to eq(id)
-    expect(curl(app, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+    id = app.ready['peer_id']
+    3.times do
+      app.command('kill-core')
+      app.event { |value| value['state'] == 'reconnecting' }
+      app.event { |value| value['state'] == 'connected' }
+      expect(app.info['peer_id']).to eq(id)
+      expect(curl(app, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+    end
     @server.stop
     app.event { |value| value['state'] == 'reconnecting' }
     @server.start

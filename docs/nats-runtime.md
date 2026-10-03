@@ -48,15 +48,17 @@ username/password; JWT/NKey credentials в этом профиле не подд
 позволяет доверять произвольному скачанному CA. URL с embedded userinfo запрещён;
 Debug конфигурации и typed errors не раскрывают endpoint или пароль.
 
-Core 3.0.0 использует единый порядок NATS `INFO → TLS → CONNECT` во всех
+## Профиль транспорта
+
+Подключение выполняется в обычном порядке NATS `INFO → TLS → CONNECT` во всех
 соединениях: join, transport lanes и восстановление. Открытым остаётся только
 начальный `INFO` с метаданными брокера. Пароль и payload передаются после
 проверенного TLS; `require_tls(true)` запрещает открытый транспорт.
 Брокер должен отправлять `INFO` до TLS (`tls.handshake_first: false`).
-TLS-first брокеры с этим runtime несовместимы: обновляйте конфигурацию брокера
-вместе с Core. Переключателей и автоматического downgrade нет.
+Брокер с другим порядком приветствия требует согласованного изменения
+конфигурации. Проверка TLS обязательна; автоматического перехода на открытый транспорт нет.
 
-Core 1.3.0 добавил `RuntimeConfig.tls_server_name: Option<String>`
+`RuntimeConfig.tls_server_name: Option<String>` задаёт ожидаемую TLS-идентичность
 со значением `None` по умолчанию. Приложение может подключаться к
 `tls://127.0.0.1:4222`, проверяя явно заданный публичный IP-адрес или домен
 в SAN сертификата. Штатный `WebPkiServerVerifier` по-прежнему проверяет
@@ -114,7 +116,7 @@ bytes плюс runtime envelope 24 bytes. Runtime отвергает и мень
 IPC JOIN, напротив, обеспечивает готовность и является no-op для ready peer,
 чтобы другой local owner не прерывал текущий обмен.
 
-## Provisioning и доверенная identity
+## Выдача прав и идентичность
 
 Broker permissions должны связывать sender PeerId, recipient PeerId и shard.
 Полученный subject без таких ACL не доказывает authenticated identity.
@@ -139,15 +141,15 @@ Subscribe разрешается только на собственный recipi
 для generations/shards/senders. Namespace prefix также ограничивается ACL.
 У другого client нет права подменить sender1, читать recipient1 или публиковать
 в чужой shard. Не выдавайте blanket publish/subscribe `>` и automatic reply
-permissions, обходящие эту границу. В NATS пустой allow-list не означает deny-all;
+permissions, расширяющие эту границу. В NATS пустой allow-list не означает deny-all;
 для роли без полномочий нужен явный `deny: [">"]`.
 
 Broker/operator входит в доверенную границу: payload не зашифрован отдельно
-между Core instances. HTTPS внутри будущего CONNECT сохраняет собственный TLS.
+между Core instances. Прикладной TLS внутри CONNECT сохраняет собственную проверку доверия.
 Скомпрометированная/дублированная credential той же identity может заменить её
 session; runtime не заменяет credential revocation.
 
-## Join, замена и готовность
+## Присоединение, замена и готовность
 
 Control v1 — ровно 77 bytes: `SKC1`, kind u8, sender generation u128, recipient
 generation u128, initiator nonce u128, pair token/challenge u128, watermark u64;
@@ -207,7 +209,7 @@ Host обязан регулярно вызывать `turn` и `poll_events`. �
 накапливает поколения. При global recovery такой stall переводит lifecycle в
 `Failed`; при peer replacement другие peers могут продолжать работу.
 
-## Liveness и recovery
+## Живость и восстановление
 
 DATA envelope содержит pair token u128 и последовательный frame sequence u64.
 Разрыв sequence завершает peer. PING содержит nonce и число dispatched frames;
@@ -237,7 +239,7 @@ broker credential revocation принадлежит provisioner. Ошибки р
 Tls, Authentication/Authorization, Timeout, Admission, PeerUnavailable, StaleKey,
 Transport/Protocol и безопасные Manager errors.
 
-## Queues, изоляция и status
+## Очереди, изоляция и состояние
 
 Одна join connection и до `shards` lazy lane connections, по DATA и CONTROL
 subscription на lane. Default shards8, допустимо1..32; отсутствуют connection/task

@@ -6,8 +6,10 @@
 !daemon/
 !daemon/**
 !clients/
+clients/**
 !clients/ruby/
 !clients/ruby/**
+!clients/ubuntu/Cargo.toml
 !connectors/
 !connectors/tcp/
 !connectors/tcp/**

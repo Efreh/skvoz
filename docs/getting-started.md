@@ -13,6 +13,7 @@ Docker-образа используйте [руководство сервер�
 
 Для контейнерного стенда нужны Linux, Rust 1.92 или новее, Python 3.9 или новее,
 OpenSSL и Docker с работающим daemon, доступным текущему пользователю.
+Для `check` и `daemon` также нужен Ruby 3.4+; GTK-зависимости для стенда не нужны.
 Проверьте инструменты:
 
 ```sh
@@ -34,7 +35,7 @@ Cargo-зависимости. Образ закреплён версией и di
 python3 testbench/run.py demo
 ```
 
-Runner создаёт NATS с INFO → TLS, временными сертификатами и отдельными правами
+Runner создаёт NATS с TLS, временными сертификатами и отдельными правами
 пользователя и потребителя. Порты выбираются динамически и публикуются только
 на loopback. Демонстрация передаёт по 32 768 байт в каждом направлении каждого
 из четырёх потоков; потоки инициируются обеими ролями.
@@ -142,8 +143,8 @@ cargo run --locked -p skvoz-core --example in_memory
 
 Legacy demo/load использует finite buffers в одном процессе и статический
 NatsNode; минимальный TCP relay требует выделенного node. Dynamic runtime
-поддерживает join/rejoin и новые streams после recovery. Готовый proxy/VPN,
-VPN/мобильные клиенты и transparent stream resumption пока не реализованы. [Клиент Ubuntu](ubuntu-client.md) поставляется отдельно через deb. Подробнее:
+поддерживает join/rejoin и новые streams после recovery. Прерванные потоки
+не возобновляются. [Клиент Ubuntu](ubuntu-client.md) поставляется отдельно через deb. Подробнее:
 [архитектура](architecture.md), [контракт](stream-engine.md),
 [формат пакетов](wire.md).
 
@@ -192,7 +193,7 @@ Qualification queue profile вычисляется для его собстве�
 Derived capacity выше65536 отклоняется как workload-limit error. Маленькие queues
 отдельно проверяются на честное failure/isolation; профиль не скрывает overflow.
 
-## Standalone daemon из исходников
+## Сборка демона из исходников
 
 Для language-independent Core executable нужны дополнительно Ruby3.4+ и Linux.
 Из корня:
@@ -203,7 +204,7 @@ cargo build --release -p skvoz-daemon --locked
 python3 testbench/run.py daemon
 ```
 
-`daemon` использует dedicated pinned INFO → TLS NATS, независимые release processes,
+`daemon` использует dedicated pinned NATS с TLS, независимые release processes,
 Python incoming host, Ruby/Python stdlib clients и общий login для двух явно
 provisioned PeerId. Проверяет exact binary bytes/EOF/credits, owner/stale handles,
 nonreading owner isolation, private endpoint/config, TLS/auth negatives и real

@@ -1,43 +1,40 @@
 # SKVOZ Core
 
-Подпроект ядра в общем репозитории SKVOZ. Rust package `skvoz-core`,
-участник корневого workspace. Содержит std-only Stream/Manager без I/O, экспериментальный wire codec и
-опциональный `nats` runtime (async-nats/Tokio). Все коннекторы и обе стороны
-используют одну библиотеку и контракт.
+`skvoz-core` — универсальная Rust-библиотека двунаправленных байтовых потоков.
+Все коннекторы и обе стороны используют одну реализацию и контракт.
+По умолчанию библиотека содержит Stream/Manager и кодек без I/O и внешних
+зависимостей. Возможность `nats` добавляет Tokio/async-nats и два способа встраивания:
 
-`src/` — состояния, кредит, агрегатные бюджеты, multi-peer routing, очереди и codec; `tests/` — contract/fixture/wire
-проверки; `examples/` — пример в памяти. [Контракт движка](../docs/stream-engine.md)
-и [wire формат](../docs/wire.md) находятся в общей документации;
-[fixtures/vectors](tests/fixtures/README.md) — рядом с тестами.
+- `NatsRuntime` — динамические сессии, присоединение, проверка живости и восстановление для новых потоков.
+- `NatsNode` — статические участники и маршруты для простых примеров и транспортных проверок.
 
-Команды из корня общего репозитория:
+`src/` содержит состояния, кредит, бюджеты, маршрутизацию и транспорт.
+`runtime.rs` обслуживает транспорт и сессии; `runtime/api.rs` определяет публичные
+типы и проверяет профиль без I/O, сохраняя экспорт через `skvoz_core::runtime`;
+`tests/` — контракты и [публичные векторы](tests/fixtures/README.md);
+`examples/` — обмен в памяти и встраивание runtime с профилем.
+
+| Что найти | Контракт |
+| --- | --- |
+| Stream/Manager, состояния, кредит и память | [Движок](../docs/stream-engine.md) |
+| Присоединение, восстановление, доверие и очереди | [NATS runtime](../docs/nats-runtime.md) |
+| Бинарные пакеты | [Wire v1](../docs/wire.md) |
+| Доступ из других языков | [Демон и IPC v1](../docs/daemon-ipc.md) — тот же Core внутри отдельного процесса |
+
+Из корня репозитория:
 
 ```sh
-cargo test -p skvoz-core --locked
+cargo test -p skvoz-core --no-default-features --locked
 cargo run -p skvoz-core --example in_memory --locked
 python3 testbench/run.py check
 ```
 
-Последняя команда — основная проверка ядра вместе с настоящим транспортом.
-Клиентские приложения принадлежат [clients/](../clients/README.md),
-контейнерный runner и сценарии — [testbench/](../testbench/README.md).
-NatsNode находится в библиотеке Core; [TCP relay](../connectors/tcp/README.md)
-использует его как embedding host.
-По умолчанию crate не имеет внешних зависимостей. Feature `nats` включает
-статический NatsNode с явными routes и динамический NatsRuntime с authenticated
-join/rejoin, lane readiness/liveness и generation-safe connector keys.
-[Контракт Manager/NatsNode](../docs/stream-engine.md#менеджер-множества-потоков)
-описывает admission, планирование и границы памяти.
-Стабильный wire и FFI остаются будущей работой. Credential issuance/revocation и
-certificate management принадлежат host/provisioner; runtime поддерживает
-проверенные System/ManagedCa trust и provisioned username/password.
-Общие правила: [структура репозитория](../docs/repository.md).
+Первые две команды проверяют движок без транспорта. Последняя — основная проверка
+с настоящим NATS, TCP и независимыми процессами.
+[Подготовка и диагностика](../docs/getting-started.md).
 
-[Текущая архитектура и схемы](../docs/architecture.md),
-[первый запуск и диагностика](../docs/getting-started.md),
-[указатель документации](../docs/README.md).
-
-[Dynamic NATS runtime: join, recovery, trust, queues and embedding](../docs/nats-runtime.md).
-
-Для host languages доступен [standalone daemon/IPC v1](../docs/daemon-ipc.md),
-который встраивает эту же Core library; Rust embedding API сохраняется.
+Коннекторы отвечают за внешний I/O, метаданные, выдачу и хранение учётных данных,
+сертификаты и интерфейс приложения. Core поддерживает проверенное доверие
+System/ManagedCa и подготовленные логин/пароль. Интерфейсы и wire остаются
+экспериментальными; нативный FFI пока не определён.
+[Архитектура](../docs/architecture.md) и [карта исходников](../docs/repository.md).

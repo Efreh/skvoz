@@ -18,7 +18,7 @@ python3 testbench/run.py daemon
 ```
 
 Runner запускает независимые release daemons, Python acceptor и Python/Ruby
-binary clients через pinned NATS с INFO → TLS и временными CA/паролями/ACL. Нужны
+binary clients через NATS с закреплённым образом и TLS и временными CA/паролями/ACL. Нужны
 Linux, Rust1.92+, Python3.9+, Ruby3.4+, Docker/OpenSSL. Для cached dependencies/image
 добавьте `--offline`. `check` включает этот же сценарий после остальных проверок.
 Dependencies и image digest закреплены в Cargo.lock и runner; IPCv1 отличается
@@ -87,7 +87,7 @@ I/O/connection turn может задержать наблюдение; hard com
 connect (safe TLS/auth category),4 terminal/internal runtime failure. Полная
 terminal teardown отменяется только на окончательном drop, runtime не переиспользуется.
 
-## Запуск из server connector
+## Запуск из серверного коннектора
 
 Host знает один настроенный `ipc_path`; искать процесс по имени не требуется.
 Daemon может запускаться отдельной service или child process connector host с
@@ -102,7 +102,7 @@ pathname и тот же UID. Host ждёт `READY ipc=1` либо успешны
 не возвращаются. Полноценный server launcher/Compose/user CLI, automatic profile
 issuance и HTTP/SOCKS destination connector здесь не поставляются.
 
-## Private endpoint и владельцы
+## Закрытая точка IPC и владельцы
 
 Pathname socket absolute, <=100encoded bytes, parent already owned0700, без
 symlink в компонентах; socket0600. Ancestor directories принадлежат root или
@@ -127,7 +127,7 @@ runtime отправляет bounded REJECT. Второй lease получает
 Daemon не разбирает destination metadata и не dispatches произвольные connector
 типы. Это ответственность принимающего host.
 
-## Binary framing и commands
+## Бинарный формат и команды
 
 Все integers big-endian, без padding. Outer u32 length исключает4bytes самого
 prefix и включает body. Valid body32..65568bytes; size проверяется до allocation.
@@ -207,7 +207,7 @@ STATUS просматривает только ограниченный набо
 Ошибки operation schema возвращают typed result; framing/replay ошибка закрывает
 connection. Обновлённый profile требует нового daemon, не передачи credentials IPC.
 
-## Events, credit и terminal порядок
+## События, кредит и порядок завершения
 
 | kind | Event | Payload |
 | --- | --- | --- |
@@ -259,7 +259,7 @@ sequenceDiagram
     D-->>A: DATA then REMOTE_FINISHED / CLOSED
 ```
 
-## Бюджеты и отказ одного owner
+## Бюджеты и отказ одного владельца
 
 Все `limits` integers, units ниже. Неизвестные fields отвергаются. Default/max:
 
@@ -348,12 +348,7 @@ URL по-прежнему выбирает адрес подключения, а
 имени или IP-адреса сертификата. Подробности — в
 [контракте доверия runtime](nats-runtime.md).
 
-## Порядок TLS handshake
+## Профиль транспорта
 
-Демон 1.4.0 (Core 3.0.0, IPC по-прежнему v1) использует `INFO → TLS → CONNECT`
-без дополнительного поля профиля. Брокер должен отправлять приветствие NATS
-перед TLS (`tls.handshake_first: false`). Проверка сертификата обязательна;
-учётные данные и данные потоков отправляются только после TLS. Порядок применяется
-ко всем соединениям runtime, включая join, transport lanes и восстановление.
-Старый TLS-first брокер требует обновления конфигурации вместе с демоном;
-подробности — в [контракте runtime](nats-runtime.md).
+Демон использует общий [профиль NATS runtime](nats-runtime.md#профиль-транспорта).
+Параметры доверия задаются в закрытом профиле; IPC остаётся v1.

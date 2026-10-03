@@ -15,5 +15,5 @@ fn main() -> gtk::glib::ExitCode {
         );
         return gtk::glib::ExitCode::SUCCESS;
     }
-    skvoz_ubuntu_client::ui::main()
+    skvoz_ubuntu_client::app::run()
 }

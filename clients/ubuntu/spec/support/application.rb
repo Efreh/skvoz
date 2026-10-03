@@ -55,9 +55,9 @@ module UbuntuSystem
       @stdin.puts(JSON.generate(command:)); @stdin.flush
     end
 
-    def info
+    def info(timeout: 35)
       command('info')
-      event { |value| value['info'] }
+      event(timeout:) { |value| value['info'] }
     end
 
     def close

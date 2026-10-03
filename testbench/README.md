@@ -1,65 +1,50 @@
-# Реальный NATS-стенд SKVOZ
+# Стенд SKVOZ с настоящим NATS
 
-Отдельный экспериментальный подпроект: package `skvoz-testbench`, adapters/demo/load
-в `src/`, реальные сценарии в `tests/`, контейнерный runner в `run.py`.
-Использует [ядро](../core/README.md) через path dependency, reusable NatsNode. В legacy demo два участника; multi-owner сценарии создают
-один server и несколько client nodes с отдельными credentials. В прежнем `load` app nodes работают в одном Rust-процессе; `qualify` запускает
-независимые release server/client processes. Брокер находится в отдельном контейнере.
+`skvoz-testbench` — отдельный экспериментальный компонент для проверки Core,
+транспорта и коннекторов. Сценарии находятся в `src/` и `tests/`; `run.py`
+управляет временным брокером, сертификатами, правами и очисткой. Продуктовые
+компоненты не зависят от стенда.
 
-Из корня общего репозитория:
+| Режим | Что выполняется |
+| --- | --- |
+| `check` | fmt/clippy, тесты Core/daemon/TCP, реальные NATS-сценарии и независимые процессы демона |
+| `demo` | Двусторонний обмен через статический NatsNode |
+| `tcp` | Реальные сокеты, FIN и ответ после EOF |
+| `load` | Статические участники в одном процессе Rust; отдельный брокер |
+| `qualify` | Динамический NatsRuntime в независимых процессах release, задержки, медленный потребитель и смена сессий |
+| `daemon` | Независимые Core-демоны и приложения Python/Ruby через IPC |
+
+Из корня репозитория:
 
 ```sh
-python3 testbench/run.py check
 python3 testbench/run.py demo
-python3 testbench/run.py tcp
-python3 testbench/run.py load --clients 100 --streams-per-client 10 --active-per-client 2 --bytes 65536
+python3 testbench/run.py check
 ```
 
-Из этого каталога работают `python3 run.py check` и `python3 run.py demo`:
-runner вычисляет общий корень по своему пути. Требуются Linux, Rust 1.92+,
-Python 3.9+, доступ к Docker daemon и OpenSSL. Для cached dependencies/image
-добавьте `--offline`; Compose и host NATS не нужны.
+Из этого каталога работают те же команды без префикса `testbench/`:
+runner определяет корень по своему пути. Нужны Linux, Rust 1.92+, Python 3.9+,
+Docker и OpenSSL; для `check` и `daemon` также нужен Ruby 3.4+.
+Добавьте `--offline`, если зависимости и образ уже скачаны. Compose и NATS на хосте
+не требуются. GTK-приложение собирается и проверяется отдельно.
 
-Runner поднимает отдельный pinned NATS с INFO → TLS/временными credentials,
-ждёт готовности и удаляет свои контейнер/сертификаты после завершения,
-включая failed tests. Режим `check` включает fmt/clippy и реальные проверки;
-режим `demo` запускает двусторонний обмен. `tcp` проверяет реальные сокеты
-с FIN запроса и ответом после EOF. `load` проверяет одинаковые IDs разных
-клиентов, смешанный трафик, медленного читателя и очистку idle slots.
-Параметры и область измерения: [руководство](../docs/getting-started.md#нагрузочный-эксперимент).
-Число logical streams не создаёт отдельные NATS соединения или async tasks.
-Прямой Cargo запуск real_nats требует feature и runner-owned env;
-основной entrypoint — `run.py`, успешного пропуска broker tests нет.
+Runner создаёт отдельный NATS с закреплённым образом и TLS, временными CA и
+учётными данными, публикует случайные порты только на loopback и ждёт готовности.
+После Rust-сценариев потери транспорта он повторно проверяет `/healthz`
+перед межпроцессными проверками. Свой контейнер и временные файлы удаляются
+при завершении, включая ошибки тестов. Прямой Cargo-запуск транспортных тестов
+требует подготовленного окружения; отсутствие брокера не считается успехом.
 
-[Контракт движка](../docs/stream-engine.md),
-[формат пакетов](../docs/wire.md),
-[общая структура](../docs/repository.md).
+[Первый запуск](../docs/getting-started.md) содержит команды, параметры,
+ограничения и диагностику. [Нагрузка](../docs/getting-started.md#нагрузочный-эксперимент)
+измеряет все приложения в одном процессе;
+[независимые процессы](../docs/getting-started.md#независимые-процессы-runtime)
+разделяют метрики клиента, сервера и брокера. Ограничения контейнера относятся
+только к брокеру; измерения не задают универсальной ёмкости или SLA.
 
-[Текущая архитектура и схемы](../docs/architecture.md),
-[первый запуск и диагностика](../docs/getting-started.md),
-[указатель документации](../docs/README.md).
+Проверки [IPC](../docs/daemon-ipc.md) охватывают кредит, половинное закрытие,
+частичную запись, владельцев и дескрипторы, малые очереди, остановку брокера
+и аварии процессов. Общий логин в отдельных сценариях имеет явные права
+для PeerId 1/2; это не изоляция между держателями общего секрета.
 
-`qualify` проверяет dynamic NatsRuntime, authenticated new generations, independent
-processes, bounded transport delay/slow-credit/churn и отдельные process metrics.
-Команды, finite workload bounds и measurement scope: [qualification guide](../docs/getting-started.md#независимые-процессы-runtime).
-Сырые metrics/credentials временные; capacity/SLA не заявляются.
-
-## Standalone daemon и foreign languages
-
-```sh
-python3 testbench/run.py daemon --offline
-```
-
-Нужны Linux/Ruby3.4+ помимо основных prerequisites. Runner строит release
-`skvoz-core-daemon`, запускает independent daemons и Python acceptor/Ruby/Python
-stdlib clients через тот же dedicated INFO → TLS broker. `check` также включает
-этот сценарий. После Rust-проверок runner повторно ждёт готовности брокера через
-`/healthz` (до 15 секунд), поскольку сценарии потери транспорта перезапускают NATS.
-Temporary ACL даёт одному device login только явно provisioned
-PeerId1/2; это не automatic ID allocation и не credential isolation между ними.
-
-[IPC contract](../docs/daemon-ipc.md) описывает finite profiles, watermark/credit,
-owner admission/isolation и startup/lifecycle. Qualification проверяет tiny local
-output queues отдельно от NATS subscription overflow tests, делает real broker
-stop/start и daemon/client kill; source-only fixtures находятся в daemon/tests.
-RSS/idle samples имеют ограниченный workload scope и не являются SLA.
+[Архитектура](../docs/architecture.md), [движок](../docs/stream-engine.md),
+[wire v1](../docs/wire.md), [NATS runtime](../docs/nats-runtime.md).

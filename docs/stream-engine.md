@@ -190,13 +190,14 @@ pending rejections. Данные в событии принадлежат caller
 Abort не может отобрать ранее переданные allocations. Логические бюджеты не
 включают allocator metadata, transport/runtime buffers, соединения и broker.
 
-## Опциональный NATS runtime
+## Статический NatsNode
 
 Feature `nats` экспортирует `nats::NatsNode`, `NatsConfig`, `PeerRoute` и
 `FailureKind`. Host задаёт url/CA/credentials, namespace, local identity/session,
 точные peer/session routes, queue capacities и per-turn limits. Для каждого
 lifetime требуется новая generation. Routing envelope описан в [wire](wire.md).
-CA-проверка, TLS и аутентификация обязательны; порядок INFO/TLS задаёт профиль runtime; broker ACL должен разрешать
+Проверка CA, TLS и аутентификация обязательны по
+[профилю транспорта](nats-runtime.md#профиль-транспорта); broker ACL должен разрешать
 publish только с credential-bound sender и нужными recipient identities.
 
 Subscription/client capacities — 1…65 536 сообщений/commands; input/output
@@ -208,7 +209,8 @@ namespace <=256 байт. Duplicate/self peers отвергаются. Broker ma
 
 `open/accept/reject/send/finish/consume_through/close` ставят работу; `turn(wait)`
 передаёт bounded output batch, принимает bounded input и обрабатывает deadlines.
-На batch выполняется flush; это broker barrier, не remote consumption.
+На пакет выполняется `flush`: в async-nats 0.50 он завершает локальную запись
+буферов сокета, не подтверждая обработку брокером или потребление удалённой стороной.
 `flush_pending()` передаёт один bounded output batch без inbound. `poll_events`
 выдаёт terminal events и применяет async failure latch. Disconnect, overflow,
 server/client error навсегда закрывают node при следующем owner turn/API/poll;
@@ -236,4 +238,4 @@ NATS очереди имеют message-count caps. Для Core publish/подп�
 Это не полный предел RSS. [Нагрузочный режим](getting-started.md#нагрузочный-эксперимент)
 показывает измеряемую область и её ограничения.
 
-`Manager.aggregate()` returns constant-time slot/reservation/send/ready counters; `resources()` is explicit detailed O(stream count) buffer inspection. Dynamic authenticated session lifecycle, generation-safe RuntimeKey and transport watermark are defined in the [NATS runtime contract](nats-runtime.md), above the unchanged Stream engine.
+`Manager.aggregate()` возвращает счётчики потоков, резервирования, отправки и готовых очередей за постоянное время. `resources()` подробно просматривает буферы за O(число потоков). Жизненный цикл динамических сессий, ключи RuntimeKey с проверкой поколения и транспортные отметки определены в [контракте NATS runtime](nats-runtime.md) поверх того же Stream.

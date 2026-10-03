@@ -1,30 +1,29 @@
-# Ruby IPC example
+# Пример IPC на Ruby
 
-`skvoz_ipc.rb` использует только Ruby3.4+ standard library (`socket`) и единый
-[IPC v1](../../docs/daemon-ipc.md). Native extension или отдельная реализация
-Core не требуется. Это bounded example helper, не полный proxy/reconnect SDK.
+`skvoz_ipc.rb` использует Ruby 3.4+ и стандартную библиотеку (`socket`) для
+[IPC v1](../../docs/daemon-ipc.md). Нативное расширение и отдельная реализация
+Core не требуются. Очереди ограничены; повторное подключение остаётся за приложением.
 
-С работающим принимающим echo host:
+С работающими демонами и принимающим обработчиком:
 
 ```sh
 SKVOZ_SOCKET="/absolute/private-directory/core.sock"
 printf 'hello' | ruby clients/ruby/echo.rb --socket "$SKVOZ_SOCKET" --peer 0
 ```
 
-Подставьте собственный absolute pathname в `SKVOZ_SOCKET`.
+Укажите свой абсолютный путь к закрытому сокету. Пример обменивает до 65 536
+бинарных байтов, сохраняет непринятый остаток SEND, допускает ответ после FINISH
+и вызывает CONSUME после записи результата. Адаптер проверяет размеры,
+версию, типы и идентификаторы запросов. Очередь событий ограничена
+4 096 элементами и 8 МиБ; приложение должно её опустошать. Код 4 при конечном
+`consume` означает освобождённый дескриптор, без подтверждения обработки.
 
-Example поддерживает0..65536 binary stdin bytes, частичный SEND, FINISH и reply
-после EOF. Раннее завершение до полного echo вызывает ошибку. Helper проверяет
-version/kinds/request IDs и ограничивает retained events4096 slots/8MiB;
-приложение должно дренировать события и возвращать credit после потребления.
-Terminal `consume` может вернуть4: handle уже освобождён, acknowledgment не применён.
-
-Из корня репозитория полная независимая Ruby/Python qualification с временным
-INFO → TLS NATS и provisioned IDs:
+Из корня репозитория независимые Ruby/Python процессы с временным NATS и TLS:
 
 ```sh
 python3 testbench/run.py daemon
 ```
 
-Принимающую metadata/destination policy и accept/reject реализует приложение.
-Новый IPC session не восстанавливает прежние streams/handles/data.
+Получение данных не возвращает кредит. Обработка непрозрачных метаданных,
+решение accept/reject и сохранение порядка потреблённых байтов остаются
+за коннектором по каноническому контракту.

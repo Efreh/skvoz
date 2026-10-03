@@ -1,3 +1,4 @@
+pub mod app;
 pub mod backend;
 pub mod desktop;
 pub mod enrollment;

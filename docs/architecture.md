@@ -61,6 +61,8 @@ flowchart TB
     runtime <-->|"TLS: присоединение и транспортные каналы"| broker
 ```
 
+## Статическое встраивание и TCP-пример
+
 Каждый NatsNode владеет одним NATS client и одной подпиской, без отдельного
 соединения или задачи на logical stream. Host задаёт явный список доверенных
 peer identities и session generations. Subjects имеют вид
@@ -79,8 +81,8 @@ API коннектора синхронно ставит bounded work. `turn(wai
 
 `connectors/tcp` владеет одним сокетом и выдаваемыми Core буферами. Реальный
 TCP пример создаёт два выделенных NatsNode того же Core, локальный requester
-и удалённый target. Он проверяет bytes/FIN/ответ после EOF. Для many-socket proxy
-нужен connector dispatcher; текущий relay не является таким proxy.
+и удалённый target. Он проверяет bytes/FIN/ответ после EOF. Для множества сокетов
+нужен диспетчер коннектора; текущий relay обслуживает только один сокет.
 
 ## Отдельный процесс ядра Core
 
@@ -209,7 +211,8 @@ ID в той же peer session повторно не используется; �
 
 Runner выдаёт раздельные временные credentials обычным runtime/TCP участникам.
 Daemon qualification также проверяет два provisioned device PeerId с общим login
-и явно ограниченным ACL набором; credential не изолирует эти две identities друг от друга. CA, ключи и пароли создаются заново; NATS принимает INFO → TLS соединения.
+и явно ограниченным ACL набором; credential не изолирует эти две identities друг от друга. CA, ключи и пароли создаются заново; используется общий
+[профиль транспорта](nats-runtime.md#профиль-транспорта).
 Подробности: [первый запуск](getting-started.md).
 
 Round-robin выдаёт один frame на ready peer, вращая streams внутри peer.

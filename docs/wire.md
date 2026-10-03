@@ -50,4 +50,4 @@ Language-neutral hex vectors находятся в
 [core/tests/fixtures/wire-v1.tsv](../core/tests/fixtures/wire-v1.tsv);
 их формат описан в [README](../core/tests/fixtures/README.md).
 
-The optional [dynamic NATS runtime](nats-runtime.md) adds its own pair-token/sequence envelope and bounded control packets around these unchanged wire v1 bytes. The stream vectors remain valid; static NatsNode uses the original packet without that runtime envelope.
+Опциональный [динамический NATS runtime](nats-runtime.md) добавляет оболочку с токеном пары и номером последовательности, а также ограниченные управляющие пакеты поверх того же wire v1. Векторы потока остаются действительными; статический NatsNode передаёт исходный пакет без оболочки runtime.
