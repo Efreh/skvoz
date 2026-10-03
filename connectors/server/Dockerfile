@@ -33,6 +33,7 @@ COPY --from=core-builder /src/target/release/skvoz-core-daemon /usr/local/bin/sk
 COPY --from=broker /usr/local/bin/nats-server /usr/local/bin/nats-server
 COPY --from=acme-test /app /usr/local/bin/pebble
 COPY connectors/server/spec spec
+COPY connectors/server/deployment deployment
 COPY daemon/tests/fixtures /opt/daemon/tests/fixtures
 COPY clients/ruby /opt/clients/ruby
 ENV SKVOZ_INTEGRATION=1
