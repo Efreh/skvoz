@@ -172,6 +172,10 @@ impl View {
         icon.add_css_class("accent");
         hero.append(&icon);
         hero.append(&label("Соединение SKVOZ", "title-1"));
+        hero.append(&label(
+            &format!("Версия {}", env!("CARGO_PKG_VERSION")),
+            "dim-label",
+        ));
         body.append(&hero);
         let login = adw::PreferencesGroup::builder().title("Сервер").build();
         let host = adw::EntryRow::builder()
@@ -241,7 +245,11 @@ impl View {
         status_box.append(&status_icon);
         status_box.append(&status);
         body.append(&status_box);
-        let speed = label("↓ 0 Б/с   ↑ 0 Б/с", "monospace");
+        let speed = label(&crate::telemetry::rates(0, 0, 1.0), "monospace");
+        speed.set_wrap(false);
+        speed.set_halign(gtk::Align::Center);
+        speed.set_width_chars(crate::telemetry::RATE_GUIDE.chars().count() as i32);
+        speed.set_max_width_chars(crate::telemetry::RATE_GUIDE.chars().count() as i32);
         speed.set_tooltip_text(Some("Получено и отправлено через SKVOZ за секунду"));
         body.append(&speed);
         let activity = adw::PreferencesGroup::builder()
@@ -504,13 +512,7 @@ impl View {
                     .and_then(|t| t.format("%H:%M:%S").ok())
                     .map(|t| t.to_string())
                     .unwrap_or_default();
-                let result = match request.result {
-                    "opening" => "Открытие",
-                    "active" => "Открыто",
-                    "finished" => "Завершено",
-                    "cancelled" => "Прервано",
-                    _ => "Ошибка",
-                };
+                let result = request_result(request.result);
                 let host = if request.host.contains(':') {
                     format!("[{}]", request.host)
                 } else {
@@ -761,5 +763,16 @@ impl View {
         });
         *self.settings_window.borrow_mut() = Some(dialog.clone());
         dialog.present();
+    }
+}
+
+pub fn request_result(code: &str) -> String {
+    match code {
+        "opening" => "Открытие".to_owned(),
+        "active" => "Открыто".to_owned(),
+        "finished" => "Завершено".to_owned(),
+        "cancelled" => "Прервано".to_owned(),
+        "stream_cancelled" => "Прервано (stream_cancelled)".to_owned(),
+        _ => format!("Ошибка ({code})"),
     }
 }

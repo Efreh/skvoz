@@ -136,7 +136,7 @@ impl Tray {
                     )
                         .to_variant(),
                     "XAyatanaLabel" => property_label.borrow().to_variant(),
-                    "XAyatanaLabelGuide" => "↓ 999.9 МиБ/с ↑ 999.9 МиБ/с".to_variant(),
+                    "XAyatanaLabelGuide" => crate::telemetry::RATE_GUIDE.to_variant(),
                     _ => "".to_variant(),
                 }
             })
@@ -358,7 +358,7 @@ impl Tray {
                 ITEM,
                 "org.kde.StatusNotifierItem",
                 "XAyatanaNewLabel",
-                (label, "↓ 999.9 МиБ/с ↑ 999.9 МиБ/с").to_variant(),
+                (label, crate::telemetry::RATE_GUIDE).to_variant(),
             );
         }
     }

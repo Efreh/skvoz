@@ -1,6 +1,6 @@
 use crate::{
     Error, Result,
-    ipc::{CLOSED, DATA, OPENED, Owner, REMOTE_FINISHED, WRITABLE},
+    ipc::{CLOSED, DATA, OPENED, Owner, REJECTED, REMOTE_FINISHED, WRITABLE},
     settings::{host_name, port},
 };
 use std::{
@@ -411,10 +411,18 @@ async fn connection(
             && serde_json::from_slice::<serde_json::Value>(&event.payload).is_ok_and(|value| {
                 value == serde_json::json!({"v":1,"type":"tcp","status":"connected"})
             });
-        drop(accounted);
         if !connected {
-            return Err(Error("destination_failed"));
+            return Err(if event.handle == reply.handle && event.kind == REJECTED {
+                rejection_error(&event.payload)
+            } else if event.handle == reply.handle && event.kind == CLOSED {
+                closed_result(&event.payload)
+                    .err()
+                    .unwrap_or(Error("ipc_failed"))
+            } else {
+                Error("ipc_failed")
+            });
         }
+        drop(accounted);
         Ok((http, session, reply.handle))
     };
     let established = tokio::time::timeout(Duration::from_secs(10), handshake).await;
@@ -439,14 +447,17 @@ async fn connection(
         }
     };
     flow.opened();
-    if socks {
-        socket.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-    } else if http.tunnel {
-        socket
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
+    let result = async {
+        if socks {
+            socket.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        } else if http.tunnel {
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+        }
+        relay(&mut socket, &mut session, handle, http.initial, &flow).await
     }
-    let result = relay(&mut socket, &mut session, handle, http.initial, &flow).await;
+    .await;
     flow.finish(result);
     let _ = session.commands.request(8, handle, &[], &[0, 4]).await;
     let _ = socket.shutdown().await;
@@ -524,11 +535,7 @@ async fn relay(
                     writer.shutdown().await?;
                 }
                 CLOSED => {
-                    return if remote_fin {
-                        Ok(())
-                    } else {
-                        Err(Error("stream_cancelled"))
-                    };
+                    return closed_result(&event.payload);
                 }
                 _ => return Err(Error("ipc_failed")),
             };
@@ -549,9 +556,75 @@ async fn relay(
         _ = failed.changed() => Err(Error("ipc_failed")),
     }
 }
+
+fn rejection_error(payload: &[u8]) -> Error {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return Error("ipc_failed");
+    };
+    if value["v"] != 1 || value["type"] != "tcp" {
+        return Error("ipc_failed");
+    }
+    Error(match value["error"].as_str() {
+        Some("forbidden") => "destination_forbidden",
+        Some("refused") => "destination_refused",
+        Some("dns_failed") => "destination_dns_failed",
+        Some("connect_timeout") => "destination_connect_timeout",
+        Some("overloaded") => "destination_overloaded",
+        Some("invalid_destination") => "invalid_destination",
+        _ => "destination_failed",
+    })
+}
+
+fn closed_result(payload: &[u8]) -> Result<()> {
+    match payload {
+        [0, 1] => Ok(()),
+        [0, 2] => Err(Error("stream_rejected")),
+        [0, 3] => Err(Error("stream_cancelled")),
+        [0, 4] => Err(Error("stream_transport_lost")),
+        [0, 5] => Err(Error("stream_protocol_error")),
+        [0, 6] => Err(Error("stream_open_timeout")),
+        _ => Err(Error("ipc_failed")),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostics_preserve_rejection_and_terminal_reasons() {
+        let cases = [
+            ("forbidden", "destination_forbidden"),
+            ("refused", "destination_refused"),
+            ("dns_failed", "destination_dns_failed"),
+            ("connect_timeout", "destination_connect_timeout"),
+            ("overloaded", "destination_overloaded"),
+        ];
+        for (reason, expected) in cases {
+            let payload =
+                serde_json::to_vec(&serde_json::json!({"v":1,"type":"tcp","error":reason}))
+                    .unwrap();
+            assert_eq!(rejection_error(&payload), Error(expected));
+        }
+        assert_eq!(
+            rejection_error(b"private malformed payload"),
+            Error("ipc_failed")
+        );
+        assert_eq!(closed_result(&[0, 1]), Ok(()));
+        for (reason, expected) in [
+            (3, "stream_cancelled"),
+            (4, "stream_transport_lost"),
+            (5, "stream_protocol_error"),
+            (6, "stream_open_timeout"),
+        ] {
+            assert_eq!(closed_result(&[0, reason]), Err(Error(expected)));
+        }
+        assert_eq!(closed_result(&[0]), Err(Error("ipc_failed")));
+        assert_eq!(closed_result(&[0, 7]), Err(Error("ipc_failed")));
+        assert_eq!(
+            Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            Error("io_connection_reset")
+        );
+        assert!(crate::ui::request_result("io_connection_reset").contains("io_connection_reset"));
+    }
     #[tokio::test]
     async fn owner_failure_interrupts_a_blocked_consumer_after_local_fin() {
         use tokio::net::UnixStream;

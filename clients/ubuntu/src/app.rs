@@ -93,10 +93,10 @@ pub fn run() -> glib::ExitCode {
                 .downloaded
                 .load(std::sync::atomic::Ordering::Relaxed);
             let seconds = previous.2.elapsed().as_secs_f64();
-            view.speed.set_label(&format!(
-                "↓ {}   ↑ {}",
-                crate::telemetry::rate(down.saturating_sub(previous.1), seconds),
-                crate::telemetry::rate(up.saturating_sub(previous.0), seconds)
+            view.speed.set_label(&crate::telemetry::rates(
+                down.saturating_sub(previous.1),
+                up.saturating_sub(previous.0),
+                seconds,
             ));
             previous = (up, down, std::time::Instant::now());
             view.refresh_log();

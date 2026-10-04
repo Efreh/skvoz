@@ -328,4 +328,37 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     expect(curl(replacement, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
   end
 
+  it 'reports destination rejection and remote cancellation after a real target reset' do
+    reset = ::Queue.new
+    broken = ServerSystem::Target.new do |socket|
+      reset.pop
+      socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [1, 0].pack('ii'))
+    end
+    @server.stop
+    @server.value['allow'] << { 'cidr' => '127.0.0.0/8', 'ports' => [broken.port] }
+    private_json(@server.config, @server.value)
+    @server.start
+    app = application('diagnostics')
+    socket = TCPSocket.new('127.0.0.1', app.socks)
+    socket.write("\5\1\0".b)
+    expect(socket.read(2)).to eq("\5\0".b)
+    socket.write([5, 1, 0, 1, 127, 0, 0, 1, 0, 1].pack('C*'))
+    expect(socket.read(10).byteslice(0, 2)).to eq("\5\1".b)
+    socket.close
+    wait_until { app.info['connections'].zero? }
+    expect(app.info.fetch('requests').last).to include('result' => 'destination_forbidden')
+    socket = tunnel(app, broken.port, socks: true)
+    reset << true
+    expect(Timeout.timeout(5) { socket.read }).to eq('')
+    socket.close
+    wait_until { app.info['connections'].zero? }
+    expect(app.info.fetch('requests').last).to include('result' => 'stream_cancelled')
+    expect(@server.command('health').fetch('connector').fetch('last_failure')).to include('errno' => Errno::ECONNRESET::Errno)
+    expect(curl(app, "http://localhost:#{@target.port}/")).to eq('skvoz-real-http-response')
+  ensure
+    socket&.close unless socket&.closed?
+    reset << true if reset
+    broken&.close
+  end
+
 end

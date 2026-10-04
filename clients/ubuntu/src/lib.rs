@@ -21,7 +21,14 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
-    fn from(_: std::io::Error) -> Self {
-        Self("io_failed")
+    fn from(error: std::io::Error) -> Self {
+        Self(match error.kind() {
+            std::io::ErrorKind::ConnectionReset => "io_connection_reset",
+            std::io::ErrorKind::ConnectionAborted => "io_connection_aborted",
+            std::io::ErrorKind::BrokenPipe => "io_broken_pipe",
+            std::io::ErrorKind::UnexpectedEof => "io_unexpected_eof",
+            std::io::ErrorKind::TimedOut => "io_timeout",
+            _ => "io_failed",
+        })
     }
 }

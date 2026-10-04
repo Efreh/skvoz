@@ -15,8 +15,8 @@ RSpec.describe Skvoz::Server::IPCSession do
     [kind, request, (high << 64) | low, body.byteslice(32..)]
   end
 
-  def respond(socket, command, value: 0, extra: ''.b)
-    socket.write(Skvoz::Server::Protocol.encode(0x8000, command[1], command[2], [0, value].pack('nQ>') + extra))
+  def respond(socket, command, code: 0, value: 0, extra: ''.b)
+    socket.write(Skvoz::Server::Protocol.encode(0x8000, command[1], command[2], [code, value].pack('nQ>') + extra))
   end
 
   def hello(socket)
@@ -24,6 +24,34 @@ RSpec.describe Skvoz::Server::IPCSession do
     expect(command[0]).to eq(1)
     capabilities = [1, 7, 9, 15, 65_536, 512, 8192, 64, 2048, 1_048_576].pack('nQ>Q>NNNNNNN')
     respond(socket, command, extra: capabilities)
+  end
+
+  it 'preserves a rejected command code independently of its exception message' do
+    Dir.mktmpdir do |directory|
+      listener = UNIXServer.new(File.join(directory, 'core.sock'))
+      Async do |root|
+        peer = nil
+        server = root.async do
+          peer = listener.accept
+          hello(peer)
+          respond(peer, read_command(peer), code: 4)
+        end
+        session = described_class.new(listener.path) { |_frame, _error| nil }.start(root)
+        reply = session.request(6, 1, [0].pack('Q>'))
+        expect { session.check(reply) }.to raise_error(Skvoz::Server::Error) do |error|
+          expect(error).to respond_to(:code)
+          expect(error.code).to eq(4)
+          allow(error).to receive(:message).and_raise('Diagnostics must not read IPC exception text')
+          expect(Skvoz::Server::Diagnostics.error_fields(error)).to include(ipc_code: 4)
+        end
+        expect(session.check(reply, allowed: [0, 4])).to equal(reply)
+        server.wait
+      ensure
+        session&.stop
+        peer&.close
+        listener.close
+      end.wait
+    end
   end
 
   it 'routes reversed concurrent replies without allowing multiple socket readers' do

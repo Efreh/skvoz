@@ -194,6 +194,8 @@ RSpec.describe 'Server TCP transport and administration', integration: true do
     release << true
     wait_until { @server.command('health').fetch('connector').fetch('streams').zero? }
     expect(@server.command('health').fetch('connector')).to include('event_bytes' => 0, 'event_frames' => 0)
+    expect(@server.command('health').fetch('connector').fetch('outcomes')).to include('cancelled' => 1, 'failed' => 0)
+    expect(@server.log.read).not_to include('SKVOZ stream failed: IOError', '"event":"stream_failed"')
   ensure
     release << true if release
   end
@@ -235,6 +237,8 @@ RSpec.describe 'Server TCP transport and administration', integration: true do
     blocker = TCPSocket.new('127.0.0.1', blocked_port)
     device = start_bridge(refused.local_address.ip_port, blocked_port)
     expect(transfer(device.path, refused.local_address.ip_port, reject: 'refused')).to be_nil
+    failure = @server.command('health').fetch('connector').fetch('last_failure')
+    expect(failure).to include('outcome' => 'rejected', 'stage' => 'connect', 'error_code' => 'refused', 'errno' => Errno::ECONNREFUSED::Errno)
     if File.read('/proc/sys/net/ipv4/tcp_abort_on_overflow').strip == '0'
       expect(transfer(device.path, blocked_port, reject: 'connect_timeout', timeout: 8)).to be_nil
     end
@@ -304,6 +308,11 @@ RSpec.describe 'Server TCP transport and administration', integration: true do
     wait_until { @server.command('health').fetch('connector').fetch('streams').zero? }
     expect(@server.command('health').fetch('connector')).to include('event_bytes' => 0, 'event_frames' => 0)
     expect(transfer(device.path, echo.port, 'after-rst')).to eq('after-fin:tsr-retfa')
+    failure = @server.command('health').fetch('connector').fetch('last_failure')
+    expect(failure).to include('outcome' => 'failed', 'stage' => 'target_read', 'error_class' => 'Errno::ECONNRESET', 'errno' => Errno::ECONNRESET::Errno)
+    expect(failure.fetch('handle')).to match(/\A[0-9a-f]{32}\z/)
+    expect(failure.fetch('peer')).to be > 0
+    expect(@server.log.read).not_to include(@bundle.fetch('password'))
   ensure
     reset << true if reset
   end

@@ -76,6 +76,11 @@ impl Telemetry {
         if history.len() == HISTORY_LIMIT {
             history.pop_front();
         }
+        let mut request = request;
+        request.time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         history.push_back(request);
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
@@ -146,18 +151,61 @@ impl Drop for Flow {
         }
     }
 }
+pub const RATE_GUIDE: &str = "↓ 999999.99 КиБ/с   ↑ 999999.99 КиБ/с";
 pub fn rate(bytes: u64, seconds: f64) -> String {
-    let value = bytes as f64 / seconds.max(0.001);
-    if value >= 1024.0 * 1024.0 {
-        format!("{:.1} МиБ/с", value / (1024.0 * 1024.0))
-    } else if value >= 1024.0 {
-        format!("{:.1} КиБ/с", value / 1024.0)
-    } else {
-        format!("{value:.0} Б/с")
+    // A fixed unit avoids resizing panel hosts that ignore XAyatanaLabelGuide.
+    // Figure spaces reserve digit cells without distracting leading zeroes.
+    let value = bytes as f64 / seconds.max(0.001) / 1024.0;
+    let mut number = format!("{value:.2}");
+    if number.len() > 9 {
+        number = format!("{value:.2e}");
     }
+    format!(
+        "{}{} КиБ/с",
+        "\u{2007}".repeat(9usize.saturating_sub(number.len())),
+        number
+    )
+}
+pub fn rates(down: u64, up: u64, seconds: f64) -> String {
+    format!("↓ {}   ↑ {}", rate(down, seconds), rate(up, seconds))
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rates_keep_digit_cells_and_never_truncate_large_values() {
+        for bytes in [
+            0,
+            30,
+            307,
+            1023,
+            1024,
+            1_000_000,
+            1_023_999_980,
+            1_023_999_995,
+            1_024_000_000,
+            u64::MAX,
+        ] {
+            let line = super::rates(bytes, 0, 1.0);
+            assert_eq!(line.chars().count(), super::RATE_GUIDE.chars().count());
+        }
+        assert!(super::rate(307, 1.0).ends_with("0.30 КиБ/с"));
+        assert!(super::rate(u64::MAX, 0.001).contains("e19"));
+    }
+    #[test]
+    fn events_use_recording_time_instead_of_connection_start() {
+        let telemetry = super::Telemetry::new(true);
+        let mut flow = telemetry.flow();
+        flow.destination("SOCKS5", "example.org", 443);
+        flow.request.as_mut().unwrap().time = 1;
+        flow.opened();
+        assert!(telemetry.history().last().unwrap().time > 1);
+        flow.request.as_mut().unwrap().time = 2;
+        flow.finish(Err(crate::Error("io_connection_reset")));
+        drop(flow);
+        let record = telemetry.history().pop().unwrap();
+        assert!(record.time > 2);
+        assert_eq!(record.result, "io_connection_reset");
+    }
     use super::*;
     #[test]
     fn bounded_history_counts_bytes_even_when_disabled_or_contended() {

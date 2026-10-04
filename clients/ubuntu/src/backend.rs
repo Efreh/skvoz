@@ -575,6 +575,11 @@ fn retryable(code: &str) -> bool {
             | "enrollment_failed"
             | "core_unavailable"
             | "io_failed"
+            | "io_connection_reset"
+            | "io_connection_aborted"
+            | "io_broken_pipe"
+            | "io_unexpected_eof"
+            | "io_timeout"
             | "ipc_failed"
     )
 }

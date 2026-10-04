@@ -43,7 +43,8 @@ module Skvoz
                 @enrollment&.stop(graceful: true)
                 begin
                   start_enrollment if monotonic >= (@next_enrollment || 0)
-                rescue StandardError
+                rescue StandardError => error
+                  Diagnostics.emit('enrollment_restart_failed', **Diagnostics.error_fields(error))
                   @next_enrollment = monotonic + 1
                 end
               end
@@ -61,10 +62,11 @@ module Skvoz
             unless @failure == 'configuration_apply_uncertain'
               @failure = [@nats, @core].compact.find { |child| !child.alive? }&.exit_category || 'core_unavailable'
             end
-            warn "SKVOZ recovering: #{@failure}"
+            Diagnostics.emit('runtime_recovering', failure: @failure, connector_failure: @connector&.failure,
+              nats_exit: @nats&.exit_category, core_exit: @core&.exit_category)
           rescue StandardError => error
             @failure = 'runtime_start_failed' unless @failure == 'configuration_apply_uncertain'
-            warn(error.is_a?(Error) ? 'SKVOZ recovering: ' + error.message : 'SKVOZ recovering: runtime_start_failed')
+            Diagnostics.emit('runtime_start_failed', stage: @runtime_stage, failure: @failure, **Diagnostics.error_fields(error))
           ensure
             @healthy = false
             @enrollment&.stop
@@ -158,26 +160,31 @@ module Skvoz
         @tls = replacement
         prune_tls
         @next_renewal = Time.now + @config.tls['renewal_interval']
-      rescue Error, SystemCallError, OpenSSL::OpenSSLError
+      rescue Error, SystemCallError, OpenSSL::OpenSSLError => error
         @failure = 'certificate_renewal_failed' unless @failure == 'configuration_apply_uncertain'
         @healthy = false
-        warn 'SKVOZ certificate renewal failed'
+        Diagnostics.emit('certificate_renewal_failed', initial:, **Diagnostics.error_fields(error))
         raise if initial
       ensure
         prune_tls(preserve_candidate: true)
       end
 
       def start_runtime
+        @runtime_stage = 'tls'
         @nats = @core = nil
         renew(initial: true) unless @tls.valid?
+        @runtime_stage = 'binary_validation'
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
         validate_binary(@config['core_binary'], 'skvoz-core-daemon 1.4.0 ipc=1')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
+        @runtime_stage = 'nats_validation'
         validate_nats(@nats_path)
+        @runtime_stage = 'nats_start'
         @nats = ChildProcess.new([@config['nats_binary'], '--config', @nats_path], label: 'nats').start(@task)
         @children << @nats
         wait_ready { probe }
+        @runtime_stage = 'core_start'
         @core_path = File.join(@state.directory, 'core.sock')
         recover_socket(@core_path, 'core-owner.json')
         profile_path = File.join(@state.directory, 'core-profile.json')
@@ -186,6 +193,7 @@ module Skvoz
         @children << @core
         wait_ready { File.socket?(@core_path) && @core.alive? }
         remember_socket(@core_path, 'core-owner.json', @core.pid)
+        @runtime_stage = 'policy'
         own = [[@config['bind'], @config['port']], ['127.0.0.1', @config['monitor_port']]]
         aliases = []
         @task.with_timeout(3) do
@@ -213,13 +221,16 @@ module Skvoz
         own = own.filter_map { |host, port| [host, port] if IPAddr.new(host) rescue nil }
         policy = Policy.new(allow: @config['allow'], deny: @config['deny'], own_endpoints: own)
         streams = @config['max_streams']
+        @runtime_stage = 'connector_start'
         @connector = TCPConnector.new(path: @core_path, policy:, limits: { streams:, tcp_buffer_bytes: @config['tcp_buffer_bytes'], stream_frames: @config['stream_queue_frames'], stream_bytes: @config['stream_queue_bytes'], event_frames: streams * @config['stream_queue_frames'], event_bytes: streams * @config['stream_queue_bytes'] }).start(@task)
+        @runtime_stage = 'enrollment_start'
         start_enrollment
         @failure = nil
         clear_candidate
         prune_tls
         @healthy = @tls.valid?
-        warn 'SKVOZ ready'
+        @runtime_stage = 'running'
+        Diagnostics.emit('runtime_ready', revision: @state.revision)
       end
 
       def start_enrollment
@@ -331,6 +342,7 @@ module Skvoz
         @healthy = @connector&.ready? && @tls.valid?
         true
       rescue StandardError, Async::Stop => error
+        Diagnostics.emit('configuration_apply_failed', revision: candidate['revision'], **Diagnostics.error_fields(error))
         @failure = 'configuration_apply_uncertain'
         @healthy = false
         @connector&.stop
@@ -397,7 +409,8 @@ module Skvoz
         end
         result = Async::Task.current.with_timeout(15) { @mutation.acquire { command(request) } }
         Async::Task.current.with_timeout(2) { socket.write(JSON.generate('ok' => true, 'result' => result) + "\n") }
-      rescue StandardError
+      rescue StandardError => error
+        Diagnostics.emit('administration_failed', **Diagnostics.error_fields(error))
         socket.write(JSON.generate('ok' => false, 'error' => 'Administration request failed') + "\n") rescue nil
       ensure
         socket.close

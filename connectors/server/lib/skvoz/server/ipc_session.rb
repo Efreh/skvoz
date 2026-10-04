@@ -79,7 +79,7 @@ module Skvoz
       end
 
       def check(reply, allowed: [0])
-        raise Error, "IPC command rejected: code #{reply.code}" unless allowed.include?(reply.code)
+        raise IPCCommandError.new(reply.code) unless allowed.include?(reply.code)
         reply
       end
 

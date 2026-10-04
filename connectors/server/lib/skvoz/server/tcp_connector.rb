@@ -3,6 +3,7 @@ require 'async/semaphore'
 require 'resolv'
 require_relative 'ipc_session'
 require_relative 'policy'
+require_relative 'diagnostics'
 
 module Skvoz
   module Server
@@ -18,6 +19,9 @@ module Skvoz
         @event_budget = Budget.new(count: @limits[:event_frames], bytes: @limits[:event_bytes])
         @connects = Async::Semaphore.new(@limits[:connecting])
         @running = false
+        @outcomes = %w[started finished cancelled failed rejected].to_h { |name| [name, 0] }
+        @log_window = 0
+        @log_count = @suppressed_events = 0
       end
 
       def start(task)
@@ -35,7 +39,26 @@ module Skvoz
 
       def statistics
         { 'streams' => @streams.length, 'target_written_bytes' => @streams.values.sum(&:written_bytes), 'cleanup_actors' => @cleanups.length, 'event_frames' => @event_budget.count,
-          'event_bytes' => @event_budget.bytes, 'peak_event_frames' => @event_budget.peak_count, 'peak_event_bytes' => @event_budget.peak_bytes }
+          'event_bytes' => @event_budget.bytes, 'peak_event_frames' => @event_budget.peak_count, 'peak_event_bytes' => @event_budget.peak_bytes,
+          'outcomes' => @outcomes.dup, 'last_failure' => @last_failure, 'suppressed_events' => @suppressed_events }
+      end
+
+      def outcome(name, fields = {})
+        @outcomes.fetch(name)
+        @outcomes[name] += 1
+        return if name == 'started' || name == 'finished'
+        fields = { time: Time.now.utc.iso8601(3), outcome: name }.merge(fields)
+        @last_failure = fields if name == 'failed' || name == 'rejected'
+        window = Process.clock_gettime(Process::CLOCK_MONOTONIC).floor
+        if window != @log_window
+          @log_window, @log_count = window, 0
+        end
+        if @log_count < 20
+          @log_count += 1
+          Diagnostics.emit('stream_' + name, **fields)
+        else
+          @suppressed_events += 1
+        end
       end
 
       def ready? = @running && @failure.nil? && @session && @session.error.nil?
@@ -84,6 +107,7 @@ module Skvoz
 
       def connect(destination)
         socket = nil
+        last_errno = nil
         Async::Task.current.with_timeout(@limits[:connect_timeout]) do
           @connects.acquire do
             addresses = resolve(destination)
@@ -100,12 +124,13 @@ module Skvoz
                   raise SystemCallError.new('TCP connect failed', errno) unless errno.zero?
                 end
                 return socket
-              rescue SystemCallError
+              rescue SystemCallError => error
+                last_errno = error.errno
                 socket.close
                 socket = nil
               end
             end
-            raise DestinationError, 'refused'
+            raise DestinationError.new('refused', errno: last_errno)
           end
         end
       rescue Async::TimeoutError
@@ -119,20 +144,23 @@ module Skvoz
 
       def dispatch(frame, error)
         if error
+          Diagnostics.emit('ipc_unavailable', **Diagnostics.error_fields(error)) unless @failure
           @failure ||= 'IPC unavailable'
           @running = false
-          @streams.values.each(&:abort)
+          @streams.values.each { |stream| stream.abort('ipc_unavailable') }
           return
         end
         if frame.kind == Protocol::INCOMING
           raise ProtocolError, 'Invalid incoming metadata' unless frame.payload.bytesize.between?(8, 520)
           raise ProtocolError, 'Duplicate incoming handle' if @streams.key?(frame.handle)
           if !@running || @streams.length >= @limits[:streams]
+            outcome('rejected', handle: format('%032x', frame.handle), error_code: 'overloaded', stage: 'admission')
             control(frame.handle, 4, Protocol.metadata(v: 1, type: 'tcp', error: 'overloaded'))
           else
             peer = frame.payload.unpack1('Q>')
             stream = TCPStream.new(self, frame.handle, peer, frame.payload.byteslice(8..), @limits)
             @streams[frame.handle] = stream
+            outcome('started')
             stream.start(@task)
           end
         else
@@ -153,6 +181,9 @@ module Skvoz
         @closed = false
         @accepted = false
         @opened = false
+        @started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @read_bytes = @sent_bytes = 0
+        @read_stage, @write_stage = 'establish', 'waiting'
         @accept_metadata = Protocol.metadata(v: 1, type: 'tcp', status: 'connected')
       end
 
@@ -175,7 +206,16 @@ module Skvoz
         elsif frame.kind == Protocol::CLOSED
           raise ProtocolError, 'Invalid closed event' unless frame.payload.bytesize == 2
           reason = frame.payload.unpack1('n')
+          raise ProtocolError, 'Invalid closed reason' unless (1..6).cover?(reason)
+          @remote_reason = reason
           unless reason == 1
+            outcome = case reason
+                      when 3 then 'cancelled'
+                      when 2 then 'rejected'
+                      else 'failed'
+                      end
+            code = { 2 => 'rejected', 3 => 'cancelled', 4 => 'transport_lost', 5 => 'protocol_error', 6 => 'open_timeout' }.fetch(reason)
+            terminal(outcome, 'remote_closed', close_reason: reason, error_code: code)
             abort
             return
           end
@@ -190,9 +230,10 @@ module Skvoz
         end
       end
 
-      def abort
+      def abort(reason = 'local_stop')
         return if @closed
         @closed = true
+        terminal(reason == 'ipc_unavailable' ? 'failed' : 'cancelled', reason) unless @terminal_recorded
         @socket&.close unless @socket&.closed?
         @queue.close
         @writable.signal
@@ -207,24 +248,28 @@ module Skvoz
 
       def enqueue(frame)
         return if @queue.push(frame, bytes: frame.payload.bytesize + 36)
-        warn "SKVOZ stream queue admission exceeded: frames=#{@queue.budget.count} bytes=#{@queue.budget.bytes}"
+        terminal('failed', 'event_queue', error_code: 'queue_overflow')
         abort
         @connector.close_handle(@handle)
       end
 
       def establish
+        @read_stage = 'destination'
         destination = Destination.new(@metadata)
+        @read_stage = 'connect'
         @socket = @connector.connect(destination)
         return @socket.close if @closed
         @accepted = true
+        @read_stage = 'accept'
         @connector.session.check(@connector.session.request(3, @handle, @accept_metadata))
         @tasks << @parent.async { write_target }
         read_target
       rescue DestinationError => error
+        terminal('rejected', @read_stage, **Diagnostics.error_fields(error)) unless @closed
         reject(error.code) unless @closed
         abort
       rescue StandardError => error
-        warn(error.is_a?(Error) ? 'SKVOZ stream failed: ' + error.message : 'SKVOZ stream failed: ' + error.class.name)
+        terminal('failed', @read_stage, **Diagnostics.error_fields(error)) unless @closed
         close_remote unless @closed
         abort
       ensure
@@ -242,8 +287,10 @@ module Skvoz
               payload = frame.payload.byteslice(8..)
               write_bytes(payload)
             when Protocol::REMOTE_FINISHED
+              @write_stage = 'target_shutdown'
               @socket.shutdown(Socket::SHUT_WR)
             when Protocol::CLOSED
+              terminal('finished', 'remote_closed', close_reason: 1)
               abort
               return
             end
@@ -252,7 +299,7 @@ module Skvoz
           end
         end
       rescue StandardError => error
-        warn(error.is_a?(Error) ? 'SKVOZ stream failed: ' + error.message : 'SKVOZ stream failed: ' + error.class.name)
+        terminal('failed', @write_stage, **Diagnostics.error_fields(error)) unless @closed
         close_remote unless @closed
         abort
       end
@@ -260,12 +307,14 @@ module Skvoz
       def write_bytes(bytes)
         written = 0
         while written < bytes.bytesize
+          @write_stage = 'target_write'
           count = @socket.write_nonblock(bytes.byteslice(written..), exception: false)
           if count == :wait_writable
             @socket.wait_writable
           else
             written += count
             @offset += count
+            @write_stage = 'consume'
             reply = @connector.session.request(6, @handle, [@offset].pack('Q>'))
             @connector.session.check(reply, allowed: [0, 4])
           end
@@ -274,13 +323,16 @@ module Skvoz
 
       def read_target
         until @closed
+          @read_stage = 'target_read'
           bytes = @socket.read_nonblock(32_768, exception: false)
           if bytes == :wait_readable
             @socket.wait_readable
           elsif bytes.nil?
+            @read_stage = 'finish'
             @connector.session.check(@connector.session.request(7, @handle), allowed: [0, 4])
             return
           else
+            @read_bytes += bytes.bytesize
             send_bytes(bytes)
           end
         end
@@ -290,11 +342,14 @@ module Skvoz
         sent = 0
         while sent < bytes.bytesize && !@closed
           generation = @writable_generation
+          @read_stage = 'send'
           reply = @connector.session.request(5, @handle, bytes.byteslice(sent..))
           @connector.session.check(reply, allowed: [0, 1, 4])
           return abort if reply.code == 4
           raise ProtocolError, 'Invalid SEND accepted prefix' if reply.value > bytes.bytesize - sent || (reply.code == 1 && reply.value != 0)
           sent += reply.value
+          @sent_bytes += reply.value
+          @read_stage = 'writable_wait'
           @writable.wait if sent < bytes.bytesize && reply.value.zero? && generation == @writable_generation && !@closed
         end
       end
@@ -303,6 +358,16 @@ module Skvoz
         @connector.session.check(@connector.session.request(4, @handle, Protocol.metadata(v: 1, type: 'tcp', error: code)), allowed: [0, 4])
       rescue Error
         nil
+      end
+
+      def terminal(outcome, stage, **fields)
+        return if @terminal_recorded
+        @terminal_recorded = true
+        @connector.outcome(outcome, { handle: format('%032x', @handle), peer: @peer, stage:,
+          duration_ms: ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - @started) * 1000).round,
+          target_written_bytes: @offset, target_read_bytes: @read_bytes, core_sent_bytes: @sent_bytes,
+          accepted: @accepted, opened: @opened, socket_closed: @socket&.closed?, close_reason: @remote_reason,
+          queue_frames: @queue.budget.count, queue_bytes: @queue.budget.bytes }.merge(fields))
       end
 
       def close_remote

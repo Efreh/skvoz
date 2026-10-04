@@ -4,6 +4,7 @@ require 'async/semaphore'
 require 'async/condition'
 require 'openssl'
 require 'json'
+require_relative 'diagnostics'
 
 module Skvoz
   module Server
@@ -120,7 +121,8 @@ module Skvoz
             @work.signal
           end
         end
-      rescue StandardError
+      rescue StandardError => error
+        Diagnostics.emit('enrollment_unavailable', **Diagnostics.error_fields(error)) if @ready
         @ready = false
       end
 
@@ -138,10 +140,12 @@ module Skvoz
           respond(reply, result) if @ready
           rescue JSON::ParserError, KeyError, Error, Async::TimeoutError => error
             code = error.message == 'Device pool exhausted' ? 'device_limit' : 'enrollment_failed'
+            Diagnostics.emit('enrollment_failed', reason: code, **Diagnostics.error_fields(error))
             respond(reply, { v: 1, error: code }) if @ready
           end
         end
-      rescue StandardError
+      rescue StandardError => error
+        Diagnostics.emit('enrollment_unavailable', **Diagnostics.error_fields(error)) if @ready
         @ready = false
       end
     end

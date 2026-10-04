@@ -85,6 +85,56 @@ fn qualify_desktop(view: &std::rc::Rc<View>) {
         registered.borrow().as_ref().unwrap().0,
         "/StatusNotifierItem"
     );
+    // GNOME renders XAyatanaLabel as plain text and ignores its width guide.
+    let panel = gtk::Label::new(None);
+    let mut panel_widths = std::collections::BTreeMap::new();
+    let mut window_width = None;
+    for (down, up) in [
+        (0, 0),
+        (307, 30),
+        (1024, 1023),
+        (1_000_000, 99_999_999),
+        (1_023_999_980, 1024),
+        (1_024_000_000, u64::MAX),
+    ] {
+        let text = skvoz_ubuntu_client::telemetry::rates(down, up, 1.0);
+        view.speed.set_text(&text);
+        tray.update();
+        let prop = dbus_call(
+            &bus,
+            "/StatusNotifierItem",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &("org.kde.StatusNotifierItem", "XAyatanaLabel").to_variant(),
+        );
+        assert_eq!(
+            prop.child_value(0)
+                .as_variant()
+                .unwrap()
+                .get::<String>()
+                .unwrap(),
+            text
+        );
+        tick(Duration::from_millis(50));
+        for font in ["Sans 11", "Ubuntu Sans 11", "Ubuntu 11"] {
+            let layout = panel.create_pango_layout(Some(&text));
+            layout.set_font_description(Some(&gtk::pango::FontDescription::from_string(font)));
+            let width = layout.pixel_size().0;
+            assert_eq!(
+                *panel_widths.entry(font).or_insert(width),
+                width,
+                "panel {font}: {text:?}"
+            );
+        }
+        let width = view.speed.width();
+        assert_eq!(
+            *window_width.get_or_insert(width),
+            width,
+            "window: {text:?}"
+        );
+    }
+    view.speed
+        .set_text(&skvoz_ubuntu_client::telemetry::rates(0, 0, 1.0));
     let reply = dbus_call(
         &bus,
         "/Menu",
@@ -322,6 +372,7 @@ fn native_window_settings_and_backend_error() {
         let mut value = settings.value.clone();
         value.host = "localhost".into();
         value.username = "shared".into();
+        value.tray_speed = true;
         value
             .remember_password("localhost", 4222, "shared", "saved-test-password".into())
             .unwrap();
@@ -355,6 +406,11 @@ fn native_window_settings_and_backend_error() {
     view.window.present();
     tick(Duration::from_millis(400));
     assert_eq!(view.status.text(), "Отключено");
+    assert!(widgets(view.window.upcast_ref()).into_iter().any(|widget| {
+        widget.downcast::<gtk::Label>().is_ok_and(|label| {
+            label.text() == format!("Версия {}", env!("CARGO_PKG_VERSION")) && label.is_visible()
+        })
+    }));
     qualify_desktop(&view);
     if let Some(path) = std::env::var_os("SKVOZ_MAIN_XWD") {
         tick(Duration::from_millis(200));
