@@ -75,12 +75,26 @@ jobs:
         env:
           SKVOZ_INTEGRATION: '1'
         run: |
-          export SKVOZ_TEST_RUNTIME="$GITHUB_WORKSPACE/target/release/skvoz-network-runtime"
-          export SKVOZ_TEST_CLIENT="$GITHUB_WORKSPACE/target/release/skvoz-client-test-driver"
-          export SKVOZ_TEST_NATS="$RUNNER_TEMP/skvoz-bin/nats-server"
-          cd connectors/server
+          # The restricted test user cannot traverse the runner's private home.
+          fixture=$(mktemp -d --tmpdir=/tmp skvoz-client-ci.XXXXXX)
+          trap 'rm -rf -- "$fixture"' EXIT
+          git archive HEAD | tar -x -C "$fixture"
+          mkdir -p "$fixture/connectors/server/vendor" "$fixture/bin"
+          cp -a connectors/server/vendor/bundle "$fixture/connectors/server/vendor/"
+          cp target/release/skvoz-network-runtime target/release/skvoz-client-test-driver "$fixture/bin/"
+          cp "$RUNNER_TEMP/skvoz-bin/nats-server" "$fixture/bin/"
+          # Only public sources, installed gems and test binaries are copied.
+          chmod -R a+rX "$fixture"
+          export BUNDLE_GEMFILE="$fixture/connectors/server/Gemfile"
+          export BUNDLE_PATH="$fixture/connectors/server/vendor/bundle"
+          export BUNDLE_APP_CONFIG="$fixture/connectors/server/.bundle"
+          export BUNDLE_FROZEN=true
+          export SKVOZ_TEST_RUNTIME="$fixture/bin/skvoz-network-runtime"
+          export SKVOZ_TEST_CLIENT="$fixture/bin/skvoz-client-test-driver"
+          export SKVOZ_TEST_NATS="$fixture/bin/nats-server"
+          cd "$fixture/connectors/server"
           # The real server fixture enforces the same UID and capability boundary as Compose.
-          sudo --preserve-env=PATH,GEM_HOME,GEM_PATH,BUNDLE_PATH,BUNDLE_APP_CONFIG,SKVOZ_INTEGRATION,SKVOZ_TEST_RUNTIME,SKVOZ_TEST_CLIENT,SKVOZ_TEST_NATS \
+          sudo --preserve-env=PATH,GEM_HOME,GEM_PATH,BUNDLE_PATH,BUNDLE_APP_CONFIG,BUNDLE_GEMFILE,BUNDLE_FROZEN,SKVOZ_INTEGRATION,SKVOZ_TEST_RUNTIME,SKVOZ_TEST_CLIENT,SKVOZ_TEST_NATS \
             setpriv --reuid 10001 --regid 10001 --clear-groups --no-new-privs \
             --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
             "$(command -v bundle)" exec rspec ../../clients/ubuntu/spec
