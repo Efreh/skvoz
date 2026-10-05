@@ -17,6 +17,8 @@ from qualification import qualify
 from daemon_qualification import qualify as qualify_daemon
 from network_qualification import qualify as qualify_network
 from network_runtime_qualification import qualify as qualify_network_runtime
+from tcp_capacity_qualification import qualify as qualify_tcp_capacity
+from tcp_capacity_resources import qualify as qualify_tcp_resources
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4"
@@ -91,7 +93,7 @@ def ready_inside(container, timeout=15):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["check", "demo", "load", "tcp", "qualify", "daemon", "network", "network-runtime"], nargs="?", default="check")
+    parser.add_argument("mode", choices=["check", "demo", "load", "tcp", "qualify", "daemon", "network", "network-runtime", "tcp-capacity"], nargs="?", default="check")
     parser.add_argument("--offline", action="store_true", help="Use cached Cargo dependencies and Docker image")
     parser.add_argument("--clients", type=int, default=10)
     parser.add_argument("--streams-per-client", type=int, default=10)
@@ -106,7 +108,38 @@ def main():
     parser.add_argument("--network-performance-only", action="store_true", help="Run matched network throughput diagnostics without functional/loss groups")
     parser.add_argument("--network-functional-only", action="store_true", help="Run network functional/security/loss groups without throughput measurements")
     parser.add_argument("--network-profile", action="store_true", help="Collect a separate bounded broker CPU profile after network measurements")
+    parser.add_argument("--tcp-capacity-hold", type=int, default=2, help="TCP capacity hold with new exchanges (0..1800 seconds)")
+    parser.add_argument("--tcp-capacity-cycles", type=int, default=0, help="Additional real open/close cycles (0..10000)")
+    parser.add_argument("--tcp-capacity-server-resources", action="store_true", help="Separate real Ruby/NATS/runtime server container, 16 consumers ×64 idle +32 active +1 stalled")
+    parser.add_argument("--tcp-capacity-benchmark", action="store_true", help="Matched useful upload/download, 1/16 streams, five 30-second runs")
+    parser.add_argument("--tcp-capacity-negatives", action="store_true", help="Real slow DNS, setup cancellation, full proxy failures and same/other peer stalled isolation")
+    parser.add_argument("--tcp-capacity-baseline-binary", type=Path)
+    parser.add_argument("--tcp-capacity-baseline-profile", type=Path)
     args = parser.parse_args()
+    if not 0 <= args.tcp_capacity_hold <= 1800 or not 0 <= args.tcp_capacity_cycles <= 10000:
+        parser.error("TCP capacity parameters exceed the bounded experiment scope")
+    if bool(args.tcp_capacity_baseline_binary) != bool(args.tcp_capacity_baseline_profile):
+        parser.error("baseline binary and matching profile must be supplied together")
+    if args.mode == "tcp-capacity" and not (1 <= args.clients <= 16
+            and 1 <= args.streams_per_client <= 512
+            and 0 <= args.active_per_client <= 512
+            and args.clients * (args.streams_per_client + args.active_per_client) <= 2048):
+        parser.error("TCP capacity requires 1..16 clients, 1..512 streams per client and at most 2048 total streams")
+    if (args.mode == "tcp-capacity" and not (args.tcp_capacity_baseline_binary
+            or args.tcp_capacity_benchmark or args.tcp_capacity_server_resources or args.tcp_capacity_negatives)
+            and not (args.streams_per_client + 64 <= 512
+                and args.clients * args.streams_per_client + 64 <= 2048
+                and args.streams_per_client + args.active_per_client < 512
+                and args.clients * (args.streams_per_client + args.active_per_client) < 2048)):
+        parser.error("positive TCP capacity requires per-client idle +64 burst and idle +active +1 fresh <=512, total idle +64 <=2048 and total idle +active +1 <=2048")
+    if args.tcp_capacity_server_resources and (args.mode != "tcp-capacity" or args.tcp_capacity_benchmark
+            or args.tcp_capacity_baseline_binary or args.clients != 16 or args.streams_per_client != 64 or args.active_per_client != 2):
+        parser.error("server resources require tcp-capacity mode, 16 clients ×64 idle and 2 active per client")
+    if args.tcp_capacity_benchmark and (args.mode != "tcp-capacity" or args.clients != 1):
+        parser.error("TCP capacity benchmark requires tcp-capacity mode with exactly one client")
+    if args.tcp_capacity_negatives and (args.mode != "tcp-capacity" or args.tcp_capacity_benchmark
+            or args.tcp_capacity_server_resources or args.tcp_capacity_baseline_binary):
+        parser.error("TCP capacity negatives require an independent current runtime fixture")
     if (args.network_performance_only or args.network_functional_only or args.network_profile) and args.mode != "network":
         parser.error("network diagnostic options require network mode")
     if args.network_performance_only and args.network_functional_only:
@@ -114,6 +147,7 @@ def main():
     if args.network_functional_only and args.network_profile:
         parser.error("network-functional-only skips profiler workloads")
     if not (1 <= args.clients <= 512 and 1 <= args.streams_per_client <= 512
+            and 0 <= args.active_per_client <= 512
             and args.clients * args.streams_per_client <= 65536 and 1 <= args.duration <= 60 and 0 <= args.delay_ms <= 200 and 1 <= args.churn_rounds <= 10
             and 0 <= args.slow_reader_delay_ms <= 2000
             and ((args.bytes+8191)//8192)*args.slow_reader_delay_ms <= 60000
@@ -125,6 +159,20 @@ def main():
     command(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     cargo = ["cargo"]
     extra = ["--locked"] + (["--offline"] if args.offline else [])
+    if args.mode == "tcp-capacity":
+        if not args.tcp_capacity_baseline_binary:
+            command(cargo + ["build", "--release", "-p", "skvoz-network", "--features", "linux-runtime", *extra])
+        command(["docker", "build", "-f", "testbench/fixtures/network-runtime/Dockerfile", "-t", "skvoz-network:runtime-fixture", "."])
+        if args.tcp_capacity_server_resources:
+            command(["docker", "build", "--target", "tests", "-f", "connectors/server/Dockerfile", "-t", "skvoz-server:tcp-capacity-tests", "."])
+            qualify_tcp_resources(ROOT, args)
+        elif args.tcp_capacity_negatives:
+            qualify_tcp_capacity(ROOT, args, certificates, mode='setup')
+            qualify_tcp_capacity(ROOT, args, certificates, mode='overload')
+            qualify_tcp_capacity(ROOT, args, certificates, mode='reduced')
+        else:
+            qualify_tcp_capacity(ROOT, args, certificates)
+        return
     if args.mode == "network-runtime":
         command(cargo + ["build", "--release", "-p", "skvoz-network", "-p", "skvoz-network-helper",
                          "--features", "skvoz-network/linux-runtime", *extra])

@@ -1,6 +1,6 @@
 # Linux helper общего сетевого компонента
 
-`skvoz-network-helper` 0.1.0 — узкий привилегированный Linux-процесс для
+`skvoz-network-helper` 0.2.0 — узкий привилегированный Linux-процесс для
 [общего сетевого модуля](../README.md). Он управляет только собственными TUN,
 маршрутами, таблицей nft, per-link DNS и постоянными адресными назначениями.
 Payload, NATS credentials и Core остаются вне helper. Весь Rust-код этого

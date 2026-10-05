@@ -12,7 +12,7 @@ module Skvoz
     module CLI
       def self.main(arguments)
         command = arguments.shift
-        return puts('skvoz-server 3.0.0') if command == '--version'
+        return puts('skvoz-server 3.1.0') if command == '--version'
         if command.nil? || %w[-h --help].include?(command)
           puts 'Usage: skvoz-server serve [--config FILE] | health [--state DIR] | user add|list|show|device-add|reset-password|remove [LOGIN] [--state DIR] [--password-stdin|--prompt-password]'
           return

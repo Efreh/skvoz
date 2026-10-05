@@ -14,6 +14,7 @@
 | `qualify` | Динамический NatsRuntime в независимых процессах release, задержки, медленный потребитель и смена сессий |
 | `daemon` | Независимые Core-демоны и приложения Python/Ruby через IPC |
 | `network` | Экспериментальный IP-движок: настоящий TUN и Core/NATS в независимых Linux-контейнерах |
+| `tcp-capacity` | HTTP/CONNECT, SOCKS5 и OPEN_TCP: независимые процессы release с TLS/NATS, удержание соединений, новые запросы и повторное открытие |
 | `network-runtime` | Продуктовые runtime/helper, API 1, NAT44, routed IPv6, DNS и аварийное восстановление в изолированных контейнерах |
 
 Из корня репозитория:
@@ -35,6 +36,48 @@ Runner создаёт отдельный NATS с закреплённым обр
 перед межпроцессными проверками. Свой контейнер и временные файлы удаляются
 при завершении, включая ошибки тестов. Прямой Cargo-запуск транспортных тестов
 требует подготовленного окружения; отсутствие брокера не считается успехом.
+
+Для проверки ёмкости TCP:
+
+```sh
+python3 testbench/run.py tcp-capacity --offline --clients 1 --streams-per-client 256 --active-per-client 32 --tcp-capacity-hold 1800 --report-directory <directory>
+python3 testbench/run.py tcp-capacity --offline --clients 16 --streams-per-client 64 --active-per-client 0 --tcp-capacity-hold 600 --report-directory <directory>
+python3 testbench/run.py tcp-capacity --offline --tcp-capacity-negatives --report-directory <directory>
+python3 testbench/run.py tcp-capacity --offline --clients 16 --streams-per-client 64 --active-per-client 2 --tcp-capacity-hold 1800 --tcp-capacity-cycles 10000 --tcp-capacity-server-resources --report-directory <directory>
+python3 testbench/run.py tcp-capacity --offline --clients 1 --streams-per-client 1 --active-per-client 0 --tcp-capacity-benchmark --report-directory <directory>
+```
+
+Этот режим создаёт изолированный контейнер с двумя CPU и пределом памяти 1 ГиБ,
+без внешней сети и дополнительных capabilities. Допустимы до 16 клиентов,
+512 соединений каждого и 2048 соединений суммарно вместе с активными.
+Обычный положительный сценарий требует запаса для burst из 64 соединений
+первого клиента (`idle +64 ≤512`, `total idle +64 ≤2048`) и одного нового
+соединения во время удержания (`idle +active +1 ≤512`,
+`clients ×(idle +active) +1 ≤2048`). Измерение скорости, отрицательные сценарии
+и серверный ресурсный стенд имеют собственную фиксированную нагрузку.
+Удержание — до 1800 секунд, `--tcp-capacity-cycles` — до 10000 открытий/закрытий.
+При удержании каждый клиент выполняет новые короткие HTTP-запросы и обмены
+через все входы. Измерение скорости использует одного клиента без удерживаемых
+соединений: 1/16 потоков, upload/download, пять повторов по 30 секунд; upload
+подтверждается числом байтов получателя после EOF, время разгрузки учитывается
+отдельно и входит в полезную скорость. Для сравнения старой сборки задайте
+`--tcp-capacity-baseline-binary` и её полный совместимый JSON-профиль через
+`--tcp-capacity-baseline-profile`.
+
+`--tcp-capacity-negatives` проверяет реальные DNS/очередь/отмену и полные
+отказы при исчерпании, рядом с загрузками того же и другого устройства.
+Сокращённый профиль с двумя TCP slots и очередью API 34816 байт / 6 записей
+проверяет третий отказ через OPEN_TCP, полный HTTP 503 и SOCKS5 reply,
+сохранение здоровых соединений, освобождение слота и новое открытие.
+`--tcp-capacity-server-resources` собирает обычный серверный tests image
+и запускает RSpec с Ruby/NATS/runtime в одном контейнере; потребители
+работают в отдельном cgroup. Удержание включает повторяемые медленные
+попытки, затем указанное число циклов и контроль очистки.
+
+Отчёт сохраняет hash бинарника, реальные RSS/FD процессов, счётчики, результаты и ошибки.
+Общий cgroup этого стенда включает тестовые клиенты, цели, брокер и runtime;
+он не является измерением отдельного серверного контейнера Ruby/NATS/runtime.
+Числа профиля и успешный короткий запуск сами по себе не задают SLA.
 
 Для совместной проверки сетевого runtime и helper:
 

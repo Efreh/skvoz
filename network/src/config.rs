@@ -109,24 +109,24 @@ impl Limits {
         let server = role == Role::Server;
         Self {
             ip_sessions: if server { 128 } else { 1 },
-            core_streams: if server { 512 } else { 32 },
-            streams_per_peer: 32,
+            core_streams: if server { 2048 } else { 512 },
+            streams_per_peer: 512,
             lease_identities: if server { 4096 } else { 1 },
             receive_window: 65536,
             max_frame: 16384,
-            core_receive_bytes: if server { 67108864 } else { 2097152 },
-            core_receive_peer_bytes: 2097152,
+            core_receive_bytes: if server { 134217728 } else { 33554432 },
+            core_receive_peer_bytes: 33554432,
             core_send_bytes: if server { 67108864 } else { 2097152 },
             core_send_peer_bytes: 2097152,
             packet_queue_bytes: 262144,
             packet_queue_records: 256,
             control_queue_bytes: 32768,
             control_queue_records: 8,
-            runtime_buffer_bytes: if server { 268435456 } else { 16777216 },
-            runtime_buffer_records: if server { 65536 } else { 4096 },
+            runtime_buffer_bytes: if server { 536870912 } else { 100663296 },
+            runtime_buffer_records: if server { 131072 } else { 16384 },
             api_queue_bytes: 131072,
             api_queue_records: 128,
-            subscription_frames: 32,
+            subscription_frames: 64,
             join_frames: 32,
             client_frames: 16,
             core_shards: 8,
@@ -143,7 +143,7 @@ impl Limits {
             || self.max_frame != c.max_frame
             || self.core_send_bytes != c.core_send_bytes
             || self.core_send_peer_bytes != c.core_send_peer_bytes
-            || self.subscription_frames != 32
+            || self.subscription_frames != 64
             || self.join_frames != 32
             || self.client_frames != 16
             || self.core_shards != 8
@@ -153,22 +153,56 @@ impl Limits {
             || self.packet_io_timeout_ms != 1000
             || !(1..=c.ip_sessions).contains(&self.ip_sessions)
             || !(2..=c.core_streams).contains(&self.core_streams)
-            || !(2..=32).contains(&self.streams_per_peer)
+            || !(2..=c.streams_per_peer).contains(&self.streams_per_peer)
             || !(1..=c.lease_identities).contains(&self.lease_identities)
             || !(131072..=c.core_receive_bytes).contains(&self.core_receive_bytes)
-            || !(131072..=2097152).contains(&self.core_receive_peer_bytes)
+            || !(131072..=c.core_receive_peer_bytes).contains(&self.core_receive_peer_bytes)
             || !(1508..=262144).contains(&self.packet_queue_bytes)
             || !(1..=256).contains(&self.packet_queue_records)
             || !(16392..=32768).contains(&self.control_queue_bytes)
             || !(1..=8).contains(&self.control_queue_records)
             || !(8388608..=c.runtime_buffer_bytes).contains(&self.runtime_buffer_bytes)
             || !(128..=c.runtime_buffer_records).contains(&self.runtime_buffer_records)
-            || !(32768..=131072).contains(&self.api_queue_bytes)
-            || !(1..=128).contains(&self.api_queue_records)
+            || !(crate::local_api::BODY_MAX + 2048..=131072).contains(&self.api_queue_bytes)
+            || !(6..=128).contains(&self.api_queue_records)
         {
             return Err(NetworkError::InvalidConfiguration);
         }
+        if self.runtime_buffer_bytes < self.minimum_runtime_bytes(role, false)? {
+            return Err(NetworkError::InvalidConfiguration);
+        }
         Ok(())
+    }
+    pub fn fixed_backing(&self, role: Role, helper: bool) -> Result<usize, NetworkError> {
+        let receive = self
+            .core_streams
+            .checked_mul(self.receive_window as usize)
+            .map(|n| n.min(self.core_receive_bytes))
+            .ok_or(NetworkError::InvalidConfiguration)?;
+        self.transport_reservation(role)
+            .checked_add(
+                receive
+                    .checked_mul(2)
+                    .ok_or(NetworkError::InvalidConfiguration)?,
+            )
+            .and_then(|n| n.checked_add(self.core_send_bytes))
+            .and_then(|n| n.checked_add(524288))
+            .and_then(|n| {
+                n.checked_add(if helper {
+                    crate::local_api::BODY_MAX * 40
+                } else {
+                    0
+                })
+            })
+            .ok_or(NetworkError::InvalidConfiguration)
+    }
+    /// Fixed backing plus one maximum command and a fully populated API queue.
+    pub fn minimum_runtime_bytes(&self, role: Role, helper: bool) -> Result<usize, NetworkError> {
+        self.fixed_backing(role, helper)?
+            .checked_add(crate::local_api::BODY_MAX * 32 + 32768)
+            .and_then(|n| n.checked_add(self.api_queue_bytes))
+            .and_then(|n| n.checked_add(self.api_queue_records.checked_mul(256)?))
+            .ok_or(NetworkError::InvalidConfiguration)
     }
     pub fn engine(&self) -> EngineConfig {
         EngineConfig {
@@ -302,7 +336,15 @@ impl NetworkConfig {
         {
             return Err(NetworkError::InvalidConfiguration);
         }
-        self.limits.validate(role)
+        self.limits.validate(role)?;
+        if self.limits.runtime_buffer_bytes
+            < self
+                .limits
+                .minimum_runtime_bytes(role, role == Role::Server && !self.families.is_empty())?
+        {
+            return Err(NetworkError::InvalidConfiguration);
+        }
+        Ok(())
     }
 }
 impl PolicyRule {
@@ -569,10 +611,11 @@ impl StartupConfig {
                 .map(|p| parse_peer(p))
                 .collect::<Result<_, _>>()?,
             shards: 8,
-            subscription_capacity: 32,
+            subscription_capacity: 64,
             join_capacity: 32,
             client_capacity: 16,
-            max_incoming_per_turn: 32,
+            // The shared server drains aggregate peer tails between native chunks.
+            max_incoming_per_turn: if self.role == Role::Server { 256 } else { 32 },
             max_outgoing_per_turn: 32,
             io_timeout: Duration::from_secs(3),
             heartbeat_interval: Duration::from_secs(2),

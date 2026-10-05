@@ -1,8 +1,94 @@
 use serde_json::{Value, json};
 use skvoz_network::{NetworkError, config::*, local_api::*, policy};
 const CLIENT: &[u8] = include_bytes!("fixtures/client-startup.json");
+#[test]
+fn shared_runtime_profiles_bound_aggregate_server_input_without_growing_queues() {
+    let mut client = StartupConfig::parse_json(CLIENT).unwrap();
+    let runtime = client.core_runtime().unwrap();
+    assert_eq!(runtime.max_incoming_per_turn, 32);
+    assert_eq!(runtime.max_outgoing_per_turn, 32);
+    client.role = Role::Server;
+    client.core.peer_id = "0".into();
+    client.core.membership = "broker_authorized".into();
+    client.core.allowed_peers.clear();
+    client.core.initiate.clear();
+    client.network.limits = Limits::canonical(Role::Server);
+    client.network.families.clear();
+    client.server = Some(serde_json::from_value(json!({"ipv4":null,"ipv6":null,"dns_servers":[],"allow":[],"deny":[],"service_prefixes":[],"lease_store":std::env::temp_dir().join("leases.json"),"server_addresses":[],"management_endpoints":[]})).unwrap());
+    let runtime = client.core_runtime().unwrap();
+    assert_eq!(runtime.max_incoming_per_turn, 256);
+    assert_eq!(runtime.max_outgoing_per_turn, 32);
+    assert_eq!(runtime.subscription_capacity, 64);
+    assert_eq!(runtime.shards, 8);
+}
+#[test]
+fn canonical_capacity_preserves_all_ip_reservations_and_dual_stack_client() {
+    let limits = Limits::canonical(Role::Server);
+    let budget = skvoz_network::budget::Budget::new(
+        limits.runtime_buffer_bytes,
+        limits.runtime_buffer_records,
+    );
+    let _fixed = budget
+        .reserve(limits.fixed_backing(Role::Server, true).unwrap(), 32)
+        .unwrap();
+    let bytes =
+        2 * limits.packet_queue_bytes + 65536 + 32768 + 2 * limits.control_queue_bytes + 65536;
+    let records = 2 * limits.packet_queue_records + 128 + 32;
+    let sessions: Vec<_> = (0..128)
+        .map(|_| budget.reserve(bytes, records).unwrap())
+        .collect();
+    assert_eq!(sessions.len(), limits.ip_sessions);
+    let mut client = StartupConfig::parse_json(CLIENT).unwrap();
+    client.network.families = vec![4, 6];
+    assert!(client.network.validate(Role::Client).is_ok());
+}
+
 fn wire(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
+}
+#[test]
+fn tuned_profiles_reject_unbacked_fixed_reservations_before_startup() {
+    for role in [Role::Client, Role::Server] {
+        let mut limits = Limits::canonical(role);
+        limits.api_queue_bytes = BODY_MAX + 2048;
+        limits.api_queue_records = 6;
+        limits.core_streams = 2;
+        limits.streams_per_peer = 2;
+        limits.core_receive_bytes = 131072;
+        limits.core_receive_peer_bytes = 131072;
+        let fixed = limits.minimum_runtime_bytes(role, false).unwrap();
+        limits.runtime_buffer_bytes = fixed;
+        assert!(limits.validate(role).is_ok());
+        limits.runtime_buffer_bytes -= 1;
+        assert_eq!(
+            limits.validate(role),
+            Err(NetworkError::InvalidConfiguration)
+        );
+        let mut network = serde_json::from_slice::<StartupConfig>(CLIENT)
+            .unwrap()
+            .network;
+        network.limits = limits;
+        network.limits.runtime_buffer_bytes = network
+            .limits
+            .minimum_runtime_bytes(role, role == Role::Server)
+            .unwrap();
+        assert!(network.validate(role).is_ok());
+        network.limits.runtime_buffer_bytes -= 1;
+        assert!(network.validate(role).is_err());
+    }
+}
+
+#[test]
+fn api_profile_requires_room_for_a_response_and_deferred_terminal_progress() {
+    let mut limits = Limits::canonical(Role::Client);
+    limits.api_queue_bytes = BODY_MAX + 2048;
+    limits.api_queue_records = 6;
+    assert!(limits.validate(Role::Client).is_ok());
+    limits.api_queue_bytes -= 1;
+    assert!(limits.validate(Role::Client).is_err());
+    limits.api_queue_bytes += 1;
+    limits.api_queue_records = 5;
+    assert!(limits.validate(Role::Client).is_err());
 }
 
 #[test]
@@ -10,11 +96,11 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     let config = StartupConfig::parse_json(CLIENT).unwrap();
     assert_eq!(
         config.network.limits.transport_reservation(Role::Client),
-        8395264
+        12592896
     );
     assert_eq!(
         Limits::canonical(Role::Server).transport_reservation(Role::Server),
-        45124544
+        78705600
     );
     let value: Value = serde_json::from_slice(CLIENT).unwrap();
     for (parent, key) in [

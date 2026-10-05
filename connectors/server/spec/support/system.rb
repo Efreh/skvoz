@@ -296,9 +296,9 @@ module ServerSystem
       raise ArgumentError, 'Exported port mismatch' if server_port && bundle['port'] != server_port
       ca = directory.join('ca.pem')
       ca.write(bundle.fetch('ca_pem')); ca.chmod(0o600)
-      limits = Skvoz::Server::NetworkConfiguration::LIMITS.merge('ip_sessions' => 1, 'core_streams' => 32,
-        'lease_identities' => 1, 'core_receive_bytes' => 2097152, 'core_send_bytes' => 2097152,
-        'runtime_buffer_bytes' => 16777216, 'runtime_buffer_records' => 4096)
+      limits = Skvoz::Server::NetworkConfiguration::LIMITS.merge('ip_sessions' => 1, 'core_streams' => 512,
+        'lease_identities' => 1, 'core_receive_bytes' => 33554432, 'core_send_bytes' => 2097152,
+        'runtime_buffer_bytes' => 100663296, 'runtime_buffer_records' => 16384)
       ServerSystem.private_json(@profile, { v: 1, role: 'client', server: nil,
         core: { url: "tls://127.0.0.1:#{bundle.fetch('port')}", tls_server_name: bundle.fetch('address'),
           trust: 'managed_ca', ca_file: ca.to_s, username: bundle.fetch('username'), password: bundle.fetch('password'),

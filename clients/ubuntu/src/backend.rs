@@ -265,6 +265,7 @@ impl Engine {
             .process_group(0);
         skvoz_network_native::inherit_control(command.as_std_mut(), remote.as_fd(), 3)?;
         let child = command.spawn()?;
+        self.telemetry.runtime_generation();
         drop(command);
         drop(remote);
         let child_id = child.id().ok_or(Error("core_unavailable"))?;

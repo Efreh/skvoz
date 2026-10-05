@@ -53,6 +53,8 @@ struct Queued {
     _api: Reservation,
     stats: bool,
     advertised: bool,
+    request_id: Option<u64>,
+    terminal_request: bool,
 }
 struct OutputState {
     queue: VecDeque<Queued>,
@@ -66,9 +68,29 @@ struct Output {
 }
 impl Output {
     fn push(&self, message: OwnedMessage) -> Result<(), RuntimeFailure> {
-        let stats = serde_json::from_slice::<Value>(&message.json)
-            .ok()
-            .is_some_and(|v| v.get("event").and_then(Value::as_str) == Some("STATS"));
+        let envelope = serde_json::from_slice::<Value>(&message.json).ok();
+        let event = envelope
+            .as_ref()
+            .and_then(|v| v.get("event"))
+            .and_then(Value::as_str);
+        let stats = event == Some("STATS");
+        let request_id = if event == Some("REQUEST") {
+            envelope.as_ref().and_then(|v| v["data"]["id"].as_u64())
+        } else {
+            None
+        };
+        let terminal_request = request_id.is_some()
+            && !envelope.as_ref().is_some_and(|v| {
+                matches!(v["data"]["result"].as_str(), Some("opening" | "active"))
+            });
+        if let Some(id) = request_id {
+            let mut state = self.state.lock().map_err(|_| RuntimeFailure::Internal)?;
+            // Coalesce only transient states; terminal and advertised records
+            // retain exact ownership until the owner receives them.
+            state
+                .queue
+                .retain(|q| q.advertised || q.terminal_request || q.request_id != Some(id));
+        }
         if stats {
             let mut state = self.state.lock().map_err(|_| RuntimeFailure::Internal)?;
             if state.queue.iter().any(|q| q.stats && q.advertised) {
@@ -94,9 +116,21 @@ impl Output {
             _api: api,
             stats,
             advertised: false,
+            request_id,
+            terminal_request,
         });
         self.changed.notify_all();
         Ok(())
+    }
+    fn terminal_batch(&self) -> usize {
+        let available = self.api.available();
+        // REQUEST has bounded host/port/protocol fields and fits in 1024 bytes.
+        // Leave room for lifecycle/response records while deferring in TCP state.
+        available
+            .records
+            .saturating_sub(4)
+            .min(available.bytes.saturating_sub(local_api::BODY_MAX) / 1024)
+            .min(32)
     }
     fn discard(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,7 +226,7 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeFailure::Overloaded)?;
         let core = budget
             .reserve(
-                limits
+                2 * limits
                     .receive_budget
                     .min(limits.max_streams * limits.stream.receive_window as usize)
                     + limits.send_budget,
@@ -201,7 +235,7 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeFailure::Overloaded)?;
         let fixed = budget
             .reserve(
-                262144
+                524288
                     + if helper_required {
                         local_api::BODY_MAX * 40
                     } else {
@@ -370,7 +404,9 @@ impl Drop for RuntimeHandle {
 type Connect = Pin<Box<dyn Future<Output = Result<std::net::TcpStream, ApiError>> + Send>>;
 struct Connecting {
     key: RuntimeKey,
-    future: Connect,
+    future: Option<Connect>,
+    host: String,
+    port: u16,
     _reservation: Reservation,
     deadline: Instant,
 }
@@ -411,6 +447,7 @@ struct Journal {
     port: u16,
     uploaded: u64,
     downloaded: u64,
+    terminal: bool,
 }
 struct ProxyPending {
     socket: std::net::TcpStream,
@@ -419,6 +456,7 @@ struct ProxyPending {
     cursor: usize,
     deadline: Instant,
     _reservation: Reservation,
+    terminal: bool,
 }
 struct Actor {
     config: StartupConfig,
@@ -448,6 +486,7 @@ struct Actor {
     tcp_uploaded: u64,
     tcp_downloaded: u64,
     connects: Vec<Connecting>,
+    tcp_stopping: bool,
     http: Option<TcpListener>,
     socks: Option<TcpListener>,
     proxy_pending: Vec<ProxyPending>,
@@ -461,8 +500,12 @@ struct Actor {
     cleanup_done: bool,
     pending_stop: Option<PendingStop>,
     native_cursor: usize,
+    proxy_cursor: usize,
+    connect_peer: PeerId,
     shutdown_deadline: Arc<Mutex<Option<Instant>>>,
     counters: local_api::Counters,
+    admission_errors: [u64; 10],
+    terminal_wait: Option<Instant>,
 }
 impl Actor {
     fn new(
@@ -509,6 +552,7 @@ impl Actor {
             tcp_uploaded: 0,
             tcp_downloaded: 0,
             connects: Vec::new(),
+            tcp_stopping: false,
             http: None,
             socks: None,
             proxy_pending: Vec::new(),
@@ -522,8 +566,12 @@ impl Actor {
             cleanup_done: false,
             pending_stop: None,
             native_cursor: 0,
+            proxy_cursor: 0,
+            connect_peer: PeerId(0),
             shutdown_deadline,
             counters: local_api::Counters::default(),
+            admission_errors: [0; 10],
+            terminal_wait: None,
         }
     }
     fn message<T: serde::Serialize>(
@@ -580,6 +628,9 @@ impl Actor {
     }
     async fn run(mut self, commands: mpsc::Receiver<Command>) -> Result<(), RuntimeFailure> {
         let result = self.run_loop(commands).await;
+        if let Err(error) = result {
+            eprintln!("Network actor stopped: {error:?}");
+        }
         let cleanup = self.cleanup().await;
         let closed = self.state(
             "closed",
@@ -645,12 +696,15 @@ impl Actor {
                 self.proxy_turn().await?;
                 self.native_turn()?;
                 if let Some(engine) = self.engine.as_mut()
-                    && engine
+                    && let Err(error) = engine
                         .drive_with_wake(Duration::from_millis(5), self.wake.notified())
                         .await
-                        .is_err()
                     && self.lifecycle != "starting"
                 {
+                    eprintln!(
+                        "Network drive failure: {error:?} counters={:?}",
+                        engine.runtime.status().counters
+                    );
                     self.state("starting", Some(ApiError::NetworkUnavailable))?;
                 }
                 self.finish_stop()?;
@@ -927,15 +981,33 @@ impl Actor {
                 port,
                 uploaded: 0,
                 downloaded: 0,
+                terminal: false,
             },
         );
         self.request_event(key, "opening")
     }
     fn request_event(&mut self, key: RuntimeKey, result: &str) -> Result<(), RuntimeFailure> {
-        if let Some(j) = self.journal.get(&key).cloned() {
+        let terminal = !matches!(result, "opening" | "active");
+        if let Some(j) = self.journal.get(&key).filter(|j| !j.terminal).cloned() {
             self.event("REQUEST",json!({"id":j.id,"protocol":j.protocol,"host":j.host,"port":j.port,"result":result,"uploaded":j.uploaded,"downloaded":j.downloaded}))?;
+            if terminal {
+                self.journal.get_mut(&key).unwrap().terminal = true;
+            }
         }
         Ok(())
+    }
+    fn failed_attempt(
+        &mut self,
+        protocol: &'static str,
+        host: String,
+        port: u16,
+        reason: &'static str,
+    ) -> Result<(), RuntimeFailure> {
+        self.request_seq = self
+            .request_seq
+            .checked_add(1)
+            .ok_or(RuntimeFailure::Internal)?;
+        self.event("REQUEST", json!({"id":self.request_seq,"protocol":protocol,"host":host,"port":port,"result":reason,"uploaded":0,"downloaded":0}))
     }
     fn open_api_tcp(&mut self, id: u32, args: local_api::TcpArgs) -> Result<(), ApiError> {
         let (runtime, host) = UnixStream::pair().map_err(|_| ApiError::LocalSetupFailed)?;
@@ -946,10 +1018,31 @@ impl Actor {
             .map_err(|_| ApiError::LocalSetupFailed)?;
         host.set_nonblocking(true)
             .map_err(|_| ApiError::LocalSetupFailed)?;
-        let engine = self.engine.as_mut().ok_or(ApiError::NetworkUnavailable)?;
-        let key = engine
+        if self.tcp.len() >= self.config.network.limits.core_streams {
+            self.admission_error("core_slots_or_credit");
+            self.failed_attempt("TCP", args.host, args.port, "overloaded")
+                .map_err(|_| ApiError::Overloaded)?;
+            return Err(ApiError::Overloaded);
+        }
+        let key = match self
+            .engine
+            .as_mut()
+            .ok_or(ApiError::NetworkUnavailable)?
             .open_tcp(PeerId(0), args.host.clone(), args.port)
-            .map_err(ApiError::from)?;
+        {
+            Ok(key) => key,
+            Err(error) => {
+                let api_error = ApiError::from(error.clone());
+                self.admission_error(if api_error == ApiError::Overloaded {
+                    "core_slots_or_credit"
+                } else {
+                    "network_unavailable"
+                });
+                self.failed_attempt("TCP", args.host, args.port, api_label(api_error))
+                    .map_err(|_| ApiError::Overloaded)?;
+                return Err(error.into());
+            }
+        };
         match TcpConnection::new(key, Socket::Unix(runtime), &self.budget, Vec::new()) {
             Ok(mut connection) => {
                 connection.reply = Some((
@@ -963,7 +1056,15 @@ impl Actor {
                 Ok(())
             }
             Err(e) => {
-                engine.close_tcp(key);
+                self.engine.as_mut().unwrap().close_tcp(key);
+                let api_error = setup_api_error(e.clone());
+                self.admission_error(if api_error == ApiError::Overloaded {
+                    "buffer"
+                } else {
+                    "local_setup"
+                });
+                self.failed_attempt("TCP", args.host, args.port, api_label(api_error))
+                    .map_err(|_| ApiError::Overloaded)?;
                 Err(e.into())
             }
         }
@@ -973,17 +1074,7 @@ impl Actor {
         self.socks.take();
         self.proxy_pending.clear();
         self.connects.clear();
-        let connections = std::mem::take(&mut self.tcp);
-        for (key, c) in connections {
-            let _ = self.request_event(key, "cancelled");
-            self.journal.remove(&key);
-            if let Some((id, _, _)) = c.reply {
-                let _ = self.respond(id, Err(ApiError::Closed), None);
-            }
-            if let Some(engine) = self.engine.as_mut() {
-                engine.close_tcp(key);
-            }
-        }
+        self.tcp_stopping = true;
     }
     fn helper_enqueue(
         &mut self,
@@ -1231,10 +1322,23 @@ impl Actor {
         Ok(())
     }
     async fn backend_turn(&mut self) -> Result<(), RuntimeFailure> {
-        while let Some(event) = self.engine.as_mut().and_then(NetworkEngine::poll_backend) {
+        for _ in 0..self.output.terminal_batch() / 2 {
+            let Some(event) = self.engine.as_mut().and_then(NetworkEngine::poll_backend) else {
+                break;
+            };
             match event {
                 BackendEvent::TcpOpen { key, host, port } => {
-                    if self.connects.len() >= 16 {
+                    if self.tcp.len() + self.connects.len()
+                        >= self.config.network.limits.core_streams
+                        || self.connects.len() >= 256
+                        || self
+                            .connects
+                            .iter()
+                            .filter(|c| c.key.stream.peer == key.stream.peer)
+                            .count()
+                            >= 64
+                    {
+                        self.admission_error("destination_queue");
                         self.engine
                             .as_mut()
                             .unwrap()
@@ -1242,7 +1346,7 @@ impl Actor {
                             .map_err(|_| RuntimeFailure::Internal)?;
                         continue;
                     }
-                    let reservation = match self.budget.reserve(65536, 4) {
+                    let reservation = match self.budget.reserve(1024, 4) {
                         Ok(r) => r,
                         Err(_) => {
                             self.engine
@@ -1253,15 +1357,11 @@ impl Actor {
                             continue;
                         }
                     };
-                    let policy = self.policy.clone().ok_or(RuntimeFailure::Internal)?;
                     self.connects.push(Connecting {
                         key,
-                        future: Box::pin(connect_destination(
-                            policy,
-                            host,
-                            port,
-                            self.budget.clone(),
-                        )),
+                        future: None,
+                        host,
+                        port,
                         _reservation: reservation,
                         deadline: Instant::now() + Duration::from_secs(10),
                     });
@@ -1348,14 +1448,64 @@ impl Actor {
                 }
             }
         }
+        // Canceled opens drop their queued/active futures promptly. An actual OS
+        // resolver worker keeps its own permit and reservation until completion.
+        self.connects.retain(|c| {
+            self.engine
+                .as_ref()
+                .unwrap()
+                .runtime
+                .snapshot(c.key)
+                .is_some()
+        });
+        // Round-robin admission by peer, with four active connects per peer.
+        // One stalled peer cannot occupy all sixteen DNS/connect workers.
+        loop {
+            if self.connects.iter().filter(|c| c.future.is_some()).count() >= 16 {
+                break;
+            }
+            let mut peers: Vec<_> = self
+                .connects
+                .iter()
+                .filter(|c| c.future.is_none())
+                .map(|c| c.key.stream.peer)
+                .collect();
+            peers.sort();
+            peers.dedup();
+            let start = peers.partition_point(|p| *p <= self.connect_peer);
+            peers.rotate_left(start);
+            let Some(peer) = peers.into_iter().find(|peer| {
+                self.connects
+                    .iter()
+                    .filter(|c| c.key.stream.peer == *peer && c.future.is_some())
+                    .count()
+                    < 4
+            }) else {
+                break;
+            };
+            let c = self
+                .connects
+                .iter_mut()
+                .filter(|c| c.key.stream.peer == peer && c.future.is_none())
+                .min_by_key(|c| c.deadline)
+                .unwrap();
+            c.future = Some(Box::pin(connect_destination(
+                self.policy.clone().ok_or(RuntimeFailure::Internal)?,
+                c.host.clone(),
+                c.port,
+                self.budget.clone(),
+            )));
+            self.connect_peer = peer;
+        }
         let mut index = 0;
         while index < self.connects.len() {
             let result = if Instant::now() >= self.connects[index].deadline {
                 Some(Err(ApiError::Timeout))
             } else {
-                tokio::time::timeout(Duration::ZERO, &mut self.connects[index].future)
-                    .await
-                    .ok()
+                match self.connects[index].future.as_mut() {
+                    Some(future) => tokio::time::timeout(Duration::ZERO, future).await.ok(),
+                    None => None,
+                }
             };
             let Some(result) = result else {
                 index += 1;
@@ -1383,17 +1533,37 @@ impl Actor {
                             }
                             Err(_) => self.engine.as_mut().unwrap().close_tcp(key),
                         },
-                        Err(_) => {
-                            let _ = self.engine.as_mut().unwrap().reject_tcp(key, "overloaded");
+                        Err(error) => {
+                            self.admission_error(if error == NetworkError::Overloaded {
+                                "buffer"
+                            } else {
+                                "local_setup"
+                            });
+                            let _ = self.engine.as_mut().unwrap().reject_tcp(
+                                key,
+                                if error == NetworkError::Overloaded {
+                                    "overloaded"
+                                } else {
+                                    "network_unavailable"
+                                },
+                            );
                         }
                     }
                 }
                 Err(e) => {
+                    self.admission_error(match e {
+                        ApiError::Overloaded => "buffer",
+                        ApiError::Timeout => "destination_timeout",
+                        ApiError::Forbidden => "forbidden",
+                        ApiError::LocalSetupFailed => "local_setup",
+                        _ => "network_unavailable",
+                    });
                     let _ = self.engine.as_mut().unwrap().reject_tcp(
                         key,
                         match e {
                             ApiError::Forbidden => "forbidden",
                             ApiError::Timeout => "timeout",
+                            ApiError::Overloaded => "overloaded",
                             _ => "network_unavailable",
                         },
                     );
@@ -1402,9 +1572,30 @@ impl Actor {
         }
         Ok(())
     }
+    fn proxy_failure(pending: &mut ProxyPending, bytes: Vec<u8>) -> Result<(), NetworkError> {
+        let protocol = pending.parser.protocol();
+        pending.parser = crate::proxy::Handshake::new(protocol);
+        pending.output = bytes;
+        pending.cursor = 0;
+        pending.terminal = true;
+        pending.deadline = Instant::now() + Duration::from_secs(1);
+        pending
+            ._reservation
+            .resize(1024 + pending.output.capacity(), 4)
+    }
     async fn proxy_turn(&mut self) -> Result<(), RuntimeFailure> {
-        for protocol in [crate::proxy::Protocol::Http, crate::proxy::Protocol::Socks] {
+        let protocols = if self.proxy_cursor.is_multiple_of(2) {
+            [crate::proxy::Protocol::Http, crate::proxy::Protocol::Socks]
+        } else {
+            [crate::proxy::Protocol::Socks, crate::proxy::Protocol::Http]
+        };
+        self.proxy_cursor = self.proxy_cursor.wrapping_add(1);
+        for protocol in protocols {
             for _ in 0..8 {
+                // Separate bounded failure slots allow complete replies to overload.
+                if self.proxy_pending.len() >= 160 {
+                    break;
+                }
                 let listener = match protocol {
                     crate::proxy::Protocol::Http => self.http.as_ref(),
                     crate::proxy::Protocol::Socks => self.socks.as_ref(),
@@ -1418,31 +1609,47 @@ impl Actor {
                     Ok(Err(_)) => return Err(RuntimeFailure::Internal),
                     Err(_) => break,
                 };
-                if self.proxy_pending.len() >= 16 {
-                    drop(socket);
-                    continue;
-                }
-                let reservation = match self.budget.reserve(4 * 65536 + 16384 + 32768, 4) {
+                let reservation = match self.budget.reserve(1024, 4) {
                     Ok(r) => r,
                     Err(_) => {
+                        self.admission_error("buffer");
                         drop(socket);
                         continue;
                     }
                 };
-                self.proxy_pending.push(ProxyPending {
+                let full = self.proxy_pending.iter().filter(|p| !p.terminal).count() >= 128;
+                let mut pending = ProxyPending {
                     socket,
                     parser: crate::proxy::Handshake::new(protocol),
                     output: Vec::new(),
                     cursor: 0,
                     deadline: Instant::now() + Duration::from_secs(10),
                     _reservation: reservation,
-                });
+                    terminal: false,
+                };
+                if full {
+                    self.admission_error("setup_queue");
+                    let bytes = match protocol {
+                        crate::proxy::Protocol::Http => crate::proxy::HTTP_OVERLOADED.to_vec(),
+                        crate::proxy::Protocol::Socks => pending.parser.bad_request(),
+                    };
+                    if Self::proxy_failure(&mut pending, bytes).is_err() {
+                        continue;
+                    }
+                }
+                self.proxy_pending.push(pending);
             }
         }
         use std::io::{Read, Write};
+        // Rotate the scan so incomplete handshakes never permanently lead a turn.
+        let count = self.proxy_pending.len();
+        if count > 0 {
+            self.proxy_pending.rotate_left(self.proxy_cursor % count);
+        }
         let mut index = 0;
         while index < self.proxy_pending.len() {
             if Instant::now() >= self.proxy_pending[index].deadline {
+                self.admission_error("setup_timeout");
                 self.proxy_pending.swap_remove(index);
                 continue;
             }
@@ -1467,11 +1674,20 @@ impl Actor {
                     index += 1;
                     continue;
                 }
-                pending.output.clear();
+                pending.output = Vec::new();
                 pending.cursor = 0;
             }
-            let progress = pending.parser.feed(&[]);
-            let progress = match progress {
+            if pending.terminal {
+                self.proxy_pending.swap_remove(index);
+                continue;
+            }
+            if self.output.terminal_batch() == 0 {
+                // A complete local admission may emit a reliable terminal REQUEST.
+                // Leave its bounded parser state intact until the owner drains.
+                index += 1;
+                continue;
+            }
+            let progress = match pending.parser.feed(&[]) {
                 Ok(crate::proxy::Progress::Read) => {
                     let mut bytes = [0u8; 16384];
                     match pending.socket.read(&mut bytes) {
@@ -1479,7 +1695,20 @@ impl Actor {
                             self.proxy_pending.swap_remove(index);
                             continue;
                         }
-                        Ok(n) => pending.parser.feed(&bytes[..n]),
+                        Ok(n) => {
+                            if pending
+                                ._reservation
+                                .resize(pending.parser.feed_reservation(n), 4)
+                                .is_err()
+                            {
+                                let failure = pending.parser.setup_failure(ApiError::Overloaded);
+                                let _ = Self::proxy_failure(pending, failure);
+                                self.admission_error("buffer");
+                                index += 1;
+                                continue;
+                            }
+                            pending.parser.feed(&bytes[..n])
+                        }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             index += 1;
                             continue;
@@ -1505,65 +1734,145 @@ impl Actor {
                     success,
                     failure,
                 }) => {
-                    let mut pending = self.proxy_pending.swap_remove(index);
-                    let key = self
-                        .engine
-                        .as_mut()
-                        .unwrap()
-                        .open_tcp(PeerId(0), host.clone(), port);
+                    let pending = self.proxy_pending.swap_remove(index);
+                    let protocol = match pending.parser.protocol() {
+                        crate::proxy::Protocol::Socks => "SOCKS5",
+                        crate::proxy::Protocol::Http if success.is_empty() => "HTTP",
+                        crate::proxy::Protocol::Http => "CONNECT",
+                    };
+                    let key = if self.tcp.len() >= self.config.network.limits.core_streams {
+                        Err(NetworkError::Overloaded)
+                    } else {
+                        self.engine
+                            .as_mut()
+                            .unwrap()
+                            .open_tcp(PeerId(0), host.clone(), port)
+                    };
                     match key {
                         Ok(key) => {
-                            match TcpConnection::new(
+                            let ProxyPending {
+                                socket,
+                                parser,
+                                _reservation: reservation,
+                                ..
+                            } = pending;
+                            drop(parser);
+                            match TcpConnection::with_reservation(
                                 key,
-                                Socket::Tcp(pending.socket),
+                                Socket::Tcp(socket),
                                 &self.budget,
                                 initial,
+                                reservation,
                             ) {
                                 Ok(mut connection) => {
-                                    let protocol = match pending.parser.protocol() {
-                                        crate::proxy::Protocol::Socks => "SOCKS5",
-                                        crate::proxy::Protocol::Http => {
-                                            if success.is_empty() {
-                                                "HTTP"
-                                            } else {
-                                                "CONNECT"
-                                            }
-                                        }
-                                    };
                                     connection.success = success;
                                     connection.failure = failure;
                                     self.tcp.insert(key, connection);
-                                    self.record_request(key, protocol, host.clone(), port)?;
+                                    self.record_request(key, protocol, host, port)?;
                                 }
-                                Err(_) => self.engine.as_mut().unwrap().close_tcp(key),
+                                Err(failed) => {
+                                    let api_error = setup_api_error(failed.error.clone());
+                                    self.engine.as_mut().unwrap().close_tcp(key);
+                                    if let Socket::Tcp(socket) = failed.socket {
+                                        let mut pending = ProxyPending {
+                                            socket,
+                                            parser: crate::proxy::Handshake::new(
+                                                if protocol == "SOCKS5" {
+                                                    crate::proxy::Protocol::Socks
+                                                } else {
+                                                    crate::proxy::Protocol::Http
+                                                },
+                                            ),
+                                            output: Vec::new(),
+                                            cursor: 0,
+                                            deadline: Instant::now(),
+                                            terminal: false,
+                                            _reservation: failed.reservation,
+                                        };
+                                        let bytes = pending.parser.open_failure(api_error, failure);
+                                        if Self::proxy_failure(&mut pending, bytes).is_ok() {
+                                            self.proxy_pending.push(pending);
+                                        }
+                                    }
+                                    self.failed_attempt(
+                                        protocol,
+                                        host,
+                                        port,
+                                        api_label(api_error),
+                                    )?;
+                                    self.admission_error(if api_error == ApiError::Overloaded {
+                                        "buffer"
+                                    } else {
+                                        "local_setup"
+                                    });
+                                }
                             }
                         }
-                        Err(_) => {
-                            let _ = pending.socket.write(&failure);
+                        Err(error) => {
+                            let api_error = ApiError::from(error);
+                            let mut pending = pending;
+                            let bytes = pending.parser.setup_failure(api_error);
+                            let _ = Self::proxy_failure(&mut pending, bytes);
+                            self.proxy_pending.push(pending);
+                            self.failed_attempt(protocol, host, port, api_label(api_error))?;
+                            self.admission_error(if api_error == ApiError::Overloaded {
+                                "core_slots_or_credit"
+                            } else {
+                                "network_unavailable"
+                            });
                         }
                     }
                 }
                 Err(_) => {
-                    let mut pending = self.proxy_pending.swap_remove(index);
-                    let _ = pending.socket.write(&pending.parser.bad_request());
+                    let bytes = pending.parser.bad_request();
+                    let _ = Self::proxy_failure(pending, bytes);
+                    self.admission_error("invalid_handshake");
+                    index += 1;
                 }
             }
         }
         Ok(())
     }
+    fn admission_error(&mut self, stage: &'static str) {
+        self.counters.errors = self.counters.errors.saturating_add(1);
+        let index = match stage {
+            "buffer" => 0,
+            "setup_queue" => 1,
+            "setup_timeout" => 2,
+            "invalid_handshake" => 3,
+            "core_slots_or_credit" => 4,
+            "destination_queue" => 5,
+            "destination_timeout" => 6,
+            "network_unavailable" => 7,
+            "local_setup" => 8,
+            _ => 9,
+        };
+        let count = &mut self.admission_errors[index];
+        *count = count.saturating_add(1);
+        // Aggregate, logarithmically bounded diagnostics, without credentials or payload.
+        if count.is_power_of_two() {
+            eprintln!(
+                "TCP admission error: stage={stage} stage_total={count} total={}",
+                self.counters.errors
+            );
+        }
+    }
     fn native_turn(&mut self) -> Result<(), RuntimeFailure> {
         let mut failed = Vec::new();
         if let Some(engine) = self.engine.as_mut() {
             let keys: Vec<_> = self.tcp.keys().copied().collect();
-            if !keys.is_empty() {
-                self.native_cursor = (self.native_cursor + 1) % keys.len();
-            }
-            for index in 0..keys.len() {
+            let count = keys.len().min(64);
+            for index in 0..count {
                 let key = &keys[(self.native_cursor + index) % keys.len()];
                 let c = self.tcp.get_mut(key).unwrap();
                 let (before_up, before_down) = (c.uploaded, c.downloaded);
-                let result = if engine.runtime.snapshot(*key).is_none() && !c.core_finished() {
+                let result = if self.tcp_stopping {
                     Err(NetworkError::InvalidState)
+                } else if engine.runtime.snapshot(*key).is_none() && !c.core_finished() {
+                    // Core may retire a stream before its bounded backend batch
+                    // delivers Closed. Wait for that event rather than losing a
+                    // graceful tail or misreporting ordinary close as I/O failure.
+                    Ok(())
                 } else {
                     c.turn(engine)
                 };
@@ -1575,14 +1884,41 @@ impl Actor {
                     j.uploaded = c.uploaded;
                     j.downloaded = c.downloaded;
                 }
-                if result.is_err() {
-                    failed.push(*key)
+                if let Err(error) = result {
+                    failed.push((*key, error))
+                }
+            }
+            if !keys.is_empty() {
+                let cursor = self.native_cursor % keys.len();
+                let wrapped = cursor + count >= keys.len();
+                self.native_cursor = (cursor + count + usize::from(wrapped)) % keys.len();
+                if !wrapped {
+                    // Slice one native scan with complete Core turns between
+                    // chunks; idle waiting belongs after the full scan wraps.
+                    self.wake.notify_one();
                 }
             }
         }
-        for key in failed {
+        // Terminal ownership is released in bounded batches, so a reading API
+        // owner can drain reliable journal records during a mass close.
+        let batch = self.output.terminal_batch();
+        let has_pending = !failed.is_empty();
+        let mut retired = 0;
+        let mut remaining = batch;
+        for (key, error) in failed {
+            let cost = 1 + usize::from(self.tcp.get(&key).is_some_and(|c| c.reply.is_some()));
+            if cost > remaining {
+                break;
+            }
+            if !self.engine.as_mut().unwrap().close_native_tcp(key) {
+                continue;
+            }
+            remaining -= cost;
+            retired += 1;
             let rejection = self.tcp.get(&key).and_then(|c| c.rejection);
-            let result = if let Some(error) = rejection {
+            let result = if self.tcp_stopping {
+                "cancelled"
+            } else if let Some(error) = rejection {
                 api_label(error)
             } else if self
                 .tcp
@@ -1591,7 +1927,12 @@ impl Actor {
             {
                 "finished"
             } else {
-                "local_setup_failed"
+                match error {
+                    NetworkError::Timeout => "timeout",
+                    NetworkError::Overloaded => "overloaded",
+                    NetworkError::Runtime(_) => "network_unavailable",
+                    _ => "local_setup_failed",
+                }
             };
             self.request_event(key, result)?;
             self.journal.remove(&key);
@@ -1600,7 +1941,17 @@ impl Actor {
             {
                 self.respond(id, Err(ApiError::NetworkUnavailable), None)?;
             }
-            self.engine.as_mut().unwrap().close_tcp(key);
+        }
+        if has_pending && retired == 0 {
+            let since = self.terminal_wait.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(3) {
+                return Err(RuntimeFailure::Overloaded);
+            }
+        } else {
+            self.terminal_wait = None;
+        }
+        if self.tcp.is_empty() {
+            self.tcp_stopping = false;
         }
         let Some(tun) = self.tun.as_ref() else {
             return Ok(());
@@ -1702,7 +2053,12 @@ impl Actor {
         let drained = self
             .engine
             .as_ref()
-            .is_none_or(|e| stop.keys.iter().all(|k| e.runtime.snapshot(*k).is_none()));
+            .is_none_or(|e| !e.tcp_cancellations_pending())
+            && stop.keys.iter().all(|k| !self.tcp.contains_key(k))
+            && self
+                .engine
+                .as_ref()
+                .is_none_or(|e| stop.keys.iter().all(|k| e.runtime.snapshot(*k).is_none()));
         if !drained && Instant::now() < stop.deadline {
             return Ok(());
         }
@@ -1769,6 +2125,12 @@ impl Actor {
         if ready && self.lifecycle != "ready" && (self.helper.is_none() || self.helper_ready) {
             self.state("ready", None)?;
         } else if !ready && self.lifecycle == "ready" {
+            if let Some(engine) = &self.engine {
+                eprintln!(
+                    "Network readiness lost: counters={:?}",
+                    engine.runtime.status().counters
+                );
+            }
             self.state("starting", Some(ApiError::NetworkUnavailable))?;
         }
         Ok(())
@@ -1795,6 +2157,33 @@ impl Actor {
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(|| Instant::now() + Duration::from_secs(3));
         let mut result = Ok(());
+        while !self.tcp.is_empty()
+            || self
+                .engine
+                .as_ref()
+                .is_some_and(NetworkEngine::tcp_cancellations_pending)
+        {
+            if Instant::now() >= until {
+                result = Err(RuntimeFailure::Internal);
+                break;
+            }
+            if let Err(error) = self.native_turn() {
+                result = Err(error);
+                break;
+            }
+            if let Some(engine) = self.engine.as_mut()
+                && engine.drive(Duration::ZERO).await.is_err()
+            {
+                result = Err(RuntimeFailure::Internal);
+                break;
+            }
+            if let Err(error) = self.backend_turn().await {
+                result = Err(error);
+                break;
+            }
+            // Keep terminal batching observable to the reading CLI/FFI owner.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         if self.helper.is_some() {
             self.helper_queue.clear();
             if self.helper_id == 0
@@ -1909,7 +2298,8 @@ async fn connect_destination(
         vec![std::net::SocketAddr::new(address, port)]
     } else {
         let permit = resolver_slots()
-            .try_acquire_owned()
+            .acquire_owned()
+            .await
             .map_err(|_| ApiError::Overloaded)?;
         let reservation = budget.reserve(65536, 1).map_err(|_| ApiError::Overloaded)?;
         // Permits and reservations live in the OS resolver task, not its cancelable waiter.
@@ -1954,6 +2344,14 @@ async fn connect_destination(
     Err(ApiError::NetworkUnavailable)
 }
 
+fn setup_api_error(error: NetworkError) -> ApiError {
+    if error == NetworkError::InvalidState {
+        ApiError::LocalSetupFailed
+    } else {
+        error.into()
+    }
+}
+
 fn api_label(error: ApiError) -> &'static str {
     match error {
         ApiError::Forbidden => "forbidden",
@@ -1989,6 +2387,38 @@ mod tests {
             budget: Budget::new(8192, 16),
             api: Budget::new(8192, 16),
         })
+    }
+    #[test]
+    fn transient_request_coalescing_preserves_terminal_advertised_records_and_order() {
+        let out = output();
+        let message = |seq, id, result| {
+            OwnedMessage { json: serde_json::to_vec(&json!({"v":1,"seq":seq,"event":"REQUEST","data":{"id":id,"result":result},"fd_count":0})).unwrap(), fd:None }
+        };
+        out.push(message(1, 1, "opening")).unwrap();
+        out.push(message(2, 2, "opening")).unwrap();
+        out.push(message(3, 1, "active")).unwrap();
+        let first: Value =
+            serde_json::from_slice(&out.poll(32768, Duration::ZERO).unwrap().json).unwrap();
+        assert_eq!(first["seq"], 2);
+        assert!(matches!(
+            out.poll(1, Duration::ZERO),
+            Err(PollError::InsufficientBuffer { .. })
+        ));
+        out.push(message(4, 1, "finished")).unwrap();
+        out.push(message(5, 1, "cancelled")).unwrap();
+        let values: Vec<Value> = (0..3)
+            .map(|_| {
+                serde_json::from_slice(&out.poll(32768, Duration::ZERO).unwrap().json).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            values
+                .iter()
+                .map(|v| v["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(out.budget.usage(), crate::budget::Usage::default());
     }
     #[test]
     fn insufficient_buffer_retains_authoritative_fd_and_credits_until_transfer() {

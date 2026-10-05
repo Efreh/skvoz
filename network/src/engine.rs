@@ -1,6 +1,6 @@
 use crate::*;
 use skvoz_core::runtime::{NatsRuntime, RuntimeKey, Status};
-use skvoz_core::{Config, Event, ManagerConfig, PeerId, PeerLimits, SendOutcome};
+use skvoz_core::{Event, ManagerConfig, PeerId, PeerLimits, SendOutcome};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
@@ -47,22 +47,16 @@ impl EngineConfig {
     }
     /// Canonical network receive/send profile; the same Core serves all profiles.
     pub fn core_limits(self, server: bool) -> ManagerConfig {
-        ManagerConfig {
-            stream: Config {
-                receive_window: 65536,
-                max_frame: 16384,
-                max_pending_frames: 128,
-                max_metadata: 512,
-                open_timeout_ms: 15000,
-            },
-            max_peers: if server { 128 } else { 1 },
-            max_streams: if server { 512 } else { 32 },
-            max_streams_per_peer: 32,
-            receive_budget: if server { 67108864 } else { 2097152 },
-            receive_budget_per_peer: 2097152,
-            send_budget: if server { 67108864 } else { 2097152 },
-            send_budget_per_peer: 2097152,
-        }
+        crate::config::Limits::canonical(if server {
+            crate::config::Role::Server
+        } else {
+            crate::config::Role::Client
+        })
+        .manager(if server {
+            crate::config::Role::Server
+        } else {
+            crate::config::Role::Client
+        })
     }
 }
 
@@ -97,6 +91,14 @@ mod profile_tests {
     use super::*;
 
     #[test]
+    fn fixed_bookkeeping_backs_backend_and_pending_cancellation_keys() {
+        // Both arrays have finite capacities, without tree nodes or a copy.
+        let bytes = 512 * (std::mem::size_of::<BackendEvent>() + 512)
+            + 2048 * std::mem::size_of::<RuntimeKey>();
+        assert!(bytes <= 524288, "bookkeeping requires {bytes} bytes");
+    }
+
+    #[test]
     fn canonical_send_pool_and_stream_profile_with_finite_role_bounds() {
         let canonical = EngineConfig::default().core_limits(false);
         assert!(validate_core_profile(canonical, false).is_ok());
@@ -111,7 +113,7 @@ mod profile_tests {
                 0 => invalid.stream.receive_window = 16384,
                 1 => invalid.stream.max_frame = 1,
                 2 => invalid.max_peers = 2,
-                3 => invalid.max_streams = 33,
+                3 => invalid.max_streams = canonical.max_streams + 1,
                 4 => invalid.send_budget_per_peer = CONTROL_MAX + 7,
                 5 => invalid.receive_budget_per_peer = 65536,
                 6 => invalid.stream.max_pending_frames = 129,
@@ -269,10 +271,12 @@ pub struct NetworkEngine {
     budget: Option<crate::budget::Budget>,
     native_send: BTreeMap<PeerId, (usize, usize)>,
     native_receive: BTreeMap<PeerId, (usize, usize)>,
+    native_terminal: BTreeMap<PeerId, (usize, Instant)>,
     ip_turn: BTreeMap<PeerId, (usize, usize)>,
     ip_reservations: BTreeMap<PeerId, crate::budget::Reservation>,
     tcp_enabled: bool,
     tcp: BTreeSet<RuntimeKey>,
+    tcp_closing: Vec<RuntimeKey>,
     backend: VecDeque<BackendEvent>,
     dynamic: Option<(Vec<u8>, u16, u8)>,
     reservations: BTreeMap<RuntimeKey, PendingReservation>,
@@ -319,10 +323,12 @@ impl NetworkEngine {
             budget: None,
             native_send: BTreeMap::new(),
             native_receive: BTreeMap::new(),
+            native_terminal: BTreeMap::new(),
             ip_turn: BTreeMap::new(),
             ip_reservations: BTreeMap::new(),
             tcp_enabled: false,
             tcp: BTreeSet::new(),
+            tcp_closing: Vec::with_capacity(2048),
             backend: VecDeque::new(),
             dynamic: None,
             reservations: BTreeMap::new(),
@@ -451,7 +457,72 @@ impl NetworkEngine {
     }
     pub fn close_tcp(&mut self, key: RuntimeKey) {
         self.tcp.remove(&key);
+        // Core retains the finite slot and its metadata until paced cancellation.
+        self.tcp_closing.retain(|pending| {
+            self.runtime
+                .snapshot(*pending)
+                .is_some_and(|s| s.state != skvoz_core::State::Closed)
+        });
+        if self
+            .runtime
+            .snapshot(key)
+            .is_some_and(|s| s.state != skvoz_core::State::Closed)
+            && let Err(index) = self.tcp_closing.binary_search(&key)
+        {
+            self.tcp_closing.insert(index, key);
+        }
+    }
+    #[cfg(feature = "linux-runtime")]
+    pub(crate) fn finish_native_tcp(&mut self, key: RuntimeKey) -> Result<bool, NetworkError> {
+        if self
+            .native_terminal
+            .get(&key.stream.peer)
+            .map(|entry| entry.0)
+            .unwrap_or(0)
+            >= 4
+        {
+            return Ok(false);
+        }
+        self.runtime.finish(key)?;
+        self.native_terminal
+            .entry(key.stream.peer)
+            .or_insert_with(|| (0, Instant::now()))
+            .0 += 1;
+        Ok(true)
+    }
+    #[cfg(feature = "linux-runtime")]
+    pub(crate) fn close_native_tcp(&mut self, key: RuntimeKey) -> bool {
+        if self
+            .runtime
+            .snapshot(key)
+            .is_some_and(|s| s.state != skvoz_core::State::Closed)
+        {
+            if self
+                .native_terminal
+                .get(&key.stream.peer)
+                .map(|entry| entry.0)
+                .unwrap_or(0)
+                >= 4
+                || self.native_allowance(key.stream.peer).2 == 0
+            {
+                return false;
+            }
+            self.native_terminal
+                .entry(key.stream.peer)
+                .or_insert_with(|| (0, Instant::now()))
+                .0 += 1;
+            self.account_native(key.stream.peer, 0, 0, 1);
+        }
+        self.tcp.remove(&key);
+        if let Ok(index) = self.tcp_closing.binary_search(&key) {
+            self.tcp_closing.remove(index);
+        }
         let _ = self.runtime.close(key);
+        true
+    }
+    #[cfg(feature = "linux-runtime")]
+    pub(crate) fn tcp_cancellations_pending(&self) -> bool {
+        !self.tcp_closing.is_empty()
     }
     pub fn complete_reservation(
         &mut self,
@@ -1430,6 +1501,38 @@ impl NetworkEngine {
                 self.close_peer(key.stream.peer);
             }
         }
+        // Direct setup/error cancellations share the native terminal quantum.
+        // The set is bounded by live Core slots; each successful close releases it.
+        let mut index = 0;
+        while index < self.tcp_closing.len() {
+            let key = self.tcp_closing[index];
+            if self
+                .runtime
+                .snapshot(key)
+                .is_none_or(|s| s.state == skvoz_core::State::Closed)
+            {
+                self.tcp_closing.remove(index);
+                continue;
+            }
+            if self
+                .native_terminal
+                .get(&key.stream.peer)
+                .map(|entry| entry.0)
+                .unwrap_or(0)
+                >= 4
+                || self.native_allowance(key.stream.peer).2 == 0
+            {
+                index += 1;
+                continue;
+            }
+            self.tcp_closing.remove(index);
+            self.native_terminal
+                .entry(key.stream.peer)
+                .or_insert_with(|| (0, Instant::now()))
+                .0 += 1;
+            self.account_native(key.stream.peer, 0, 0, 1);
+            let _ = self.runtime.close(key);
+        }
         // Feed already-owned network output before Core decides whether it is idle.
         // This is the single SEND quantum for this drive, not a second batch.
         self.flush()?;
@@ -1442,7 +1545,12 @@ impl NetworkEngine {
             return Err(error.into());
         }
         self.retire_expired_setups();
-        for observed in self.runtime.poll_events(256) {
+        // Never extract an event that cannot transfer into the bounded backend.
+        // Core retains terminal ownership until the actor drains existing work.
+        for observed in self
+            .runtime
+            .poll_events((512 - self.backend.len()).min(256))
+        {
             let key = observed.key;
             if self.tcp.contains(&key) {
                 if let Event::Opened { metadata } = &observed.event
@@ -1583,6 +1691,10 @@ impl NetworkEngine {
         }
         self.native_send.clear();
         self.native_receive.clear();
+        // Replenish only after a complete Core turn and five elapsed ms.
+        // No saved/catch-up tokens: four terminal envelopes per peer at most.
+        self.native_terminal
+            .retain(|_, (_, started)| started.elapsed() < Duration::from_millis(5));
         self.ip_turn.clear();
         Ok(())
     }

@@ -17,7 +17,7 @@ use std::{
 trait CorePort {
     fn send(&mut self, key: RuntimeKey, bytes: &[u8]) -> Result<SendOutcome, NetworkError>;
     fn consume(&mut self, key: RuntimeKey, offset: u64) -> Result<(), NetworkError>;
-    fn finish(&mut self, key: RuntimeKey) -> Result<(), NetworkError>;
+    fn finish(&mut self, key: RuntimeKey) -> Result<bool, NetworkError>;
     fn allowance(&self, peer: skvoz_core::PeerId) -> (usize, usize, usize);
     fn account(&mut self, peer: skvoz_core::PeerId, send: usize, receive: usize, records: usize);
 }
@@ -30,8 +30,8 @@ impl CorePort for NetworkEngine {
             .consume_through(key, offset)
             .map_err(Into::into)
     }
-    fn finish(&mut self, key: RuntimeKey) -> Result<(), NetworkError> {
-        self.runtime.finish(key).map_err(Into::into)
+    fn finish(&mut self, key: RuntimeKey) -> Result<bool, NetworkError> {
+        self.finish_native_tcp(key)
     }
     fn allowance(&self, peer: skvoz_core::PeerId) -> (usize, usize, usize) {
         self.tcp_allowance(peer)
@@ -70,6 +70,11 @@ struct WritePending {
     cursor: usize,
     offset: u64,
 }
+pub(crate) struct SetupFailure {
+    pub error: NetworkError,
+    pub socket: Socket,
+    pub reservation: Reservation,
+}
 pub(crate) struct TcpConnection {
     pub key: RuntimeKey,
     socket: Socket,
@@ -103,15 +108,42 @@ impl TcpConnection {
         budget: &Budget,
         initial: Vec<u8>,
     ) -> Result<Self, NetworkError> {
+        let reservation = budget.reserve(4096 + initial.capacity(), 4)?;
+        Self::with_reservation(key, socket, budget, initial, reservation)
+            .map_err(|failure| failure.error)
+    }
+    pub fn with_reservation(
+        key: RuntimeKey,
+        socket: Socket,
+        budget: &Budget,
+        initial: Vec<u8>,
+        mut reservation: Reservation,
+    ) -> Result<Self, SetupFailure> {
         let fd = match &socket {
             Socket::Tcp(s) => s.as_fd(),
             Socket::Unix(s) => s.as_fd(),
         };
-        skvoz_network_native::configure_socket_buffers(fd, 131072)
-            .map_err(|_| NetworkError::InvalidState)?;
-        let reservation = budget.reserve(65536 + 16384 + 65536 + 4096, 4)?;
+        if skvoz_network_native::configure_socket_buffers(fd, 131072).is_err() {
+            return Err(SetupFailure {
+                error: NetworkError::InvalidState,
+                socket,
+                reservation,
+            });
+        }
+        // The setup parser has been dropped; its owned reservation transfers once.
+        if let Err(error) = reservation.resize(4096 + initial.capacity(), 4) {
+            return Err(SetupFailure {
+                error,
+                socket,
+                reservation,
+            });
+        }
         if initial.len() > 65536 {
-            return Err(NetworkError::Overloaded);
+            return Err(SetupFailure {
+                error: NetworkError::Overloaded,
+                socket,
+                reservation,
+            });
         }
         Ok(Self {
             key,
@@ -165,8 +197,17 @@ impl TcpConnection {
                 {
                     return Err(NetworkError::Overloaded);
                 }
-                self.receive_bytes += bytes.len();
+                if self.receive.len() == self.receive.capacity() {
+                    let target = (self.receive.capacity().max(2) * 2).min(128);
+                    self._reservation.resize(
+                        4096 + self.send.capacity() + target * std::mem::size_of::<WritePending>(),
+                        4,
+                    )?;
+                    self.receive.reserve_exact(target - self.receive.len());
+                    self.account_capacity()?;
+                }
                 let reservation = self.budget.reserve(0, 1)?;
+                self.receive_bytes += bytes.len();
                 self.receive.push_back(WritePending {
                     _reservation: reservation,
                     bytes,
@@ -190,8 +231,15 @@ impl TcpConnection {
                 }
                 self.opened = true;
                 self.rejected = true;
-                self.prefix = std::mem::take(&mut self.failure);
-                self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+                self.prefix = if self.rejection == Some(crate::local_api::ApiError::Overloaded)
+                    && self.failure.starts_with(b"HTTP/")
+                {
+                    self.failure = Vec::new();
+                    crate::proxy::HTTP_OVERLOADED.to_vec()
+                } else {
+                    std::mem::take(&mut self.failure)
+                };
+                self.write_deadline = Some(Instant::now() + Duration::from_secs(1));
             }
             Event::Closed { .. } => return Ok(false),
             Event::Writable => {}
@@ -215,7 +263,9 @@ impl TcpConnection {
                 Ok(0) => return Err(NetworkError::InvalidState),
                 Ok(n) => {
                     self.prefix_cursor += n;
-                    self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+                    if !self.rejected {
+                        self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(_) => return Err(NetworkError::InvalidState),
@@ -223,7 +273,7 @@ impl TcpConnection {
             if self.prefix_cursor < self.prefix.len() {
                 return Ok(());
             }
-            self.prefix.clear();
+            self.prefix = Vec::new();
             self.write_deadline = None;
         }
         if self.rejected {
@@ -265,6 +315,8 @@ impl TcpConnection {
             }
         }
         if self.receive.is_empty() {
+            self.receive = VecDeque::new();
+            self.account_capacity()?;
             self.write_deadline = None;
         }
         if self.remote_eof && self.receive.is_empty() && !self.write_shutdown {
@@ -283,11 +335,42 @@ impl TcpConnection {
             self.send.clear();
             self.send_cursor = 0;
             if !self.local_eof {
+                // Do not remove bytes from the kernel until their worst-case
+                // read capacity is backed. Exhaustion applies backpressure.
+                if self
+                    ._reservation
+                    .resize(
+                        4096 + self.send.capacity().max(16384)
+                            + self.receive.capacity() * std::mem::size_of::<WritePending>(),
+                        4,
+                    )
+                    .is_err()
+                {
+                    return Ok(());
+                }
                 let mut buffer = [0u8; 16384];
                 match self.socket.read(&mut buffer) {
-                    Ok(0) => self.local_eof = true,
-                    Ok(n) => self.send.extend_from_slice(&buffer[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(0) => {
+                        self.local_eof = true;
+                        self.send = Vec::new();
+                        self.account_capacity()?;
+                    }
+                    Ok(n) => {
+                        // Reserve before growth; reuse already charged capacity during active I/O.
+                        let target = self.send.capacity().max(n);
+                        self._reservation.resize(
+                            4096 + target
+                                + self.receive.capacity() * std::mem::size_of::<WritePending>(),
+                            4,
+                        )?;
+                        self.send.reserve_exact(n.saturating_sub(self.send.len()));
+                        self.send.extend_from_slice(&buffer[..n]);
+                        self.account_capacity()?;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.send = Vec::new();
+                        self.account_capacity()?;
+                    }
                     Err(_) => return Err(NetworkError::InvalidState),
                 }
             }
@@ -306,11 +389,23 @@ impl TcpConnection {
                 SendOutcome::WouldBlock => {}
             }
         }
-        if self.local_eof && self.send_cursor == self.send.len() && !self.finished {
-            engine.finish(self.key)?;
+        if self.local_eof
+            && self.send_cursor == self.send.len()
+            && !self.finished
+            && engine.allowance(self.key.stream.peer).2 > 0
+            && engine.finish(self.key)?
+        {
+            engine.account(self.key.stream.peer, 0, 0, 1);
             self.finished = true;
         }
         Ok(())
+    }
+    fn account_capacity(&mut self) -> Result<(), NetworkError> {
+        self._reservation.resize(
+            4096 + self.send.capacity()
+                + self.receive.capacity() * std::mem::size_of::<WritePending>(),
+            4,
+        )
     }
 }
 
@@ -352,6 +447,7 @@ mod tests {
         sent: Vec<u8>,
         consumed: Vec<u64>,
         finished: bool,
+        terminal: usize,
         used: (usize, usize),
     }
     impl CorePort for Port {
@@ -371,9 +467,13 @@ mod tests {
             self.consumed.push(offset);
             Ok(())
         }
-        fn finish(&mut self, _key: RuntimeKey) -> Result<(), NetworkError> {
+        fn finish(&mut self, _key: RuntimeKey) -> Result<bool, NetworkError> {
+            if self.terminal >= 4 {
+                return Ok(false);
+            }
+            self.terminal += 1;
             self.finished = true;
-            Ok(())
+            Ok(true)
         }
         fn allowance(&self, _peer: PeerId) -> (usize, usize, usize) {
             let bytes = 32768usize.saturating_sub(self.used.0);
@@ -390,6 +490,7 @@ mod tests {
             sent: Vec::new(),
             consumed: Vec::new(),
             finished: false,
+            terminal: 0,
             used: (0, 0),
         }
     }
@@ -416,6 +517,71 @@ mod tests {
         .unwrap();
         c.opened = true;
         (c, b)
+    }
+    #[test]
+    fn fin_waits_for_and_consumes_the_shared_peer_record_quantum() {
+        let (mut connection, host) = pair(Vec::new());
+        host.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut port = port();
+        port.used.1 = 16;
+        connection.turn_port(&mut port).unwrap();
+        assert!(connection.local_eof);
+        assert!(!port.finished);
+        port.used = (0, 15);
+        connection.turn_port(&mut port).unwrap();
+        assert!(port.finished);
+        assert_eq!(port.used.1, 16);
+        connection.turn_port(&mut port).unwrap();
+        assert_eq!(port.used.1, 16);
+    }
+    #[test]
+    fn tiny_global_send_budget_backpressures_without_reading_or_canceling_other_socket() {
+        let budget = Budget::new(8192 + 16384, 32);
+        let make = || {
+            let (a, b) = UnixStream::pair().unwrap();
+            a.set_nonblocking(true).unwrap();
+            b.set_nonblocking(true).unwrap();
+            let mut c = TcpConnection::new(key(), Socket::Unix(a), &budget, Vec::new()).unwrap();
+            c.opened = true;
+            (c, b)
+        };
+        let (mut first, mut a) = make();
+        let (mut second, mut b) = make();
+        a.write_all(&vec![1; 16384]).unwrap();
+        b.write_all(b"other connection").unwrap();
+        let mut one = port();
+        one.script.push_back(0);
+        first.turn_port(&mut one).unwrap();
+        assert_eq!(budget.usage().bytes, 8192 + 16384);
+        let mut two = port();
+        second.turn_port(&mut two).unwrap();
+        assert!(two.sent.is_empty());
+        first.turn_port(&mut one).unwrap();
+        one.used = (0, 0);
+        first.turn_port(&mut one).unwrap();
+        assert_eq!(budget.usage().bytes, 8192);
+        second.turn_port(&mut two).unwrap();
+        assert_eq!(two.sent, b"other connection");
+        two.used = (0, 0);
+        second.turn_port(&mut two).unwrap();
+        assert_eq!(budget.usage().bytes, 8192);
+        drop((first, second));
+        assert_eq!(budget.usage(), crate::budget::Usage::default());
+    }
+    #[test]
+    fn larger_read_after_small_retained_send_is_charged_and_released_when_idle() {
+        let (mut c, mut socket) = pair(vec![7; 8]);
+        let mut port = port();
+        c.turn_port(&mut port).unwrap();
+        socket.write_all(&vec![9; 16000]).unwrap();
+        port.used = (0, 0);
+        c.turn_port(&mut port).unwrap();
+        assert_eq!(port.sent.len(), 16008);
+        assert_eq!(c._reservation.usage().bytes, 4096 + c.send.capacity());
+        port.used = (0, 0);
+        c.turn_port(&mut port).unwrap();
+        assert_eq!(c.send.capacity(), 0);
+        assert_eq!(c._reservation.usage().bytes, 4096);
     }
     #[test]
     fn rejected_stream_drains_native_failure_after_core_retirement() {
@@ -571,5 +737,28 @@ mod tests {
         port.used = (0, 0);
         c.turn_port(&mut port).unwrap();
         assert_eq!(port.sent, b"send-after-writes");
+    }
+    #[test]
+    fn terminal_quantum_defers_fin_without_losing_native_eof() {
+        let mut connections = Vec::new();
+        let mut owners = Vec::new();
+        let mut port = port();
+        for _ in 0..5 {
+            let (connection, owner) = pair(Vec::new());
+            owner.shutdown(Shutdown::Write).unwrap();
+            connections.push(connection);
+            owners.push(owner);
+        }
+        for connection in &mut connections {
+            connection.turn_port(&mut port).unwrap();
+        }
+        assert_eq!(port.terminal, 4);
+        assert!(connections[..4].iter().all(|c| c.finished));
+        assert!(connections[4].local_eof && !connections[4].finished);
+        port.terminal = 0;
+        port.used = (0, 0);
+        connections[4].turn_port(&mut port).unwrap();
+        assert!(connections[4].finished);
+        assert_eq!(port.terminal, 1);
     }
 }

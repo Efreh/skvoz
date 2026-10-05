@@ -98,7 +98,7 @@ def qualify(root, settings, certificate_factory):
             value['network']['max_mtu']=1400
             core.update(membership='broker_authorized',allowed_peers=[],initiate=[])
             limits=value['network']['limits']
-            limits.update(ip_sessions=128,core_streams=512,lease_identities=4096,core_receive_bytes=67108864,core_send_bytes=67108864,runtime_buffer_bytes=268435456,runtime_buffer_records=65536)
+            limits.update(ip_sessions=128,core_streams=2048,lease_identities=4096,core_receive_bytes=134217728,core_send_bytes=67108864,runtime_buffer_bytes=536870912,runtime_buffer_records=131072)
             value['server'] = {'ipv4':{'pool':POOL4,'egress':'nat44','interface':'eth1'},
                 'ipv6':{'pool':POOL6,'egress':'routed','interface':'eth1'},
                 'dns_servers':[E+'.30'], 'allow':[{'cidr':E+'.0/24','protocols':'any','ports':None},{'cidr':V+'::/64','protocols':'any','ports':None}],

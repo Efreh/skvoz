@@ -23,6 +23,10 @@ services:
     volumes:
       - state:/var/lib/skvoz
       - network-state:/var/lib/skvoz-network
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

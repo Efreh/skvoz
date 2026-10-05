@@ -9,12 +9,12 @@ module Skvoz
   module Server
     # Produces the same immutable public policy for the runtime and root helper.
     class NetworkConfiguration
-      LIMITS = { ip_sessions: 128, core_streams: 512, streams_per_peer: 32, lease_identities: 4096,
-        receive_window: 65536, max_frame: 16384, core_receive_bytes: 67108864, core_receive_peer_bytes: 2097152,
+      LIMITS = { ip_sessions: 128, core_streams: 2048, streams_per_peer: 512, lease_identities: 4096,
+        receive_window: 65536, max_frame: 16384, core_receive_bytes: 134217728, core_receive_peer_bytes: 33554432,
         core_send_bytes: 67108864, core_send_peer_bytes: 2097152, packet_queue_bytes: 262144,
         packet_queue_records: 256, control_queue_bytes: 32768, control_queue_records: 8,
-        runtime_buffer_bytes: 268435456, runtime_buffer_records: 65536, api_queue_bytes: 131072,
-        api_queue_records: 128, subscription_frames: 32, join_frames: 32, client_frames: 16,
+        runtime_buffer_bytes: 536870912, runtime_buffer_records: 131072, api_queue_bytes: 131072,
+        api_queue_records: 128, subscription_frames: 64, join_frames: 32, client_frames: 16,
         core_shards: 8, flow_buckets: 1024, setup_timeout_ms: 15000, teardown_timeout_ms: 3000,
         packet_io_timeout_ms: 1000 }.transform_keys(&:to_s).freeze
       DEFAULTS = { 'ipv4' => nil, 'ipv6' => nil, 'dns_servers' => [], 'service_prefixes' => [],

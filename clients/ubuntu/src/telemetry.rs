@@ -1,7 +1,7 @@
 //! Bounded metadata history and payload counters; no payload inspection or disk I/O.
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,13 +20,22 @@ pub struct Request {
     pub uploaded: u64,
     pub downloaded: u64,
 }
+const RUNTIME_FLOW_LIMIT: usize = 512;
+#[derive(Default)]
+struct RuntimeJournal {
+    live: BTreeMap<u64, &'static str>,
+    completed: BTreeSet<u64>,
+    completion_order: VecDeque<u64>,
+    max_seen: u64,
+    clear_barrier: u64,
+}
 #[derive(Default)]
 pub struct Telemetry {
     pub uploaded: AtomicU64,
     pub downloaded: AtomicU64,
     enabled: AtomicBool,
     history: Mutex<VecDeque<Request>>,
-    runtime_live: Mutex<BTreeSet<u64>>,
+    runtime_journal: Mutex<RuntimeJournal>,
     revision: AtomicU64,
     epoch: AtomicU64,
     next_id: AtomicU64,
@@ -49,11 +58,21 @@ impl Telemetry {
         if let Ok(mut history) = self.history.lock() {
             self.epoch.fetch_add(1, Ordering::Relaxed);
             history.clear();
-            if let Ok(mut live) = self.runtime_live.lock() {
-                live.clear();
+            if let Ok(mut journal) = self.runtime_journal.lock() {
+                journal.clear_barrier = journal.max_seen;
+                journal.live.clear();
+                journal.completed.clear();
+                journal.completion_order.clear();
             }
             self.skipped.store(0, Ordering::Relaxed);
             self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn runtime_generation(&self) {
+        // A new child restarts request IDs; keep history but retire old tracking.
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut journal) = self.runtime_journal.lock() {
+            *journal = RuntimeJournal::default();
         }
     }
     pub fn revision(&self) -> u64 {
@@ -89,9 +108,6 @@ impl Telemetry {
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
     pub fn runtime_request(&self, data: &serde_json::Value) {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return;
-        }
         let epoch = self.epoch.load(Ordering::Relaxed);
         let protocol = match data["protocol"].as_str() {
             Some("HTTP") => "HTTP",
@@ -126,19 +142,41 @@ impl Telemetry {
             return;
         }
         {
-            let Ok(mut live) = self.runtime_live.lock() else {
+            let Ok(mut journal) = self.runtime_journal.lock() else {
                 return;
             };
-            if result == "opening" {
-                if live.len() >= 32 && !live.contains(&id) {
-                    return;
-                }
-                live.insert(id);
-            } else if !live.contains(&id) {
+            journal.max_seen = journal.max_seen.max(id);
+            if !self.enabled.load(Ordering::Relaxed) {
+                journal.clear_barrier = journal.max_seen;
                 return;
             }
-            if result != "opening" && result != "active" {
-                live.remove(&id);
+            if id <= journal.clear_barrier || journal.completed.contains(&id) {
+                return;
+            }
+            if result == "opening" || result == "active" {
+                if journal
+                    .live
+                    .get(&id)
+                    .is_some_and(|previous| *previous == result || *previous == "active")
+                {
+                    return;
+                }
+                if journal.live.len() == RUNTIME_FLOW_LIMIT && !journal.live.contains_key(&id) {
+                    self.skipped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                journal.live.insert(id, result);
+            } else {
+                // Reliable API output may coalesce opening/active before delivery.
+                // Terminal IDs are deduplicated within a finite recent window;
+                // the runtime itself guarantees one terminal event per request.
+                journal.live.remove(&id);
+                if journal.completion_order.len() == RUNTIME_FLOW_LIMIT {
+                    let old = journal.completion_order.pop_front().unwrap();
+                    journal.completed.remove(&old);
+                }
+                journal.completed.insert(id);
+                journal.completion_order.push_back(id);
             }
         }
         self.record(
@@ -352,5 +390,62 @@ mod runtime_tests {
         event["downloaded"] = json!(12);
         telemetry.runtime_request(&event);
         assert_eq!(telemetry.history().last().unwrap().downloaded, 12);
+    }
+    fn event(id: u64, result: &str) -> serde_json::Value {
+        json!({"id":id,"protocol":"HTTP","host":"example.org","port":80,"result":result,"uploaded":31,"downloaded":17})
+    }
+    #[test]
+    fn coalesced_first_active_or_terminal_and_out_of_order_completion_are_recorded_once() {
+        let telemetry = Telemetry::new(true);
+        telemetry.runtime_request(&event(1, "active"));
+        telemetry.runtime_request(&event(2, "finished"));
+        telemetry.runtime_request(&event(1, "finished"));
+        telemetry.runtime_request(&event(1, "finished"));
+        telemetry.runtime_request(&event(2, "active"));
+        let history = telemetry.history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].id, 2);
+        assert_eq!(history[2].id, 1);
+        assert_eq!(history[2].downloaded, 17);
+        telemetry.runtime_request(&event(3, "overloaded"));
+        assert_eq!(telemetry.history().last().unwrap().result, "overloaded");
+    }
+    #[test]
+    fn all_512_live_flows_and_terminal_only_churn_use_finite_tracking() {
+        let telemetry = Telemetry::new(true);
+        for id in 1..=512 {
+            telemetry.runtime_request(&event(id, "active"));
+        }
+        assert_eq!(telemetry.runtime_journal.lock().unwrap().live.len(), 512);
+        for id in (1..=512).rev() {
+            telemetry.runtime_request(&event(id, "finished"));
+        }
+        for id in 513..=10000 {
+            telemetry.runtime_request(&event(id, "overloaded"));
+        }
+        let journal = telemetry.runtime_journal.lock().unwrap();
+        assert!(journal.live.is_empty());
+        assert_eq!(journal.completed.len(), 512);
+        assert_eq!(journal.completion_order.len(), 512);
+        assert_eq!(telemetry.history().len(), HISTORY_LIMIT);
+        assert_eq!(telemetry.skipped.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn disabled_observed_flows_stay_hidden_but_new_child_ids_restart() {
+        let telemetry = Telemetry::new(true);
+        telemetry.runtime_request(&event(9, "active"));
+        telemetry.clear();
+        telemetry.runtime_request(&event(7, "finished"));
+        assert!(telemetry.history().is_empty());
+        telemetry.enable(false);
+        telemetry.runtime_request(&event(10, "active"));
+        telemetry.enable(true);
+        telemetry.runtime_request(&event(10, "finished"));
+        assert!(telemetry.history().is_empty());
+        telemetry.runtime_request(&event(11, "finished"));
+        telemetry.runtime_generation();
+        telemetry.runtime_request(&event(1, "finished"));
+        assert_eq!(telemetry.history().len(), 2);
+        assert_eq!(telemetry.history().last().unwrap().id, 1);
     }
 }

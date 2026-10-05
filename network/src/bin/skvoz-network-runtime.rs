@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return Err("invalid arguments".into());
                 }
-                println!("skvoz-network-runtime 0.1.0 network=2 api=1 core=3.1.0");
+                println!("skvoz-network-runtime 0.2.0 network=2 api=1 core=3.1.0");
                 return Ok(());
             }
             "--help" => {
@@ -56,13 +56,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeHandle::start(config, helper).map_err(|e| format!("startup failed: {e:?}"))?;
     let until = Instant::now() + Duration::from_secs(5);
     let mut hello = false;
-    loop {
+    'owner: loop {
+        let mut progress = false;
         channel.check_deadlines()?;
         if !hello && Instant::now() >= until {
             return Err("HELLO timeout".into());
         }
         match channel.try_receive_frame() {
             Ok(frame) => {
+                progress = true;
                 runtime
                     .request_json(&frame.body, frame.fd)
                     .map_err(|e| format!("invalid owner request: {e:?}"))?;
@@ -72,23 +74,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
-        if !channel.write_pending() {
-            match runtime.next_message(32768, Duration::ZERO) {
-                Ok(message) => channel.queue_frame(message.json, message.fd)?,
-                Err(PollError::Timeout) => {}
-                Err(PollError::Closed) => break,
-                Err(e) => return Err(format!("owner output failed: {e:?}").into()),
+        // Drain a bounded batch before sleeping. One record per 2ms artificially
+        // stalled a reading owner during ordinary TCP opening/closing bursts.
+        for _ in 0..32 {
+            if !channel.write_pending() {
+                match runtime.next_message(32768, Duration::ZERO) {
+                    Ok(message) => {
+                        channel.queue_frame(message.json, message.fd)?;
+                        progress = true;
+                    }
+                    Err(PollError::Timeout) => break,
+                    Err(PollError::Closed) => break 'owner,
+                    Err(e) => return Err(format!("owner output failed: {e:?}").into()),
+                }
             }
-        }
-        match channel.try_flush() {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
+            match channel.try_flush() {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
         }
         if skvoz_network_native::owner_closed(channel.as_fd())? {
             break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        if !progress {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
     runtime
         .shutdown()

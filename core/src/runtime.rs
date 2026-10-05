@@ -600,6 +600,11 @@ impl NatsRuntime {
                 .as_ref()
                 .is_some_and(|c| c.latch.get() != 0)
             {
+                eprintln!(
+                    "Transport shard failure: lane={} reason={}",
+                    lane,
+                    self.lanes[lane].as_ref().unwrap().latch.get()
+                );
                 if self.lanes[lane]
                     .as_ref()
                     .is_some_and(|c| c.latch.get() & 2 != 0)
@@ -997,6 +1002,12 @@ impl NatsRuntime {
             return Ok(());
         }
         if s.rx.checked_add(1) != Some(seq) {
+            eprintln!(
+                "Peer envelope sequence failure: peer={} received={} expected={:?}",
+                id.0,
+                seq,
+                s.rx.checked_add(1)
+            );
             self.retire(id);
             self.last_error = Some(RuntimeError::Protocol);
             return Ok(());
@@ -1009,18 +1020,18 @@ impl NatsRuntime {
                 return Ok(());
             }
         };
-        if self
-            .manager
-            .receive(
-                StreamKey {
-                    peer: id,
-                    stream_id: packet.stream_id,
-                },
-                &packet.frame,
-                self.now()?,
-            )
-            .is_err()
-        {
+        if let Err(error) = self.manager.receive(
+            StreamKey {
+                peer: id,
+                stream_id: packet.stream_id,
+            },
+            &packet.frame,
+            self.now()?,
+        ) {
+            eprintln!(
+                "Peer stream receive failure: peer={} stream={} sequence={} error={error:?}",
+                id.0, packet.stream_id, seq
+            );
             self.retire(id);
             self.last_error = Some(RuntimeError::Protocol);
             return Ok(());
@@ -1225,6 +1236,15 @@ impl NatsRuntime {
                 !s.retiring && s.ping.is_some_and(|(_, _, deadline)| deadline <= now)
             });
             if timeout {
+                let session = self.peers[&id].session.as_ref().unwrap();
+                eprintln!(
+                    "Peer watermark timeout: peer={} tx={} rx={} ping={:?} pong={:?}",
+                    id.0,
+                    session.tx,
+                    session.rx,
+                    session.ping.map(|(_, watermark, _)| watermark),
+                    session.pong.map(|(_, watermark)| watermark)
+                );
                 self.retire(id);
                 self.counters.peer_timeouts += 1;
             }

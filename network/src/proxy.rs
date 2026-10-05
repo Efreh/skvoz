@@ -7,6 +7,8 @@ use std::{
 pub const HANDSHAKE_MAX: usize = 64 * 1024;
 const HTTP_BAD_REQUEST: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+pub(crate) const HTTP_OVERLOADED: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const HTTP_FAILED: &[u8] =
     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const HTTP_CONNECTED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -67,11 +69,38 @@ impl Handshake {
     pub fn protocol(&self) -> Protocol {
         self.protocol
     }
+    /// Bound input growth plus concurrently rewritten HTTP fields/header/payload.
+    pub fn feed_reservation(&self, incoming: usize) -> usize {
+        let capacity = self
+            .input
+            .capacity()
+            .saturating_mul(2)
+            .max(self.input.len().saturating_add(incoming))
+            .min(HANDSHAKE_MAX);
+        1024 + 4 * capacity + 32768
+    }
     pub fn bad_request(&self) -> Vec<u8> {
         match self.protocol {
             Protocol::Http => HTTP_BAD_REQUEST.to_vec(),
             Protocol::Socks if !self.negotiated => vec![5, 255],
             Protocol::Socks => SOCKS_FAILED.to_vec(),
+        }
+    }
+
+    pub fn open_failure(&self, error: crate::local_api::ApiError, parsed: Vec<u8>) -> Vec<u8> {
+        if self.protocol == Protocol::Socks {
+            parsed
+        } else {
+            self.setup_failure(error)
+        }
+    }
+    pub fn setup_failure(&self, error: crate::local_api::ApiError) -> Vec<u8> {
+        match self.protocol {
+            Protocol::Http if error == crate::local_api::ApiError::Overloaded => {
+                HTTP_OVERLOADED.to_vec()
+            }
+            Protocol::Http => HTTP_FAILED.to_vec(),
+            Protocol::Socks => self.bad_request(),
         }
     }
 
@@ -600,6 +629,33 @@ mod tests {
             Handshake::new(Protocol::Http)
                 .feed(request.as_bytes())
                 .is_err()
+        );
+    }
+    #[test]
+    fn overload_and_post_parse_socks_failures_preserve_the_protocol_phase() {
+        let fresh = Handshake::new(Protocol::Socks);
+        assert_eq!(
+            fresh.setup_failure(crate::local_api::ApiError::Overloaded),
+            vec![5, 255]
+        );
+        assert_eq!(
+            fresh.open_failure(
+                crate::local_api::ApiError::Overloaded,
+                SOCKS_FAILED.to_vec()
+            ),
+            SOCKS_FAILED
+        );
+        let http = Handshake::new(Protocol::Http);
+        assert_eq!(
+            http.open_failure(crate::local_api::ApiError::Overloaded, HTTP_FAILED.to_vec()),
+            HTTP_OVERLOADED
+        );
+        assert_eq!(
+            http.open_failure(
+                crate::local_api::ApiError::NetworkUnavailable,
+                HTTP_FAILED.to_vec()
+            ),
+            HTTP_FAILED
         );
     }
 }
