@@ -6,6 +6,7 @@ on:
     paths:
       - 'core/**'
       - 'daemon/**'
+      - 'network/**'
       - 'connectors/server/**'
       - 'connectors/tcp/**'
       - 'testbench/**'
@@ -19,6 +20,7 @@ on:
     paths:
       - 'core/**'
       - 'daemon/**'
+      - 'network/**'
       - 'connectors/server/**'
       - 'connectors/tcp/**'
       - 'testbench/**'
@@ -68,7 +70,7 @@ jobs:
           load: true
           tags: skvoz-server:tests
       - name: Ruby contracts and real server, TLS, ACME tests in Docker
-        run: docker run --rm skvoz-server:tests
+        run: docker run --rm --cap-drop ALL --security-opt no-new-privileges:true skvoz-server:tests
       - id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}/skvoz-server" >> "$GITHUB_OUTPUT"
       - id: metadata
@@ -99,10 +101,10 @@ jobs:
           mkdir -p "$test_bin"
           container=$(docker create skvoz-server:qualification)
           trap 'docker rm -v "$container" >/dev/null' EXIT
-          docker cp "$container:/usr/local/bin/skvoz-core-daemon" "$test_bin/skvoz-core-daemon"
+          docker cp "$container:/usr/local/bin/skvoz-network-runtime" "$test_bin/skvoz-network-runtime"
           cd connectors/server
           SKVOZ_COMPOSE=1 SKVOZ_TEST_IMAGE=skvoz-server:qualification \
-            SKVOZ_TEST_CORE="$test_bin/skvoz-core-daemon" bundle exec rspec spec/compose_spec.rb
+            SKVOZ_TEST_RUNTIME="$test_bin/skvoz-network-runtime" bundle exec rspec spec/compose_spec.rb
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         if: github.event_name != 'pull_request'
         with:

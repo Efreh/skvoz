@@ -2,7 +2,6 @@ services:
   server:
     # Replace the address and email before starting the server.
     image: ghcr.io/efreh/skvoz/skvoz-server:latest
-    init: true
     restart: unless-stopped
     environment:
       SKVOZ_ADVERTISED_PORT: &listen_port "4222"
@@ -10,7 +9,7 @@ services:
       SKVOZ_ACME_EMAIL: YOUR_CERTIFICATE_CONTACT_EMAIL
       # Set "true" only after accepting the certificate issuer's terms.
       SKVOZ_ACME_TERMS_AGREED: "false"
-      SKVOZ_ALLOW_CIDRS: ""
+      SKVOZ_ALLOW: '[]'
     ports:
       - target: 4222
         published: *listen_port
@@ -23,6 +22,7 @@ services:
         max-file: "3"
     volumes:
       - state:/var/lib/skvoz
+      - network-state:/var/lib/skvoz-network
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -30,6 +30,18 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - NET_ADMIN
+      - SETUID
+      - SETGID
+      - SETPCAP
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.ipfrag_high_thresh: "4194304"
+      net.ipv4.ipfrag_time: "15"
     stop_grace_period: 15s
 volumes:
+  network-state:
   state:

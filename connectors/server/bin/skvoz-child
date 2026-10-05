@@ -2,6 +2,11 @@
 # frozen_string_literal: true
 parent = Integer(ARGV.shift, 10)
 exit 70 unless Process.ppid == parent
+descriptors = ARGV.shift.split(',').reject(&:empty?).to_h do |text|
+  fd = Integer(text, 10)
+  exit 70 unless [3, 4].include?(fd)
+  [fd, IO.for_fd(fd)]
+end
 command = ARGV.shift
 exit 70 if command.nil? || Process.ppid != parent
-exec(command, *ARGV, close_others: true)
+exec(command, *ARGV, **descriptors, close_others: true)

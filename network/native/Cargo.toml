@@ -1,0 +1,13 @@
+[package]
+name = "skvoz-network-native"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "=0.2.183"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+

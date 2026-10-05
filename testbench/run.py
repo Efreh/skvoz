@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 from qualification import qualify
 from daemon_qualification import qualify as qualify_daemon
+from network_qualification import qualify as qualify_network
+from network_runtime_qualification import qualify as qualify_network_runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4"
@@ -71,9 +73,25 @@ def ready(url, timeout=15):
     raise RuntimeError("NATS readiness deadline exceeded")
 
 
+def ready_inside(container, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            result = subprocess.run(["docker", "exec", container, "wget", "-q", "-O", "-", "-T", "1",
+                                     "http://127.0.0.1:8222/healthz"], cwd=ROOT, capture_output=True,
+                                    timeout=min(1, remaining))
+            if result.returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(min(.05, max(0, deadline - time.monotonic())))
+    raise RuntimeError("NATS internal readiness deadline exceeded")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["check", "demo", "load", "tcp", "qualify", "daemon"], nargs="?", default="check")
+    parser.add_argument("mode", choices=["check", "demo", "load", "tcp", "qualify", "daemon", "network", "network-runtime"], nargs="?", default="check")
     parser.add_argument("--offline", action="store_true", help="Use cached Cargo dependencies and Docker image")
     parser.add_argument("--clients", type=int, default=10)
     parser.add_argument("--streams-per-client", type=int, default=10)
@@ -84,7 +102,17 @@ def main():
     parser.add_argument("--slow-reader-delay-ms", type=int, default=0)
     parser.add_argument("--churn-rounds", type=int, default=1)
     parser.add_argument("--max-app-rss-mib", type=int, default=1024)
+    parser.add_argument("--report-directory", type=Path, help="Copy non-secret network qualification evidence to this directory")
+    parser.add_argument("--network-performance-only", action="store_true", help="Run matched network throughput diagnostics without functional/loss groups")
+    parser.add_argument("--network-functional-only", action="store_true", help="Run network functional/security/loss groups without throughput measurements")
+    parser.add_argument("--network-profile", action="store_true", help="Collect a separate bounded broker CPU profile after network measurements")
     args = parser.parse_args()
+    if (args.network_performance_only or args.network_functional_only or args.network_profile) and args.mode != "network":
+        parser.error("network diagnostic options require network mode")
+    if args.network_performance_only and args.network_functional_only:
+        parser.error("network performance-only and functional-only are mutually exclusive")
+    if args.network_functional_only and args.network_profile:
+        parser.error("network-functional-only skips profiler workloads")
     if not (1 <= args.clients <= 512 and 1 <= args.streams_per_client <= 512
             and args.clients * args.streams_per_client <= 65536 and 1 <= args.duration <= 60 and 0 <= args.delay_ms <= 200 and 1 <= args.churn_rounds <= 10
             and 0 <= args.slow_reader_delay_ms <= 2000
@@ -97,6 +125,13 @@ def main():
     command(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     cargo = ["cargo"]
     extra = ["--locked"] + (["--offline"] if args.offline else [])
+    if args.mode == "network-runtime":
+        command(cargo + ["build", "--release", "-p", "skvoz-network", "-p", "skvoz-network-helper",
+                         "--features", "skvoz-network/linux-runtime", *extra])
+        command(["docker", "build", "-f", "testbench/fixtures/network-runtime/Dockerfile",
+                 "-t", "skvoz-network:runtime-fixture", "."])
+        qualify_network_runtime(ROOT, args, certificates)
+        return
     if args.mode == "check":
         command(cargo + ["fmt", "--all", "--", "--check"])
         command(cargo + ["clippy", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra, "--", "-D", "warnings"])
@@ -104,13 +139,19 @@ def main():
         command(cargo + ["build", "--release", "-p", "skvoz-daemon", *extra])
     if args.mode == "qualify":
         command(cargo + ["build", "--release", "-p", "skvoz-testbench", *extra])
+    if args.mode == "network":
+        command(cargo + ["build", "--release", "-p", "skvoz-testbench", "--bin", "network_probe", *extra])
     token = secrets.token_hex(8)
     container = f"skvoz-testbench-{token}"
     user_password, consumer_password = secrets.token_hex(24), secrets.token_hex(24)
-    mesh_passwords = [secrets.token_hex(24) for _ in range(max(132 if args.mode == "check" else 2, args.clients+1))]
+    identity_minimum = 132 if args.mode == "check" else (5 if args.mode == "network" else 2)
+    mesh_passwords = [secrets.token_hex(24) for _ in range(max(identity_minimum, args.clients+1))]
     old_mask = os.umask(0o077)
     try:
-        with tempfile.TemporaryDirectory(prefix="skvoz-nats-") as temporary:
+        private_parent = ROOT / "temp" if args.mode == "network" else None
+        if private_parent:
+            private_parent.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="skvoz-nats-", dir=private_parent) as temporary:
             directory = Path(temporary)
             certificates(directory)
             (directory / "empty-trust").mkdir()
@@ -168,30 +209,54 @@ authorization {{
                 broker_port = listener.getsockname()[1]
                 fixed_monitor_port = monitoring_listener.getsockname()[1]
             created = False
+            bootstrap = f"skvoz-testbench-{token}-profile"
+            bootstrap_created = False
             try:
+                if args.network_profile:
+                    command(["docker", "network", "create", "--internal", "--label",
+                             f"skvoz.testbench.run={token}", bootstrap], stdout=subprocess.DEVNULL)
+                    bootstrap_created = True
                 command(["docker", "create", "--name", container,
                     "--label", f"skvoz.testbench.run={token}", "--read-only", "--cap-drop=ALL",
                     "--security-opt=no-new-privileges:true", "--user", f"{os.getuid()}:{os.getgid()}",
-                    "--memory=128m", "--cpus=1", "--publish", f"127.0.0.1:{broker_port}:4222",
-                    "--publish", f"127.0.0.1:{fixed_monitor_port}:8222", "--mount", f"type=bind,source={directory},target=/bench,readonly",
-                    "--pull=never" if args.offline else "--pull=missing", IMAGE, "--config", "/bench/nats.conf"], stdout=subprocess.DEVNULL)
+                    "--memory=128m", "--cpus=1", *(["--network", bootstrap] if args.network_profile else []),
+                    *([] if args.network_profile else ["--publish", f"127.0.0.1:{broker_port}:4222",
+                        "--publish", f"127.0.0.1:{fixed_monitor_port}:8222"]),
+                    "--mount", f"type=bind,source={directory},target=/bench,readonly",
+                    "--pull=never" if args.offline else "--pull=missing", IMAGE, "--config", "/bench/nats.conf",
+                    *(["--profile", "8223"] if args.network_profile else [])], stdout=subprocess.DEVNULL)
                 created = True
                 command(["docker", "start", container], stdout=subprocess.DEVNULL)
-                port = capture(["docker", "port", container, "4222/tcp"]).rsplit(":", 1)[1]
-                monitor_port = capture(["docker", "port", container, "8222/tcp"]).rsplit(":", 1)[1]
-                monitor = f"http://127.0.0.1:{monitor_port}"
-                ready(monitor)
-                with urllib.request.urlopen(monitor + "/varz", timeout=2) as response:
-                    version = json.load(response)["version"]
-                print(f"Real NATS {version}: INFO before TLS, provisioned identities, loopback port {port}", flush=True)
+                if args.network_profile:
+                    info = json.loads(capture(["docker", "inspect", container]))[0]
+                    assert not info["HostConfig"]["PortBindings"], "Profile broker host ports published"
+                    host = info["NetworkSettings"]["Networks"][bootstrap]["IPAddress"]
+                    assert host, "Profile bootstrap IP missing"
+                    port = "4222"
+                    monitor = f"http://{host}:8222"
+                    ready_inside(container)
+                    version = json.loads(capture(["docker", "exec", container, "wget", "-q", "-O", "-", "-T", "2",
+                                                   "http://127.0.0.1:8222/varz"]))["version"]
+                    endpoint = "isolated internal container port4222"
+                else:
+                    host = "127.0.0.1"
+                    port = capture(["docker", "port", container, "4222/tcp"]).rsplit(":", 1)[1]
+                    monitor_port = capture(["docker", "port", container, "8222/tcp"]).rsplit(":", 1)[1]
+                    monitor = f"http://127.0.0.1:{monitor_port}"
+                    ready(monitor)
+                    with urllib.request.urlopen(monitor + "/varz", timeout=2) as response:
+                        version = json.load(response)["version"]
+                    endpoint = f"loopback port {port}"
+                print(f"Real NATS {version}: INFO before TLS, provisioned identities, {endpoint}", flush=True)
                 env = os.environ | {
-                    "SKVOZ_NATS_URL": f"tls://127.0.0.1:{port}", "SKVOZ_NATS_CA": str(directory / "ca.pem"),
+                    "SKVOZ_NATS_URL": f"tls://{host}:{port}", "SKVOZ_NATS_CA": str(directory / "ca.pem"),
                     "SKVOZ_NATS_WRONG_CA": str(directory / "wrong-ca.pem"),
                     "SKVOZ_TRUST_EMPTY_DIR": str(directory / "empty-trust"),
                     "SKVOZ_NATS_FIXTURE_DIR": str(directory),
                     "SKVOZ_NATS_USER_PASSWORD": user_password, "SKVOZ_NATS_CONSUMER_PASSWORD": consumer_password,
                     "SKVOZ_DAEMON_PASSWORD": daemon_password,
                     "SKVOZ_NATS_RUN_TOKEN": token, "SKVOZ_NATS_CONTAINER": container, "SKVOZ_NATS_MONITOR": monitor,
+                    "SKVOZ_NATS_BOOTSTRAP_NETWORK": bootstrap if args.network_profile else "",
                 }
                 env.update({f"SKVOZ_NATS_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(mesh_passwords)})
                 if args.mode == "check":
@@ -206,6 +271,8 @@ authorization {{
                     qualify_daemon(ROOT, directory, env, args)
                 elif args.mode == "qualify":
                     qualify(ROOT, directory, env, args)
+                elif args.mode == "network":
+                    qualify_network(ROOT, directory, env, args)
                 else:
                     command(cargo + ["run", "-p", "skvoz-testbench", *extra, "--", args.mode,
                         str(args.clients), str(args.streams_per_client), str(args.active_per_client), str(args.bytes)], env=env)
@@ -214,9 +281,13 @@ authorization {{
                     command(["docker", "logs", "--tail=100", container])
                 raise
             finally:
-                if created:
-                    command(["docker", "rm", "--force", container], stdout=subprocess.DEVNULL)
-                    print("Testbench container removed", flush=True)
+                try:
+                    if created:
+                        command(["docker", "rm", "--force", container], stdout=subprocess.DEVNULL)
+                        print("Testbench container removed", flush=True)
+                finally:
+                    if bootstrap_created:
+                        command(["docker", "network", "rm", bootstrap], stdout=subprocess.DEVNULL)
     finally:
         os.umask(old_mask)
 

@@ -5,19 +5,23 @@
 mod api;
 pub use api::{
     Authentication, Counters, Lifecycle, Membership, PeerStatus, RuntimeConfig, RuntimeError,
-    RuntimeEvent, RuntimeKey, Status, Trust,
+    RuntimeEvent, RuntimeKey, Status, Trust, verified_tls_config,
 };
 
 use crate::{
-    CloseReason, Manager, ManagerConfig, PeerId, Resources, SendOutcome, Snapshot, StreamKey, wire,
+    CloseReason, Manager, ManagerConfig, PeerId, PeerLimits, Resources, SendOutcome, Snapshot,
+    StreamKey, wire,
 };
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use std::{
     collections::BTreeMap,
+    future::Future,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -59,6 +63,11 @@ impl Drop for OutputGuard {
             self.latch.mark(4);
         }
     }
+}
+struct Incoming {
+    message: async_nats::Message,
+    lane: Option<usize>,
+    control: bool,
 }
 struct Connection {
     client: async_nats::Client,
@@ -518,6 +527,15 @@ impl NatsRuntime {
     pub fn snapshot(&self, key: RuntimeKey) -> Option<Snapshot> {
         self.check_key(key).ok()?;
         self.manager.snapshot(key.stream)
+    }
+    /// Local configured limits; this does not change runtime or stream state.
+    pub fn limits(&self) -> ManagerConfig {
+        self.limits
+    }
+    /// Validated remote stream limits, available only for this live generation.
+    pub fn peer_limits(&self, key: RuntimeKey) -> Option<PeerLimits> {
+        self.check_key(key).ok()?;
+        self.manager.peer_limits(key.stream)
     }
     pub fn poll_events(&mut self, max: usize) -> Vec<RuntimeEvent> {
         self.apply_failures();
@@ -1017,6 +1035,7 @@ impl NatsRuntime {
         Ok(())
     }
     async fn output(&mut self) -> Result<usize, RuntimeError> {
+        let started = Instant::now();
         let mut count = 0;
         let mut guard = BatchGuard {
             latches: Vec::new(),
@@ -1054,13 +1073,13 @@ impl NatsRuntime {
                 count += 1;
                 continue;
             }
-            let mut bytes = Vec::with_capacity(TRANSPORT_PACKET_BYTES);
+            let size = wire::encoded_size(frame.key.stream_id, &frame.frame)
+                .map_err(|_| RuntimeError::Protocol)?;
+            let mut bytes = Vec::with_capacity(24 + size);
             bytes.extend_from_slice(&s.token.to_be_bytes());
             bytes.extend_from_slice(&s.tx.to_be_bytes());
-            bytes.extend_from_slice(
-                &wire::encode(frame.key.stream_id, &frame.frame)
-                    .map_err(|_| RuntimeError::Protocol)?,
-            );
+            wire::encode_into(&mut bytes, frame.key.stream_id, &frame.frame)
+                .map_err(|_| RuntimeError::Protocol)?;
             let subject = format!(
                 "{}.lane.{}.{:032x}.{}.data.{}.{:032x}",
                 self.config.namespace,
@@ -1077,6 +1096,7 @@ impl NatsRuntime {
             .await
             .map_err(|_| RuntimeError::Timeout)?
             .map_err(|_| RuntimeError::Transport)?;
+            self.counters.published(&frame.frame);
             c.dirty = true;
             count += 1;
         }
@@ -1104,9 +1124,15 @@ impl NatsRuntime {
                     .map_err(|_| RuntimeError::Timeout)?
                     .map_err(|_| RuntimeError::Transport)?;
                 c.dirty = false;
+                self.counters.socket_flushes_completed =
+                    self.counters.socket_flushes_completed.saturating_add(1);
             }
         }
         guard.complete = true;
+        self.counters.output_elapsed_ns = self
+            .counters
+            .output_elapsed_ns
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         Ok(count)
     }
     #[cfg(feature = "fault-injection")]
@@ -1378,8 +1404,77 @@ impl NatsRuntime {
         }
         Ok(())
     }
+    // Pending polls register the owner waker without extracting a message. A
+    // Ready message is handed immediately to the normal authenticated decoder.
+    fn poll_incoming(&mut self, cx: &mut Context<'_>) -> Poll<Option<Incoming>> {
+        if let Some(join) = &mut self.join {
+            match Pin::new(&mut join.data).poll_next(cx) {
+                Poll::Ready(Some(message)) => {
+                    return Poll::Ready(Some(Incoming {
+                        message,
+                        lane: None,
+                        control: true,
+                    }));
+                }
+                Poll::Ready(None) => {
+                    join.latch.mark(1);
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {}
+            }
+        }
+        for control in [true, false] {
+            for _ in 0..self.lanes.len() {
+                let lane = self.lane_cursor;
+                self.lane_cursor = (self.lane_cursor + 1) % self.lanes.len();
+                let Some(connection) = &mut self.lanes[lane] else {
+                    continue;
+                };
+                let subscriber = if control {
+                    let Some(subscriber) = &mut connection.control else {
+                        continue;
+                    };
+                    subscriber
+                } else {
+                    &mut connection.data
+                };
+                match Pin::new(subscriber).poll_next(cx) {
+                    Poll::Ready(Some(message)) => {
+                        return Poll::Ready(Some(Incoming {
+                            message,
+                            lane: Some(lane),
+                            control,
+                        }));
+                    }
+                    Poll::Ready(None) => {
+                        connection.latch.mark(1);
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => {}
+                }
+            }
+        }
+        Poll::Pending
+    }
     /// Bounded message work. Host polling cadence is part of the liveness profile.
     pub async fn turn(&mut self, wait: Duration) -> Result<usize, RuntimeError> {
+        self.turn_with_wake(wait, std::future::pending()).await
+    }
+    /// Run a complete bounded turn, allowing host readiness to end idle waiting.
+    /// The wake future is polled only after output guards have completed and no
+    /// work was done. An incoming NATS message takes priority over a host wake.
+    /// A host wake does not count as transport work or consume any message.
+    /// Hosts must clear their readiness after WouldBlock to avoid repeated wakes,
+    /// and must still await the complete turn rather than cancel active output.
+    pub async fn turn_with_wake<F>(
+        &mut self,
+        wait: Duration,
+        wake: F,
+    ) -> Result<usize, RuntimeError>
+    where
+        F: Future<Output = ()>,
+    {
+        let mut wake = std::pin::pin!(wake);
         self.apply_failures();
         if self.lifecycle == Lifecycle::Recovering {
             self.recover().await?;
@@ -1436,11 +1531,35 @@ impl NatsRuntime {
         progress += self.output().await?;
         self.apply_failures();
         if progress == 0 && !wait.is_zero() {
-            tokio::time::sleep(
-                wait.min(self.config.heartbeat_interval)
-                    .min(self.config.retry_initial),
+            let timeout = wait
+                .min(self.config.heartbeat_interval)
+                .min(self.config.retry_initial);
+            if let Ok(incoming) = tokio::time::timeout(
+                timeout,
+                std::future::poll_fn(|cx| match self.poll_incoming(cx) {
+                    Poll::Ready(incoming) => Poll::Ready(incoming),
+                    Poll::Pending => wake.as_mut().poll(cx).map(|()| None),
+                }),
             )
-            .await;
+            .await
+            {
+                if let Some(incoming) = incoming {
+                    let id = if incoming.lane.is_none() {
+                        self.sender(incoming.message.subject.as_str(), None, true)
+                    } else {
+                        None
+                    };
+                    // No await between owning the arrival and handling its bytes.
+                    self.handle_message(incoming.message, incoming.lane, incoming.control)?;
+                    progress += 1;
+                    if let Some(id) = id
+                        && self.peers.contains_key(&id)
+                    {
+                        self.promote(id).await?;
+                    }
+                }
+                self.apply_failures();
+            }
         }
         Ok(progress)
     }

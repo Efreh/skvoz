@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+if [ "$1" = configure ]; then
+  install -d -m 700 /etc/skvoz-network-helper /var/lib/skvoz-network-helper
+  install -d -m 711 /run/skvoz-network-helper
+  # Socket instances are restricted to existing local interactive user accounts.
+  getent passwd | while IFS=: read -r name password uid gid comment home shell; do
+    if [ "$uid" -ge 1000 ] && [ "$uid" -lt 65534 ] && [ "$shell" != /usr/sbin/nologin ] && [ "$shell" != /bin/false ]; then
+      config="/etc/skvoz-network-helper/$uid.json"
+      if [ ! -e "$config" ]; then
+        install -d -m 700 "/var/lib/skvoz-network-helper/$uid"
+        umask 077
+        printf '{"v":1,"role":"client","state_dir":"/var/lib/skvoz-network-helper/%s","policy":null}\n' "$uid" > "$config"
+      fi
+      install -d -m 711 "/run/skvoz-network-helper/$uid"
+      if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl enable --now "skvoz-network-helper@$uid.socket"
+      fi
+    fi
+  done
+fi

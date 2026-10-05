@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+check_state() {
+  for config in /etc/skvoz-network-helper/*.json; do
+    if [ -e "$config" ]; then
+      if ! /usr/libexec/skvoz-network-helper --check-removal --config "$config"; then return 1; fi
+    fi
+  done
+  return 0
+}
+check_services() {
+  if [ -d /run/systemd/system ]; then
+    active=$(systemctl list-units --state=active --plain --no-legend 'skvoz-network-helper@*.service') || return 1
+    if [ -n "$active" ]; then
+      echo "Active SKVOZ network helper. Disconnect the client before removal." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
+  check_services
+  check_state
+  if [ -d /run/systemd/system ]; then
+    sockets=$(systemctl list-unit-files --plain --no-legend 'skvoz-network-helper@*.socket')
+    original_active=$(systemctl list-units --state=active --plain --no-legend 'skvoz-network-helper@*.socket')
+    # Stop admission before the second durable-state check. Keep enablement intact
+    # until safe removal is proven, so a rejected removal can restore admission.
+    printf '%s\n' "$sockets" | while read -r unit rest; do
+      if [ -n "$unit" ]; then systemctl stop "$unit"; fi
+    done
+    if ! check_state || ! check_services; then
+      printf '%s\n' "$original_active" | while read -r unit rest; do
+        if [ -n "$unit" ]; then systemctl start "$unit"; fi
+      done
+      echo "SKVOZ removal rejected: retained network state changed. Socket admission restored; disconnect and retry." >&2
+      exit 1
+    fi
+    printf '%s\n' "$sockets" | while read -r unit rest; do
+      if [ -n "$unit" ]; then systemctl disable "$unit"; fi
+    done
+  fi
+fi

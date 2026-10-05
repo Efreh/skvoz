@@ -6,7 +6,7 @@ on:
     paths:
       - 'clients/ubuntu/**'
       - 'core/**'
-      - 'daemon/**'
+      - 'network/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'connectors/server/lib/**'
@@ -15,13 +15,12 @@ on:
       - 'connectors/server/Gemfile.lock'
       - 'connectors/server/spec/support/**'
       - 'connectors/server/spec/spec_helper.rb'
-      - 'clients/ruby/**'
       - '.github/workflows/ubuntu-client.yml'
   pull_request:
     paths:
       - 'clients/ubuntu/**'
       - 'core/**'
-      - 'daemon/**'
+      - 'network/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'connectors/server/lib/**'
@@ -30,7 +29,6 @@ on:
       - 'connectors/server/Gemfile.lock'
       - 'connectors/server/spec/support/**'
       - 'connectors/server/spec/spec_helper.rb'
-      - 'clients/ruby/**'
       - '.github/workflows/ubuntu-client.yml'
   workflow_dispatch:
 permissions:
@@ -49,7 +47,7 @@ jobs:
       - name: Native UI build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-4-dev libadwaita-1-dev pkg-config xvfb xauth dbus-x11 x11-apps adwaita-icon-theme librsvg2-common curl openssl jq
+          sudo apt-get install -y --no-install-recommends nftables iproute2 systemd-resolved polkitd libgtk-4-dev libadwaita-1-dev pkg-config xvfb xauth dbus-x11 x11-apps adwaita-icon-theme librsvg2-common curl openssl jq
           rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
           rustup default 1.92.0
       - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
@@ -58,11 +56,11 @@ jobs:
           bundler: '4.0.22'
           bundler-cache: true
           working-directory: connectors/server
-      - name: Native Rust contracts and bundled Core
+      - name: Native Rust contracts and shared network runtime
         run: |
           cargo fmt --all -- --check
-          cargo clippy --locked -p skvoz-ubuntu-client --all-targets --features qualification -- -D warnings
-          cargo build --release --locked -p skvoz-ubuntu-client --features qualification -p skvoz-daemon
+          cargo clippy --locked -p skvoz-ubuntu-client --all-targets --features qualification,skvoz-network/linux-runtime -- -D warnings
+          cargo build --release --locked -p skvoz-ubuntu-client --features qualification,skvoz-network/linux-runtime -p skvoz-network -p skvoz-network-helper
           cargo test --release --locked -p skvoz-ubuntu-client --lib
           SKVOZ_UI_TEST=1 dbus-run-session -- xvfb-run -a cargo test --release --locked -p skvoz-ubuntu-client --test ui -- --nocapture
       - name: Pinned real NATS for independent client process tests
@@ -77,18 +75,23 @@ jobs:
         env:
           SKVOZ_INTEGRATION: '1'
         run: |
-          export SKVOZ_TEST_CORE="$GITHUB_WORKSPACE/target/release/skvoz-core-daemon"
+          export SKVOZ_TEST_RUNTIME="$GITHUB_WORKSPACE/target/release/skvoz-network-runtime"
           export SKVOZ_TEST_CLIENT="$GITHUB_WORKSPACE/target/release/skvoz-client-test-driver"
           export SKVOZ_TEST_NATS="$RUNNER_TEMP/skvoz-bin/nats-server"
           cd connectors/server
-          bundle exec rspec ../../clients/ubuntu/spec
+          # The real server fixture enforces the same UID and capability boundary as Compose.
+          sudo --preserve-env=PATH,GEM_HOME,GEM_PATH,BUNDLE_PATH,BUNDLE_APP_CONFIG,SKVOZ_INTEGRATION,SKVOZ_TEST_RUNTIME,SKVOZ_TEST_CLIENT,SKVOZ_TEST_NATS \
+            setpriv --reuid 10001 --regid 10001 --clear-groups --no-new-privs \
+            --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+            "$(command -v bundle)" exec rspec ../../clients/ubuntu/spec
       - name: Build and install deb
         run: |
           cargo build --release --locked -p skvoz-ubuntu-client --bin skvoz-client
           clients/ubuntu/packaging/build-deb.sh
           sudo apt-get install -y ./clients/ubuntu/dist/skvoz-client_*_amd64.deb
           /usr/bin/skvoz-client --version
-          /usr/lib/skvoz-client/skvoz-core-daemon --version
+          /usr/lib/skvoz-client/skvoz-network-runtime --version
+          /usr/libexec/skvoz-network-helper --version
           sudo dpkg -i clients/ubuntu/dist/skvoz-client_*_amd64.deb
           sudo apt-get remove -y skvoz-client
       - name: Publish client release and retain five latest

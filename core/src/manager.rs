@@ -1,7 +1,7 @@
 //! Multi-peer ownership, admission and active-work scheduling without I/O.
 use crate::{
-    CloseReason, Config, Error, Event, Frame, MAX_BATCH_EVENTS, SendOutcome, Snapshot, State,
-    Stream,
+    CloseReason, Config, Error, Event, Frame, MAX_BATCH_EVENTS, PeerLimits, SendOutcome, Snapshot,
+    State, Stream,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -616,6 +616,11 @@ impl Manager {
     }
     pub fn snapshot(&self, key: StreamKey) -> Option<Snapshot> {
         self.streams.get(&key).map(|e| e.stream.snapshot())
+    }
+    /// Inspect validated peer limits without advancing stream ownership.
+    /// Unknown streams and streams awaiting peer negotiation return None.
+    pub fn peer_limits(&self, key: StreamKey) -> Option<PeerLimits> {
+        self.streams.get(&key).and_then(|e| e.stream.peer_limits())
     }
     /// Constant-time counters; buffer occupancy remains a detailed diagnostic.
     pub fn aggregate(&self) -> Aggregate {

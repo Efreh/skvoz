@@ -74,8 +74,8 @@ module Skvoz
         @status.signaled? ? "#{@label}_signal_#{@status.termsig}" : "#{@label}_exit_#{@status.exitstatus}"
       end
 
-      def initialize(argv, label:, capture: 0)
-        @argv, @label, @capture = argv, label, capture
+      def initialize(argv, label:, capture: 0, descriptors: {})
+        @argv, @label, @capture, @descriptors = argv, label, capture, descriptors
         @output = +''.b
         @output_overflow = false
       end
@@ -84,8 +84,8 @@ module Skvoz
         raise Error, 'Child spawn must run on host main thread' unless Thread.current == Thread.main
         reader, writer = IO.pipe
         guard = File.expand_path('../../../bin/skvoz-child', __dir__)
-        @pid = Process.spawn('setpriv', '--pdeathsig', 'KILL', RbConfig.ruby, guard, Process.pid.to_s, *@argv,
-                             pgroup: true, close_others: true, in: File::NULL, out: writer, err: writer)
+        @pid = Process.spawn('setpriv', '--pdeathsig', 'KILL', RbConfig.ruby, guard, Process.pid.to_s, @descriptors.keys.join(','), *@argv,
+                             **@descriptors, pgroup: true, close_others: true, in: File::NULL, out: writer, err: writer)
         writer.close
         @start_time = self.class.identity(@pid)&.fetch(:start)
         @drain = task.async do

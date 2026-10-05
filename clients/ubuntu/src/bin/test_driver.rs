@@ -1,7 +1,6 @@
 //! Test-only independent backend process; never installed in the deb package.
 use skvoz_ubuntu_client::{
     backend::{Control, Engine, child_guard, run},
-    proxy::Budgets,
     settings::Settings,
 };
 use std::{
@@ -37,19 +36,9 @@ fn main() {
         });
     preferences.request_log = config["request_log"].as_bool().unwrap_or(true);
     settings.save(preferences).unwrap();
-    let budgets = Budgets {
-        connections: config["budgets"]["max_connections"].as_u64().unwrap_or(62) as usize,
-        frames: config["budgets"]["event_frames"]
-            .as_u64()
-            .map_or(Budgets::default().frames, |value| value as usize),
-        bytes: config["budgets"]["event_bytes"]
-            .as_u64()
-            .map_or(Budgets::default().bytes, |value| value as usize),
-    };
     let engine = Engine::new(
         Arc::new(Mutex::new(settings)),
-        PathBuf::from(config["daemon"].as_str().unwrap()),
-        budgets,
+        PathBuf::from(config["runtime"].as_str().unwrap()),
     );
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let (status_tx, status_rx) =

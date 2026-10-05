@@ -31,10 +31,65 @@ pub struct Packet {
     pub frame: Frame,
 }
 
+/// Encode one validated packet with an exact initial allocation.
 pub fn encode(stream_id: u64, frame: &Frame) -> Result<Vec<u8>, WireError> {
+    let mut result = Vec::with_capacity(encoded_size(stream_id, frame)?);
+    encode_into(&mut result, stream_id, frame)?;
+    Ok(result)
+}
+
+// Validate all fields before a caller-visible buffer can be appended to.
+pub(crate) fn encoded_size(stream_id: u64, frame: &Frame) -> Result<usize, WireError> {
     if stream_id == 0 {
         return Err(WireError::InvalidValue);
     }
+    let body = match frame {
+        Frame::Open {
+            receive_window,
+            max_frame,
+            metadata,
+        }
+        | Frame::Accept {
+            receive_window,
+            max_frame,
+            metadata,
+        } => {
+            limits(*receive_window, *max_frame)?;
+            blob_size(metadata, MAX_METADATA_BYTES)? + 8
+        }
+        Frame::Reject { reason } => blob_size(reason, MAX_METADATA_BYTES)?,
+        Frame::Data { bytes, .. } => {
+            if bytes.is_empty() {
+                return Err(WireError::InvalidValue);
+            }
+            blob_size(bytes, MAX_FRAME_BYTES as usize)? + 8
+        }
+        Frame::WindowUpdate { .. } | Frame::Fin { .. } => 8,
+        Frame::Close { reason } => {
+            if !reason.is_abort() {
+                return Err(WireError::InvalidValue);
+            }
+            1
+        }
+    };
+    Ok(16 + body)
+}
+
+fn blob_size(bytes: &[u8], limit: usize) -> Result<usize, WireError> {
+    if bytes.len() > limit {
+        Err(WireError::TooLarge)
+    } else {
+        Ok(4 + bytes.len())
+    }
+}
+
+pub(crate) fn encode_into(
+    result: &mut Vec<u8>,
+    stream_id: u64,
+    frame: &Frame,
+) -> Result<(), WireError> {
+    let size = encoded_size(stream_id, frame)?;
+    result.reserve(size);
     let kind = match frame {
         Frame::Open { .. } => 1,
         Frame::Accept { .. } => 2,
@@ -44,7 +99,6 @@ pub fn encode(stream_id: u64, frame: &Frame) -> Result<Vec<u8>, WireError> {
         Frame::Fin { .. } => 6,
         Frame::Close { .. } => 7,
     };
-    let mut result = Vec::new();
     result.extend_from_slice(b"SKVZ");
     result.extend_from_slice(&[1, kind, 0, 0]);
     result.extend_from_slice(&stream_id.to_be_bytes());
@@ -59,18 +113,14 @@ pub fn encode(stream_id: u64, frame: &Frame) -> Result<Vec<u8>, WireError> {
             max_frame,
             metadata,
         } => {
-            limits(*receive_window, *max_frame)?;
             result.extend_from_slice(&receive_window.to_be_bytes());
             result.extend_from_slice(&max_frame.to_be_bytes());
-            put_bytes(&mut result, metadata, MAX_METADATA_BYTES)?;
+            put_bytes(result, metadata);
         }
-        Frame::Reject { reason } => put_bytes(&mut result, reason, MAX_METADATA_BYTES)?,
+        Frame::Reject { reason } => put_bytes(result, reason),
         Frame::Data { offset, bytes } => {
-            if bytes.is_empty() {
-                return Err(WireError::InvalidValue);
-            }
             result.extend_from_slice(&offset.to_be_bytes());
-            put_bytes(&mut result, bytes, MAX_FRAME_BYTES as usize)?;
+            put_bytes(result, bytes);
         }
         Frame::WindowUpdate { consumed } => result.extend_from_slice(&consumed.to_be_bytes()),
         Frame::Fin { final_offset } => result.extend_from_slice(&final_offset.to_be_bytes()),
@@ -79,10 +129,10 @@ pub fn encode(stream_id: u64, frame: &Frame) -> Result<Vec<u8>, WireError> {
             CloseReason::TransportLost => 2,
             CloseReason::ProtocolError => 3,
             CloseReason::OpenTimeout => 4,
-            _ => return Err(WireError::InvalidValue),
+            _ => unreachable!("validated abort reason"),
         }),
     }
-    Ok(result)
+    Ok(())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Packet, WireError> {
@@ -171,13 +221,9 @@ fn limits(window: u32, frame: u32) -> Result<(), WireError> {
     }
 }
 
-fn put_bytes(output: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), WireError> {
-    if bytes.len() > limit {
-        return Err(WireError::TooLarge);
-    }
+fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     output.extend_from_slice(bytes);
-    Ok(())
 }
 
 struct Reader<'a> {
@@ -218,5 +264,62 @@ impl<'a> Reader<'a> {
             return Err(WireError::InvalidLength);
         }
         Ok(bytes.into())
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_append_keeps_existing_prefix_bytes_and_capacity() {
+        let invalid = [
+            Frame::Data {
+                offset: 0,
+                bytes: Box::new([]),
+            },
+            Frame::Data {
+                offset: 0,
+                bytes: vec![0; MAX_FRAME_BYTES as usize + 1].into(),
+            },
+            Frame::Open {
+                receive_window: 0,
+                max_frame: 1,
+                metadata: Box::new([]),
+            },
+            Frame::Reject {
+                reason: vec![0; MAX_METADATA_BYTES + 1].into(),
+            },
+            Frame::Close {
+                reason: CloseReason::Finished,
+            },
+        ];
+        for frame in invalid {
+            let mut buffer = b"existing envelope prefix".to_vec();
+            let original = buffer.clone();
+            let capacity = buffer.capacity();
+            assert!(encode_into(&mut buffer, 1, &frame).is_err());
+            assert_eq!(buffer, original);
+            assert_eq!(buffer.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn exact_size_append_preserves_prefix_and_maximum_payload() {
+        for size in [1, 1508, 16384, MAX_FRAME_BYTES as usize] {
+            let frame = Frame::Data {
+                offset: 123,
+                bytes: vec![42; size].into(),
+            };
+            let encoded = encode(7, &frame).unwrap();
+            assert_eq!(encoded_size(7, &frame).unwrap(), encoded.len());
+            let mut envelope = Vec::with_capacity(24 + encoded.len());
+            envelope.extend_from_slice(&[9; 24]);
+            let capacity = envelope.capacity();
+            encode_into(&mut envelope, 7, &frame).unwrap();
+            assert_eq!(envelope.capacity(), capacity);
+            assert_eq!(&envelope[..24], &[9; 24]);
+            assert_eq!(&envelope[24..], encoded);
+        }
     }
 }

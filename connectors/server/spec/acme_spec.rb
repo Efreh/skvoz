@@ -95,7 +95,7 @@ RSpec.describe 'Automatic ACME certificate lifecycle', integration: true do
     mutations = 2.times.map { |index| Thread.new { @server.command('add', "acme#{index}") } }
     wait_until(timeout: 20) { committed_certificate.last.serial != first.serial }
     profiles = mutations.map(&:value)
-    @device = ServerSystem::Device.new(@directory.join('device'), profiles.first, ServerSystem::CORE, @server.port)
+    @device = ServerSystem::Device.new(@directory.join('device'), profiles.first, @server.port)
     expect(@server.command('list').length).to eq(2)
     expect(@server.state.glob('tls-*').length).to be <= 3
     users = committed_certificate.first.fetch('users')
@@ -104,16 +104,18 @@ RSpec.describe 'Automatic ACME certificate lifecycle', integration: true do
     begin
       # Hold the broker before reload so the pending candidate cannot commit between polls.
       wait_until(timeout: 20) { @server.state.join('candidate.json').exist? }
-      wait_until(timeout: 12) { @server.command('health')['failure'] == 'configuration_apply_uncertain' }
+      wait_until(timeout: 15) { process_dead(@server.process) }
       committed = committed_certificate.first
       pending = JSON.parse(@server.state.join('candidate.json').read)
       expect(committed.fetch('tls')).not_to eq(pending.fetch('tls'))
       expect(committed.fetch('users')).to eq(users)
-      expect(@server.command('health')['healthy']).to be(false)
+      expect(process_dead(@server.process)).to be(true)
     ensure
       Process.kill('CONT', nats) rescue Errno::ESRCH
     end
-    wait_until(timeout: 25) { @server.command('health')['healthy'] }
+    wait_until(timeout: 25) { process_dead(@server.process) }
+    @server.stop(kill: true)
+    @server.start
     @server.stop
     tls['renewal_interval'] = 86_400
     private_json(@server.config, @server.value)
@@ -124,9 +126,9 @@ RSpec.describe 'Automatic ACME certificate lifecycle', integration: true do
     expect(replacement.serial).not_to eq(expired.serial)
     expect(current.fetch('users')).to eq(users)
     profile = @device.profile.binread
-    ca_path = JSON.parse(profile).fetch('ca_file')
+    ca_path = JSON.parse(profile).fetch('core').fetch('ca_file')
     ca = File.binread(ca_path)
-    # A raw daemon can become terminal after the deliberately long broker outage.
+    # The runtime can become terminal after the deliberately long broker outage.
     @device.restart
     expect(@device.profile.binread).to eq(profile)
     expect(File.binread(ca_path)).to eq(ca)

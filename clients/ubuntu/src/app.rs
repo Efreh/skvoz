@@ -1,7 +1,6 @@
 //! GTK application lifecycle, backend wiring and desktop event scheduling.
 use crate::{
-    backend::{Engine, bundled_daemon, run as run_backend},
-    proxy::Budgets,
+    backend::{Engine, bundled_runtime, run as run_backend},
     settings::Settings,
     ui::{View, label, message},
 };
@@ -50,13 +49,13 @@ pub fn run() -> glib::ExitCode {
                 return;
             }
         };
-        let daemon = match bundled_daemon() {
+        let runtime = match bundled_runtime() {
             Ok(path) => path,
             Err(_) => return,
         };
         let (tx, rx) = mpsc::channel(8);
         let (status_tx, status_rx) = std::sync::mpsc::sync_channel(32);
-        let engine = Engine::new(settings.clone(), daemon, Budgets::default());
+        let engine = Engine::new(settings.clone(), runtime);
         let telemetry = engine.telemetry.clone();
         let resume_watch = crate::desktop::watch_resume(tx.clone());
         crate::desktop::watch_network(tx.clone());

@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-core"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -1172,6 +1172,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "skvoz-network"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "skvoz-core",
+ "skvoz-network-native",
+ "tokio",
+]
+
+[[package]]
+name = "skvoz-network-ffi"
+version = "0.1.0"
+dependencies = [
+ "skvoz-network",
+ "skvoz-network-native",
+]
+
+[[package]]
+name = "skvoz-network-helper"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "skvoz-network",
+ "skvoz-network-native",
+]
+
+[[package]]
+name = "skvoz-network-native"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "skvoz-tcp"
 version = "1.0.0"
 dependencies = [
@@ -1181,19 +1219,22 @@ dependencies = [
 
 [[package]]
 name = "skvoz-testbench"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "async-nats",
  "futures-util",
  "serde_json",
  "skvoz-core",
+ "skvoz-network",
+ "skvoz-network-ffi",
+ "skvoz-network-native",
  "skvoz-tcp",
  "tokio",
 ]
 
 [[package]]
 name = "skvoz-ubuntu-client"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -1203,6 +1244,9 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "skvoz-core",
+ "skvoz-network",
+ "skvoz-network-native",
  "tokio",
  "url",
 ]

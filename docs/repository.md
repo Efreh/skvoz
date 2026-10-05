@@ -17,6 +17,12 @@ skvoz/
 │   ├── Cargo.toml      # skvoz-daemon / skvoz-core-daemon binary
 │   ├── src/
 │   └── tests/fixtures/ # public IPC vectors
+├── network/            # общий TCP/IP runtime поверх того же Core
+│   ├── src/            # safe Rust codec, engine, actor и TCP I/O
+│   ├── tests/          # контракт и владение пакетами
+│   ├── native/         # узкая Linux FD/TUN/SCM_RIGHTS boundary
+│   ├── helper/         # root policy, durable leases, kernel gateway
+│   └── ffi/            # ABI 1 того же actor, header и C consumers
 ├── clients/            # каждый клиент — clients/<name>/
 │   ├── python/         # stdlib IPC helper/echo example
 │   ├── ruby/           # stdlib IPC helper/echo example
@@ -32,7 +38,7 @@ skvoz/
 │   ├── Cargo.toml      # package skvoz-testbench
 │   ├── src/
 │   ├── tests/
-│   └── run.py          # контейнер NATS: check/demo/tcp/load/qualify/daemon
+│   └── run.py          # контейнер NATS: check/demo/tcp/load/qualify/daemon/network
 ├── .github/workflows/  # раздельные сборки сервера и Ubuntu
 ├── docs/               # архитектура и контракты
 └── README.md           # вход в общий проект
@@ -66,17 +72,20 @@ Ubuntu — законченное настольное приложение. Н�
 | Статическое встраивание NATS | `core/src/nats.rs`, `connectors/tcp/src/lib.rs` |
 | Локальные владельцы и обслуживание Core | `daemon/src/driver.rs`, `endpoint.rs` |
 | Профиль демона и IPC | `daemon/src/config.rs`, `protocol.rs`, `daemon/tests/fixtures/` |
+| TCP/IP-сессии, native I/O и управление | `network/src/{engine,runtime,tcp,proxy,local_api,config,budget,policy}.rs` |
+| FD/TUN, gateway и C ABI | `network/native/`, `network/helper/`, `network/ffi/` |
 | Сервер: процессы, пользователи, TLS | `connectors/server/lib/skvoz/server/{service,process,state,tls,enrollment}.rb` |
-| Сервер: назначения, TCP, очереди и IPC | `connectors/server/lib/skvoz/server/{destination,policy,tcp_connector,budget,ipc_session,ipc_protocol}.rb` |
+| Сервер: bootstrap, static policy и runtime control | `connectors/server/lib/skvoz/server/{bootstrap,network_configuration,runtime_control}.rb` |
 | Ubuntu: подключение, выделение устройства и настройки | `clients/ubuntu/src/{backend,enrollment,settings}.rs` |
-| Ubuntu: протокольные интерфейсы и локальный IPC | `clients/ubuntu/src/{proxy,ipc}.rs` |
+| Ubuntu: runtime/helper control и FD | `clients/ubuntu/src/ipc.rs`; протокольные интерфейсы — `network/src/proxy.rs` |
 | Ubuntu: запуск приложения и связь UI, backend и desktop | `clients/ubuntu/src/app.rs` |
 | Ubuntu: окно, фон, индикатор и журнал | `clients/ubuntu/src/{ui,desktop,tray,telemetry}.rs` |
 | Реальный NATS и межпроцессные сценарии | `testbench/run.py`, `testbench/{qualification,daemon_qualification}.py`, `testbench/src/`, `testbench/tests/` |
 
 IPC-адаптеры в разных языках реализуют один [локальный контракт](daemon-ipc.md),
 а не отдельные ядра. Статический NatsNode используется примерами и регрессионными
-сценариями; сервер и Ubuntu используют динамический NatsRuntime внутри демона.
+сценариями; сервер и Ubuntu используют динамический NatsRuntime внутри общего сетевого
+runtime; generic daemon остаётся самостоятельным способом встраивания Core.
 Стенд и его адаптер фиксированной пары не входят в зависимости приложений.
 
 ## Проверка проекта
@@ -107,5 +116,6 @@ python3 testbench/run.py demo
 
 Значения по умолчанию библиотеки и профили приложений имеют разные задачи.
 [Manager](stream-engine.md#менеджер-множества-потоков) использует небольшие окна;
-сервер и Ubuntu задают окна 1 МиБ и блоки 32 КиБ с согласованными бюджетами очередей.
+сетевой runtime задаёт окно 64 КиБ и max frame 16 КиБ с конечными бюджетами
+[текущего профиля](network-runtime.md#данные-кредит-и-границы).
 Это настройки коннекторов поверх общего Core, а не отдельные варианты ядра.

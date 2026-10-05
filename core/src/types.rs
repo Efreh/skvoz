@@ -15,6 +15,13 @@ pub struct Config {
     pub open_timeout_ms: u64,
 }
 
+/// Validated limits advertised by the peer's OPEN or ACCEPT frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerLimits {
+    pub receive_window: u32,
+    pub max_frame: u32,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {

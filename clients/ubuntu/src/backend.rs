@@ -1,14 +1,19 @@
 use crate::{
-    DAEMON_VERSION, Error, Result,
+    Error, RUNTIME_VERSION, Result,
     enrollment::{Credentials, enroll},
     ipc::Session,
-    proxy::{Budgets, Proxies},
-    settings::{Settings, host_name, private_dir, read_private, token, write_private},
+    settings::{Mode, Settings, host_name, private_dir, read_private, token, write_private},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use skvoz_network::{
+    SessionId,
+    config::{CoreConfig, Limits, NetworkConfig, Role, StartupConfig},
+    local_api::{ClientPrepared, HelperResponse, PrepareClientArgs, TransportEndpoint},
+};
 use std::{
     fs,
-    os::unix::fs::MetadataExt,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
@@ -31,17 +36,22 @@ pub struct Status {
 pub type SharedSettings = Arc<Mutex<Settings>>;
 pub struct Engine {
     pub settings: SharedSettings,
-    daemon: PathBuf,
+    executable: PathBuf,
     pub child: Option<Child>,
-    pub proxies: Option<Proxies>,
+    control: Option<Session>,
+    helper: Option<Session>,
+    ip_handle: Option<SessionId>,
     pub runtime: Option<PathBuf>,
     pub peer_id: Option<u64>,
     pub state: &'static str,
-    pub budgets: Budgets,
     pub telemetry: Arc<crate::telemetry::Telemetry>,
+    connections: usize,
+    guard_retained: bool,
+    uploaded_base: u64,
+    downloaded_base: u64,
 }
 impl Engine {
-    pub fn new(settings: SharedSettings, daemon: PathBuf, budgets: Budgets) -> Self {
+    pub fn new(settings: SharedSettings, executable: PathBuf) -> Self {
         let telemetry = crate::telemetry::Telemetry::new(
             settings
                 .lock()
@@ -49,15 +59,20 @@ impl Engine {
                 .unwrap_or(false),
         );
         Self {
-            telemetry,
             settings,
-            daemon,
+            executable,
             child: None,
-            proxies: None,
+            control: None,
+            helper: None,
+            ip_handle: None,
             runtime: None,
             peer_id: None,
             state: "disconnected",
-            budgets,
+            telemetry,
+            connections: 0,
+            guard_retained: false,
+            uploaded_base: 0,
+            downloaded_base: 0,
         }
     }
     pub fn status(&self, error: Option<&'static str>) -> Status {
@@ -67,15 +82,11 @@ impl Engine {
             peer_id: self.peer_id,
             pid: self.child.as_ref().and_then(Child::id),
             runtime: self.runtime.clone(),
+            connections: self.connections,
             info: false,
             uploaded: self.telemetry.uploaded.load(Ordering::Relaxed),
             downloaded: self.telemetry.downloaded.load(Ordering::Relaxed),
             requests: Vec::new(),
-            connections: self
-                .proxies
-                .as_ref()
-                .map(|proxies| proxies.active.load(Ordering::Relaxed))
-                .unwrap_or(0),
         }
     }
     pub fn prepare(
@@ -99,19 +110,22 @@ impl Engine {
         let mut preferences = settings.value.clone();
         preferences.host = host.clone();
         preferences.port = port;
-        preferences.username = user.to_owned();
+        preferences.username = user.into();
         preferences.remember_password(&host, port, user, password.clone())?;
         settings.save(preferences)?;
         Ok(Credentials {
             host,
             port,
-            username: user.to_owned(),
+            username: user.into(),
             password,
             ca_file: settings.value.ca_file.clone(),
+            dial_ip: None,
         })
     }
     pub async fn start(&mut self, credentials: &Credentials) -> Result<()> {
         self.state = "connecting";
+        self.uploaded_base = self.telemetry.uploaded.load(Ordering::Relaxed);
+        self.downloaded_base = self.telemetry.downloaded.load(Ordering::Relaxed);
         let (device, preferences, directory) = {
             let mut settings = self.settings.lock().map_err(|_| Error("unsafe_settings"))?;
             (
@@ -124,16 +138,59 @@ impl Engine {
         self.runtime = Some(runtime.clone());
         let mut validated = credentials.clone();
         if !credentials.ca_file.is_empty() {
-            let bytes = read_ca(Path::new(&credentials.ca_file))?;
             let ca = runtime.join("ca.pem");
-            write_private(&ca, &bytes)?;
-            validated.ca_file = ca.to_string_lossy().into_owned();
+            write_private(&ca, &read_ca(Path::new(&credentials.ca_file))?)?;
+            validated.ca_file = ca.to_string_lossy().into();
         }
-        let enrollment = enroll(&validated, &device).await?;
+        // Freeze one complete numeric transport endpoint before any capture rules.
+        if preferences.mode == Mode::Vpn {
+            self.authorize_helper().await?;
+        }
+        let snapshot_key = serde_json::to_string(&(
+            credentials.host.clone(),
+            credentials.port,
+            credentials.username.clone(),
+            device.clone(),
+            "vpn",
+        ))
+        .map_err(|_| Error("unsafe_settings"))?;
+        let addresses = if self.guard_retained {
+            vec![
+                preferences
+                    .transport_snapshots
+                    .get(&snapshot_key)
+                    .and_then(|ip| ip.parse().ok())
+                    .ok_or(Error("guarded_transport_unknown"))?,
+            ]
+        } else {
+            resolve_brokers(&credentials.host, credentials.port).await?
+        };
+        let (broker, enrollment) = tokio::time::timeout(Duration::from_secs(20), async {
+            for broker in addresses {
+                validated.dial_ip = Some(broker);
+                match enroll(&validated, &device).await {
+                    Ok(enrollment) => return Ok((broker, enrollment)),
+                    Err(Error("server_unavailable" | "enrollment_failed"))
+                        if !self.guard_retained => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(Error("server_unavailable"))
+        })
+        .await
+        .map_err(|_| Error("server_unavailable"))??;
+        if preferences.mode == Mode::Vpn {
+            let mut settings = self.settings.lock().map_err(|_| Error("unsafe_settings"))?;
+            let mut value = settings.value.clone();
+            value
+                .transport_snapshots
+                .insert(snapshot_key, broker.to_string());
+            settings.save(value)?;
+        }
         self.peer_id = Some(enrollment.peer_id);
         let output = tokio::time::timeout(
             Duration::from_secs(3),
-            Command::new(&self.daemon)
+            Command::new(&self.executable)
                 .arg("--version")
                 .kill_on_drop(true)
                 .output(),
@@ -142,152 +199,462 @@ impl Engine {
         .map_err(|_| Error("version_mismatch"))??;
         if !output.status.success()
             || String::from_utf8_lossy(&output.stdout).trim()
-                != format!("skvoz-core-daemon {DAEMON_VERSION} ipc=1")
+                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=2 api=1 core=3.1.0")
         {
             return Err(Error("version_mismatch"));
         }
-        let path = runtime.join("core.sock");
-        let host = if credentials.host.contains(':') {
-            format!("[{}]", credentials.host)
-        } else {
-            credentials.host.clone()
+        let endpoint = std::net::SocketAddr::new(broker, credentials.port);
+        let config = StartupConfig {
+            v: 1,
+            role: Role::Client,
+            core: CoreConfig {
+                url: format!("tls://{endpoint}"),
+                tls_server_name: credentials
+                    .host
+                    .parse::<IpAddr>()
+                    .is_err()
+                    .then(|| credentials.host.clone()),
+                trust: if credentials.ca_file.is_empty() {
+                    "system"
+                } else {
+                    "managed_ca"
+                }
+                .into(),
+                ca_file: (!validated.ca_file.is_empty()).then(|| validated.ca_file.clone().into()),
+                username: credentials.username.clone(),
+                password: credentials.password.clone(),
+                namespace: enrollment.namespace,
+                peer_id: enrollment.peer_id.to_string(),
+                membership: "allowlist".into(),
+                allowed_peers: vec!["0".into()],
+                initiate: vec!["0".into()],
+            },
+            network: NetworkConfig {
+                families: preferences.families.clone(),
+                max_mtu: preferences.max_mtu,
+                channels: 1,
+                limits: Limits::canonical(Role::Client),
+            },
+            server: None,
         };
-        let mut profile = serde_json::json!({"ipc_path":path,"url":format!("tls://{host}:{}",credentials.port),"username":credentials.username,"password":credentials.password,"trust":if credentials.ca_file.is_empty(){"system"}else{"managed_ca"},"namespace":enrollment.namespace,"peer_id":enrollment.peer_id,"allowed_peers":[0],"initiate":[0],"limits":{"owners":64,"streams_per_owner":1,"streams":64,"streams_per_peer":64,"peers":1,"receive_window":crate::RECEIVE_WINDOW,"max_frame":crate::DATA_BLOCK,"receive_bytes":64*crate::RECEIVE_WINDOW,"receive_bytes_per_peer":64*crate::RECEIVE_WINDOW,"send_bytes":8*1024*1024,"send_bytes_per_peer":8*1024*1024,"output_frames":128,"output_bytes":2*crate::RECEIVE_WINDOW,"subscription_frames":64*(crate::RECEIVE_WINDOW/crate::DATA_BLOCK+4),"join_frames":128}});
-        if !credentials.ca_file.is_empty() {
-            profile["ca_file"] = serde_json::json!(validated.ca_file);
-        }
-        let profile_path = runtime.join("profile.json");
+        config
+            .validate()
+            .map_err(|_| Error("invalid_network_settings"))?;
+        let profile = runtime.join("profile.json");
         write_private(
-            &profile_path,
-            &serde_json::to_vec(&profile).map_err(|_| Error("core_unavailable"))?,
+            &profile,
+            &serde_json::to_vec(&config).map_err(|_| Error("core_unavailable"))?,
         )?;
-        let executable = std::env::current_exe()?;
-        let child = Command::new("setpriv")
+        let (local, remote) = std::os::unix::net::UnixStream::pair()?;
+        local.set_nonblocking(true)?;
+        remote.set_nonblocking(true)?;
+        use std::os::fd::AsFd;
+        let mut command = Command::new("setpriv");
+        command
             .args(["--pdeathsig", "KILL"])
-            .arg(executable)
+            .arg(std::env::current_exe()?)
             .arg("--child")
             .arg(std::process::id().to_string())
-            .arg(&self.daemon)
-            .arg(&profile_path)
+            .arg(&self.executable)
+            .arg(&profile)
+            .arg("3")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
+        skvoz_network_native::inherit_control(command.as_std_mut(), remote.as_fd(), 3)?;
+        let child = command.spawn()?;
+        drop(command);
+        drop(remote);
         let child_id = child.id().ok_or(Error("core_unavailable"))?;
         self.child = Some(child);
         remember_child(&runtime, child_id)?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if self
-                    .child
-                    .as_mut()
-                    .ok_or(Error("core_unavailable"))?
-                    .try_wait()?
-                    .is_some()
-                {
-                    return Err(Error("core_unavailable"));
-                }
-                if path.exists() {
-                    let mut session = Session::connect(&path, 32, 16384).await?;
-                    let ready = session.request(11, 0, &0u64.to_be_bytes(), &[0]).await?;
-                    if ready.extra == [1] {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        self.control = Some(Session::new(local.into(), false)?);
+        let session = self.control.as_mut().ok_or(Error("ipc_failed"))?;
+        let hello = session.call("HELLO", json!({"api":1,"network":2})).await?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Capabilities {
+            profiles: Vec<String>,
+            families: Vec<u8>,
+            max_mtu: u16,
+            max_channels: u8,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Hello {
+            api: u8,
+            network: u8,
+            role: Role,
+            capabilities: Capabilities,
+        }
+        let hello: Hello = serde_json::from_value(hello).map_err(|_| Error("version_mismatch"))?;
+        if hello.api != 1
+            || hello.network != 2
+            || hello.role != Role::Client
+            || hello.capabilities.profiles != ["tcp", "ip"]
+            || hello.capabilities.families != preferences.families
+            || hello.capabilities.max_mtu != preferences.max_mtu
+            || hello.capabilities.max_channels != 1
+        {
+            return Err(Error("version_mismatch"));
+        }
+        fs::remove_file(profile)?;
+        loop {
+            let event = session.wait_event("RUNTIME_STATE").await?;
+            let state: skvoz_network::local_api::RuntimeStateEvent =
+                skvoz_network::local_api::arguments(&event.data)
+                    .map_err(|_| Error("ipc_failed"))?;
+            if state.state == "ready" {
+                break;
             }
-            Ok::<(), Error>(())
-        })
-        .await
-        .map_err(|_| Error("core_unavailable"))??;
-        fs::remove_file(profile_path)?;
-        self.proxies = Some(
-            Proxies::start(
-                path,
-                preferences.http_port,
-                preferences.socks_port,
-                self.budgets,
-                self.telemetry.clone(),
-            )
-            .await?,
-        );
+            if state.state == "closed" || state.state == "closing" {
+                return Err(crate::ipc::api_error(state.error));
+            }
+        }
+        match preferences.mode {
+            Mode::Proxy => {
+                let http = bind(preferences.http_port);
+                let socks = bind(preferences.socks_port);
+                let started = session
+                    .call("START_PROXY", json!({"http_bind":http,"socks_bind":socks}))
+                    .await?;
+                if started
+                    != json!({
+                        "http": http.map(|address| format!("http://{address}")),
+                        "socks": socks.map(|address| format!("socks5://{address}"))
+                    })
+                {
+                    return Err(Error("ipc_failed"));
+                }
+            }
+            Mode::Vpn => {
+                let result=session.call("START_IP",json!({"families":preferences.families,"max_mtu":preferences.max_mtu,"channels":1})).await?;
+                let result: skvoz_network::local_api::HandleArgs =
+                    skvoz_network::local_api::arguments(&result)
+                        .map_err(|_| Error("ipc_failed"))?;
+                let handle = result.handle;
+
+                let event = session.wait_event("CONFIGURED").await?;
+                let configured: skvoz_network::local_api::ConfiguredEvent =
+                    skvoz_network::local_api::arguments(&event.data)
+                        .map_err(|_| Error("ipc_failed"))?;
+                if configured.handle != handle {
+                    return Err(Error("ipc_failed"));
+                }
+                let config = configured.config;
+                let args = PrepareClientArgs {
+                    handle: handle.clone(),
+                    config,
+                    transport_endpoints: vec![TransportEndpoint {
+                        ip: broker,
+                        port: credentials.port,
+                    }],
+                };
+                let helper = self.helper.as_ref().ok_or(Error("helper_failed"))?;
+                let frame = helper
+                    .helper_call(
+                        "PREPARE_CLIENT",
+                        serde_json::to_value(args).map_err(|_| Error("helper_failed"))?,
+                    )
+                    .await?;
+                let response =
+                    HelperResponse::parse_json(&frame.body).map_err(|_| Error("helper_failed"))?;
+                let prepared: ClientPrepared =
+                    serde_json::from_value(response.result.ok_or(Error("helper_failed"))?)
+                        .map_err(|_| Error("helper_failed"))?;
+                if prepared.handle != handle {
+                    return Err(Error("helper_failed"));
+                }
+                self.guard_retained = true;
+                self.ip_handle = Some(handle.clone());
+                let fd = frame.fd.ok_or(Error("helper_failed"))?;
+                let attached = session
+                    .request(
+                        "ATTACH_IP",
+                        json!({"handle":handle,"interface":prepared.interface,"mtu":prepared.mtu}),
+                        Some(fd),
+                    )
+                    .await?;
+                let attached: skvoz_network::local_api::HandleArgs =
+                    skvoz_network::local_api::arguments(&require_success(&attached.body)?)
+                        .map_err(|_| Error("ipc_failed"))?;
+                if attached.handle != handle {
+                    return Err(Error("ipc_failed"));
+                }
+                helper
+                    .helper_call("ACTIVATE_CLIENT", json!({"handle":handle}))
+                    .await?;
+                let ready = session
+                    .call("LOCAL_READY", json!({"handle":handle}))
+                    .await?;
+                let ready: skvoz_network::local_api::HandleArgs =
+                    skvoz_network::local_api::arguments(&ready).map_err(|_| Error("ipc_failed"))?;
+                if ready.handle != handle {
+                    return Err(Error("ipc_failed"));
+                }
+                let active = session.wait_event("ACTIVE").await?;
+                if active.data["handle"] != json!(handle) {
+                    return Err(Error("ipc_failed"));
+                }
+            }
+        }
         self.state = "connected";
+        Ok(())
+    }
+    async fn authorize_helper(&mut self) -> Result<()> {
+        let uid = crate::settings::uid()?;
+        let process = format!(
+            "{},{},{}",
+            std::process::id(),
+            identity(std::process::id()).ok_or(Error("helper_failed"))?,
+            uid
+        );
+        if self.helper.as_ref().is_some_and(|h| !h.healthy()) {
+            self.helper = None;
+            return Err(Error("helper_failed"));
+        }
+        if self.helper.is_none() {
+            let status = tokio::time::timeout(
+                Duration::from_secs(60),
+                Command::new("pkcheck")
+                    .args([
+                        "--action-id",
+                        "org.skvoz.network.manage",
+                        "--process",
+                        &process,
+                        "--allow-user-interaction",
+                    ])
+                    .kill_on_drop(true)
+                    .status(),
+            )
+            .await
+            .map_err(|_| Error("helper_authorization_failed"))??;
+            if !status.success() {
+                return Err(Error("helper_authorization_failed"));
+            }
+        }
+        if self.helper.is_none() {
+            let socket = tokio::net::UnixStream::connect(format!(
+                "/run/skvoz-network-helper/{uid}/control.sock"
+            ))
+            .await?;
+            let socket = socket.into_std()?;
+            let helper = Session::new(socket.into(), true)?;
+            helper
+                .helper_call("HELLO", json!({"api":1,"network":2}))
+                .await?;
+            self.helper = Some(helper);
+        }
+        let helper = self.helper.as_ref().ok_or(Error("helper_failed"))?;
+        let recovery = helper.helper_call("RECOVER", json!({})).await?;
+        let r = HelperResponse::parse_json(&recovery.body).map_err(|_| Error("helper_failed"))?;
+        let recovered: skvoz_network::local_api::HelperState =
+            serde_json::from_value(r.result.ok_or(Error("helper_failed"))?)
+                .map_err(|_| Error("helper_failed"))?;
+        match (recovered.state.as_str(), &recovered.handle) {
+            ("guarded", Some(_)) => {
+                self.guard_retained = true;
+                self.ip_handle = recovered.handle;
+            }
+            ("idle", None) => {
+                self.guard_retained = false;
+                self.ip_handle = None;
+            }
+            _ => return Err(Error("helper_failed")),
+        }
         Ok(())
     }
     pub async fn healthy(&mut self) -> bool {
         if self
             .child
             .as_mut()
-            .and_then(|child| child.try_wait().ok())
+            .and_then(|c| c.try_wait().ok())
             .flatten()
             .is_some()
         {
             return false;
         }
-        let Some(runtime) = &self.runtime else {
+        let Some(control) = self.control.as_mut() else {
             return false;
         };
-        let operation = async {
-            let mut session = Session::connect(&runtime.join("core.sock"), 32, 16384).await?;
-            let status = session.request(9, 0, &[], &[0]).await?;
-            let ready = session.request(11, 0, &0u64.to_be_bytes(), &[0]).await?;
-            Ok::<bool, Error>(
-                status.extra.len() == 97 && status.extra[0] == 1 && ready.extra == [1],
-            )
-        };
-        matches!(
-            tokio::time::timeout(Duration::from_secs(2), operation).await,
-            Ok(Ok(true))
-        )
+        if !control.healthy() {
+            return false;
+        }
+        for event in control.drain() {
+            if matches!(event.event.as_str(), "CLOSED" | "ERROR")
+                || event.event == "RUNTIME_STATE" && event.data["state"] != "ready"
+            {
+                return false;
+            }
+            if event.event == "REQUEST" {
+                self.telemetry.runtime_request(&event.data);
+            }
+            if event.event == "STATS" {
+                let Ok(stats) = skvoz_network::local_api::arguments::<
+                    skvoz_network::local_api::StatsEvent,
+                >(&event.data) else {
+                    return false;
+                };
+                let Ok(connections) = usize::try_from(stats.counters.tcp_open) else {
+                    return false;
+                };
+                self.connections = connections;
+                self.telemetry.uploaded.store(
+                    self.uploaded_base.saturating_add(stats.counters.uploaded),
+                    Ordering::Relaxed,
+                );
+                self.telemetry.downloaded.store(
+                    self.downloaded_base
+                        .saturating_add(stats.counters.downloaded),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+        true
     }
     pub async fn cleanup(&mut self) {
-        if let Some(proxies) = self.proxies.take() {
-            proxies.close().await;
+        self.explicit_stop("user_stop").await;
+    }
+    pub async fn shutdown(&mut self) {
+        self.explicit_stop("shutdown").await;
+    }
+    async fn explicit_stop(&mut self, reason: &str) {
+        let vpn = self
+            .settings
+            .lock()
+            .map(|s| s.value.mode == Mode::Vpn)
+            .unwrap_or(false);
+        if self.helper.as_ref().is_some_and(|h| !h.healthy()) {
+            self.helper = None;
         }
-        if let Some(mut child) = self.child.take()
-            && child.try_wait().ok().flatten().is_none()
-        {
-            if let Some(pid) = child.id() {
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status()
-                    .await;
-            }
-            if tokio::time::timeout(Duration::from_secs(5), child.wait())
+        let recovery_failed =
+            vpn && self.helper.is_none() && self.authorize_helper().await.is_err();
+        self.cleanup_reason(Some(reason)).await;
+        if recovery_failed {
+            self.state = "guarded";
+        }
+    }
+    pub async fn abort(&mut self) {
+        self.cleanup_reason(None).await;
+    }
+    async fn cleanup_reason(&mut self, reason: Option<&str>) {
+        let mut cleanup_failed = false;
+        if reason.is_none()
+            && let (Some(handle), Some(helper)) = (&self.ip_handle, &self.helper)
+            && helper
+                .helper_call("ABORT_CLIENT", json!({"handle":handle}))
                 .await
                 .is_err()
-            {
-                let _ = child.kill().await;
-            }
-            let _ = child.wait().await;
+        {
+            cleanup_failed = true;
         }
-        if let Some(directory) = self.runtime.take() {
-            let _ = fs::remove_dir_all(directory);
+        if let Some(control) = self.control.take() {
+            if let (Some(handle), Some(reason)) = (&self.ip_handle, reason) {
+                // A failed STOP cannot authorize restoration while its process lives.
+                let _ = control
+                    .call("STOP_IP", json!({"handle":handle,"reason":reason}))
+                    .await;
+            }
+            let _ = control.call("PREPARE_SHUTDOWN", json!({})).await;
+        }
+        let mut dead = true;
+        if let Some(mut child) = self.child.take()
+            && !matches!(
+                tokio::time::timeout(Duration::from_secs(3), child.wait()).await,
+                Ok(Ok(_))
+            )
+        {
+            let _ = child.start_kill();
+            dead = matches!(
+                tokio::time::timeout(Duration::from_secs(3), child.wait()).await,
+                Ok(Ok(_))
+            );
+            if !dead {
+                self.child = Some(child);
+                cleanup_failed = true;
+            }
+        }
+        if let (Some(reason), Some(handle), Some(helper)) = (reason, &self.ip_handle, &self.helper)
+        {
+            if dead {
+                if helper
+                    .helper_call("RESTORE_CLIENT", json!({"handle":handle,"reason":reason}))
+                    .await
+                    .is_err()
+                {
+                    cleanup_failed = true;
+                } else {
+                    self.guard_retained = false;
+                }
+            } else {
+                cleanup_failed = true;
+            }
+        }
+        if dead && let Some(runtime) = self.runtime.take() {
+            let _ = fs::remove_dir_all(runtime);
+        }
+        if reason.is_some() && !cleanup_failed && !self.guard_retained {
+            self.ip_handle = None;
+            self.helper = None;
         }
         self.peer_id = None;
-        self.state = "disconnected";
+        self.connections = 0;
+        self.state = if cleanup_failed || self.guard_retained {
+            "guarded"
+        } else {
+            "disconnected"
+        };
     }
 }
 impl Drop for Engine {
     fn drop(&mut self) {
-        if let Some(proxies) = &self.proxies {
-            proxies.abort();
-        }
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
         }
     }
 }
-
+fn bind(port: u16) -> Option<String> {
+    (port != 0).then(|| format!("127.0.0.1:{port}"))
+}
+fn require_success(body: &[u8]) -> Result<Value> {
+    let r =
+        skvoz_network::local_api::Response::parse_json(body).map_err(|_| Error("ipc_failed"))?;
+    r.result.ok_or(Error("network_unavailable"))
+}
+async fn resolve_brokers(host: &str, port: u16) -> Result<Vec<IpAddr>> {
+    let operation = async {
+        let addresses = tokio::net::lookup_host((host, port)).await?;
+        let mut result = Vec::new();
+        for a in addresses {
+            let ip = a.ip();
+            if ip.to_canonical() != ip || ip.is_unspecified() || ip.is_multicast() {
+                return Err(Error("server_unavailable"));
+            }
+            if !result.contains(&ip) {
+                if result.len() >= 32 {
+                    return Err(Error("server_unavailable"));
+                }
+                result.push(ip);
+            }
+        }
+        if result.is_empty() {
+            return Err(Error("server_unavailable"));
+        }
+        Ok(result)
+    };
+    tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| Error("server_unavailable"))?
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Owner {
     parent: u32,
     parent_start: String,
-    daemon: Option<u32>,
-    daemon_start: Option<String>,
+    runtime_pid: Option<u32>,
+    runtime_start: Option<String>,
 }
 pub fn identity(pid: u32) -> Option<String> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -308,7 +675,7 @@ pub fn parent_pid() -> Result<u32> {
         .ok_or(Error("core_unavailable"))
 }
 pub fn child_guard(args: &[String]) -> Result<()> {
-    if args.len() != 4 || args[0] != "--child" || args[1].parse::<u32>().ok() != Some(parent_pid()?)
+    if args.len() != 5 || args[0] != "--child" || args[1].parse::<u32>().ok() != Some(parent_pid()?)
     {
         return Err(Error("core_unavailable"));
     }
@@ -316,6 +683,8 @@ pub fn child_guard(args: &[String]) -> Result<()> {
     let _ = std::process::Command::new(&args[2])
         .arg("--config")
         .arg(&args[3])
+        .arg("--control-fd")
+        .arg(&args[4])
         .exec();
     Err(Error("core_unavailable"))
 }
@@ -358,19 +727,11 @@ pub fn recover_runtime(directory: &Path) -> Result<PathBuf> {
         let owner: Owner = serde_json::from_slice(&read_private(&record, 1024)?)
             .map_err(|_| Error("unsafe_settings"))?;
         let parent = identity(owner.parent);
-        let daemon = owner.daemon.and_then(identity);
+        let runtime_pid = owner.runtime_pid.and_then(identity);
         if parent.is_some() && parent.as_ref() == Some(&owner.parent_start)
-            || daemon.is_some() && daemon == owner.daemon_start
+            || runtime_pid.is_some() && runtime_pid == owner.runtime_start
         {
             return Err(Error("already_running"));
-        }
-        let socket = path.join("core.sock");
-        if socket.exists() || socket.is_symlink() {
-            let meta = fs::symlink_metadata(socket)?;
-            use std::os::unix::fs::FileTypeExt;
-            if !meta.file_type().is_socket() || meta.uid() != crate::settings::uid()? {
-                return Err(Error("unsafe_settings"));
-            }
         }
         fs::remove_dir_all(path)?;
     }
@@ -381,8 +742,8 @@ pub fn recover_runtime(directory: &Path) -> Result<PathBuf> {
     let owner = Owner {
         parent: std::process::id(),
         parent_start: identity(std::process::id()).ok_or(Error("core_unavailable"))?,
-        daemon: None,
-        daemon_start: None,
+        runtime_pid: None,
+        runtime_start: None,
     };
     write_private(
         &path.join("owner.json"),
@@ -394,17 +755,17 @@ fn remember_child(directory: &Path, pid: u32) -> Result<()> {
     let mut owner: Owner =
         serde_json::from_slice(&read_private(&directory.join("owner.json"), 1024)?)
             .map_err(|_| Error("unsafe_settings"))?;
-    owner.daemon = Some(pid);
-    owner.daemon_start = identity(pid);
+    owner.runtime_pid = Some(pid);
+    owner.runtime_start = identity(pid);
     write_private(
         &directory.join("owner.json"),
         &serde_json::to_vec(&owner).map_err(|_| Error("unsafe_settings"))?,
     )
 }
-pub fn bundled_daemon() -> Result<PathBuf> {
+pub fn bundled_runtime() -> Result<PathBuf> {
     let executable = std::env::current_exe()?;
     let directory = executable.parent().ok_or(Error("core_unavailable"))?;
-    Ok(directory.join("skvoz-core-daemon"))
+    Ok(directory.join("skvoz-network-runtime"))
 }
 
 #[derive(Clone)]
@@ -464,26 +825,27 @@ pub async fn run(
             command = commands.recv() => match command {
                 Some(Control::Connect { host, port, username, password }) => {
                     credentials = None;
-                    engine.cleanup().await;
+                    if engine.control.is_some() {engine.explicit_stop("mode_change").await;}
+                    if engine.guard_retained || engine.state=="guarded" {emit(&engine,Some("helper_failed"));continue;}
                     match engine.prepare(&host, port, &username, password) {
                         Ok(input) => {
                             engine.state = "connecting";
                             emit(&engine, None);
                             let (attempt, quit) = attempt_start(&mut engine, &input, &mut commands, &status).await;
-                            if quit { engine.cleanup().await; engine.state = "stopped"; emit(&engine, None); return; }
+                            if quit { engine.shutdown().await; engine.state = "stopped"; emit(&engine, None); return; }
                             match attempt {
                                 Some(Ok(())) => {
                                     credentials = Some(input);
                                     emit(&engine, None);
                                 }
                                 Some(Err(error)) => {
-                                    engine.cleanup().await;
+                                    engine.abort().await;
                                     if retryable(error.0) {
                                         credentials = Some(input);
                                         engine.state = "reconnecting";
                                         retry = std::time::Instant::now() + Duration::from_secs(1);
                                         delay = 1;
-                                    } else { engine.state = "error"; }
+                                    } else { engine.state = if engine.guard_retained {"guarded"} else {"error"}; }
                                     emit(&engine, Some(error.0));
                                 }
                                 None => {
@@ -512,7 +874,7 @@ pub async fn run(
                 Some(Control::NetworkAvailable) => { if credentials.is_some() && engine.state == "reconnecting" { retry = std::time::Instant::now(); } }
                 Some(Control::Resume) => {
                     if credentials.is_some() {
-                        engine.cleanup().await;
+                        engine.abort().await;
                         engine.state = "reconnecting";
                         retry = std::time::Instant::now();
                         delay = 1;
@@ -524,7 +886,7 @@ pub async fn run(
                     if let Some(child) = &mut engine.child { let _ = child.start_kill(); }
                 }
                 Some(Control::Quit) | None => {
-                    engine.cleanup().await;
+                    engine.shutdown().await;
                     engine.state = "stopped";
                     emit(&engine, None);
                     return;
@@ -533,7 +895,7 @@ pub async fn run(
             _ = timer.tick() => {
                 if let Some(input) = &credentials {
                     if engine.state == "connected" && !engine.healthy().await {
-                        engine.cleanup().await;
+                        engine.abort().await;
                         engine.state = "reconnecting";
                         retry = std::time::Instant::now() + Duration::from_secs(1);
                         delay = 1;
@@ -541,15 +903,15 @@ pub async fn run(
                     }
                     if engine.state == "reconnecting" && std::time::Instant::now() >= retry {
                         let (attempt, quit) = attempt_start(&mut engine, input, &mut commands, &status).await;
-                        if quit { engine.cleanup().await; engine.state = "stopped"; emit(&engine, None); return; }
+                        if quit { engine.shutdown().await; engine.state = "stopped"; emit(&engine, None); return; }
                         match attempt {
                             Some(Ok(())) => {
                                 delay = 1;
                                 emit(&engine, None);
                             }
                             Some(Err(error)) => {
-                                engine.cleanup().await;
-                                if !retryable(error.0) { credentials = None; engine.state = "error"; emit(&engine, Some(error.0)); continue; }
+                                engine.abort().await;
+                                if !retryable(error.0) { credentials = None; engine.state = if engine.guard_retained {"guarded"} else {"error"}; emit(&engine, Some(error.0)); continue; }
                                 engine.state = "reconnecting";
                                 delay = (delay * 2).min(15);
                                 retry = std::time::Instant::now() + Duration::from_secs(delay);
@@ -581,6 +943,9 @@ fn retryable(code: &str) -> bool {
             | "io_unexpected_eof"
             | "io_timeout"
             | "ipc_failed"
+            | "ipc_timeout"
+            | "network_unavailable"
+            | "network_timeout"
     )
 }
 
@@ -608,11 +973,36 @@ pub fn read_ca(path: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn accidental_loss_retains_guard_and_explicit_stop_requires_restore_proof() {
+        let directory = std::env::temp_dir().join(format!("skvoz-guard-{}", token().unwrap()));
+        let settings = Arc::new(Mutex::new(Settings::open(directory.clone()).unwrap()));
+        let mut engine = Engine::new(settings.clone(), "/unused".into());
+        engine.guard_retained = true;
+        engine.ip_handle = Some(SessionId::random().unwrap());
+        let original = engine.ip_handle.clone();
+        engine.abort().await;
+        assert_eq!(engine.state, "guarded");
+        assert!(engine.guard_retained);
+        assert_eq!(engine.ip_handle, original);
+        // With no helper acknowledgment, a manual stop cannot claim restoration.
+        engine.cleanup().await;
+        assert_eq!(engine.state, "guarded");
+        assert!(engine.guard_retained);
+        assert_eq!(engine.ip_handle, original);
+        engine.guard_retained = false;
+        engine.ip_handle = None;
+        engine.abort().await;
+        assert_eq!(engine.state, "disconnected");
+        drop(engine);
+        drop(settings);
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn invalid_login_does_not_corrupt_persistent_settings() {
         let directory = std::env::temp_dir().join(format!("skvoz-backend-{}", token().unwrap()));
         let settings = Arc::new(Mutex::new(Settings::open(directory.clone()).unwrap()));
-        let mut engine = Engine::new(settings.clone(), "/unused".into(), Budgets::default());
+        let mut engine = Engine::new(settings.clone(), "/unused".into());
         assert!(
             engine
                 .prepare(
@@ -652,8 +1042,8 @@ mod tests {
         let owner = Owner {
             parent: u32::MAX,
             parent_start: "1".into(),
-            daemon: Some(u32::MAX),
-            daemon_start: None,
+            runtime_pid: Some(u32::MAX),
+            runtime_start: None,
         };
         write_private(
             &runtime.join("owner.json"),

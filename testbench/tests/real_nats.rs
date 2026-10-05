@@ -145,9 +145,14 @@ async fn response_is_possible_after_request_eof() {
 async fn reject_and_cancel_have_real_peer_observations() {
     let (mut user, mut consumer) = scenarios::pair("rejectcancel", small()).await.unwrap();
     let rejected = user.open(b"request").await.unwrap();
-    consumer.turn(Duration::from_secs(1)).await.unwrap();
-    consumer.poll_events();
-    consumer.reject(rejected, b"denied").await.unwrap();
+    let started = Instant::now();
+    let progress = consumer.turn(Duration::from_secs(1)).await.unwrap();
+    let events = consumer.poll_events();
+    let elapsed = started.elapsed();
+    let before_reject = consumer.snapshot(rejected);
+    consumer.reject(rejected, b"denied").await.unwrap_or_else(|error| panic!(
+        "Reject observation: error={error} elapsed={elapsed:?} progress={progress} events={events:?} user_failure={:?} consumer_failure={:?} user_snapshot={:?} consumer_snapshot_before={before_reject:?} consumer_snapshot_after={:?}",
+        user.failure_kind(),consumer.failure_kind(),user.snapshot(rejected),consumer.snapshot(rejected)));
     user.turn(Duration::from_secs(1)).await.unwrap();
     let events = user.poll_events();
     assert_eq!(

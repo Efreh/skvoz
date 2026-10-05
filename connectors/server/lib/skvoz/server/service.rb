@@ -3,8 +3,10 @@ require 'async'
 require 'open3'
 require 'uri'
 require 'net/http'
+require 'io/nonblock'
+require_relative 'tls'
 require_relative 'state'
-require_relative 'tcp_connector'
+require_relative 'runtime_control'
 require_relative 'enrollment'
 
 module Skvoz
@@ -14,6 +16,14 @@ module Skvoz
 
       def initialize(config)
         @config = config
+        if ENV['SKVOZ_HELPER_FD']
+          raise Error, 'Invalid inherited helper' unless ENV['SKVOZ_HELPER_FD'] == '3' && ENV['SKVOZ_HELPER_PID']&.match?(/\A[0-9]+\z/)
+          @helper_pid = Integer(ENV.delete('SKVOZ_HELPER_PID'))
+          @helper_owner = UNIXSocket.for_fd(Integer(ENV.delete('SKVOZ_HELPER_FD')))
+          credentials = @helper_owner.getsockopt(Socket::SOL_SOCKET, Socket::SO_PEERCRED).to_s.unpack('iii')
+          raise Error, 'Untrusted inherited helper channel' unless credentials[0] == Process.pid && credentials[1].zero? && credentials[2].zero?
+          @helper_owner.close_on_exec = true
+        end
         @state = State.new(config)
         @stopping = false
         @healthy = false
@@ -33,49 +43,24 @@ module Skvoz
         @admin_task = task.async { administration }
         prune_tls(preserve_candidate: true)
         bootstrap_tls
-        retry_delay = 1
-        until @stopping
-          begin
-            start_runtime
-            retry_delay = 1
-            while !@stopping && children_alive? && @connector.ready?
-              unless @enrollment&.ready?
-                @enrollment&.stop(graceful: true)
-                begin
-                  start_enrollment if monotonic >= (@next_enrollment || 0)
-                rescue StandardError => error
-                  Diagnostics.emit('enrollment_restart_failed', **Diagnostics.error_fields(error))
-                  @next_enrollment = monotonic + 1
-                end
-              end
-              @healthy = @tls.valid? && @failure.nil? && @enrollment&.ready?
-              unless @tls.valid?
-                @connector.stop
-                break
-              end
-              if @config.tls['mode'] == 'acme' && @tls.renewal_due? && Time.now >= (@next_renewal || Time.at(0))
-                renew
-              end
-              task.sleep(0.1)
-            end
-            break if @stopping
-            unless @failure == 'configuration_apply_uncertain'
-              @failure = [@nats, @core].compact.find { |child| !child.alive? }&.exit_category || 'core_unavailable'
-            end
-            Diagnostics.emit('runtime_recovering', failure: @failure, connector_failure: @connector&.failure,
-              nats_exit: @nats&.exit_category, core_exit: @core&.exit_category)
-          rescue StandardError => error
-            @failure = 'runtime_start_failed' unless @failure == 'configuration_apply_uncertain'
-            Diagnostics.emit('runtime_start_failed', stage: @runtime_stage, failure: @failure, **Diagnostics.error_fields(error))
-          ensure
-            @healthy = false
-            @enrollment&.stop
-            @connector&.stop
-            stop_children
+        start_runtime
+        while !@stopping && children_alive?
+          @connector.refresh
+          raise Error, 'Runtime control lost' if @connector.failure
+          unless @enrollment&.ready?
+            @enrollment&.stop(graceful: true)
+            start_enrollment
           end
-          sleep_until(monotonic + retry_delay) unless @stopping
-          retry_delay = [retry_delay * 2, 30].min
+          @healthy = @tls.valid? && @failure.nil? && @connector.ready? && @enrollment&.ready?
+          raise Error, 'TLS certificate expired' unless @tls.valid?
+          renew if @config.tls['mode'] == 'acme' && @tls.renewal_due? && Time.now >= (@next_renewal || Time.at(0))
+          task.sleep(0.25)
         end
+        raise Error, 'Supervised process exited; container restart required' unless @stopping
+      rescue StandardError => error
+        @failure ||= 'runtime_fatal'
+        Diagnostics.emit('runtime_fatal', stage: @runtime_stage, failure: @failure, **Diagnostics.error_fields(error))
+        raise
       ensure
         shutdown
       end
@@ -171,11 +156,11 @@ module Skvoz
 
       def start_runtime
         @runtime_stage = 'tls'
-        @nats = @core = nil
+        @nats = @runtime = nil
         renew(initial: true) unless @tls.valid?
         @runtime_stage = 'binary_validation'
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
-        validate_binary(@config['core_binary'], 'skvoz-core-daemon 1.4.0 ipc=1')
+        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.1.0 network=2 api=1 core=3.1.0')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         @runtime_stage = 'nats_validation'
@@ -184,45 +169,30 @@ module Skvoz
         @nats = ChildProcess.new([@config['nats_binary'], '--config', @nats_path], label: 'nats').start(@task)
         @children << @nats
         wait_ready { probe }
-        @runtime_stage = 'core_start'
-        @core_path = File.join(@state.directory, 'core.sock')
-        recover_socket(@core_path, 'core-owner.json')
-        profile_path = File.join(@state.directory, 'core-profile.json')
-        PrivateFiles.write(profile_path, JSON.generate(@state.profile))
-        @core = ChildProcess.new([@config['core_binary'], '--config', profile_path], label: 'core').start(@task)
-        @children << @core
-        wait_ready { File.socket?(@core_path) && @core.alive? }
-        remember_socket(@core_path, 'core-owner.json', @core.pid)
-        @runtime_stage = 'policy'
-        own = [[@config['bind'], @config['port']], ['127.0.0.1', @config['monitor_port']]]
-        aliases = []
-        @task.with_timeout(3) do
-          begin
-            IPAddr.new(@config['address'])
-            aliases << @config['address']
-          rescue IPAddr::InvalidAddressError
-            Resolv.each_address(@config['address']) do |address|
-              raise Error, 'Advertised alias budget exceeded' if aliases.length >= 128
-              aliases << address
-            end
-          end
+        @runtime_stage = 'network_start'
+        policy = NetworkConfiguration.new(@config)
+        policy.inventory!(@config) unless policy.ip? && @helper_owner && ENV['SKVOZ_BOOTSTRAPPED'] == '1'
+        profile_path = File.join(@state.directory, 'network-profile.json')
+        profile = JSON.generate(@state.profile(policy))
+        raise Error, 'Network startup configuration exceeds limit' if profile.bytesize > 32768
+        PrivateFiles.write(profile_path, profile)
+        control, child_control = UNIXSocket.pair
+        control.nonblock = child_control.nonblock = true
+        argv = [@config['runtime_binary'], '--config', profile_path, '--control-fd', '3']
+        descriptors = { 3 => child_control }
+        raise Error, 'Unexpected helper for TCP-only server' if !policy.ip? && @helper_owner
+        if policy.ip?
+          raise Error, 'Missing inherited helper owner' unless @helper_owner && @helper_pid && ENV['SKVOZ_BOOTSTRAPPED'] == '1'
+          helper = @helper_owner
+          descriptors[4] = helper
+          argv.concat(['--helper-fd', '4'])
         end
-        aliases.each do |address|
-          own << [address, @config['port']]
-          own << [address, @config['advertised_port']]
-        end
-        if @config.tls['mode'] == 'acme'
-          own << [@config.tls['challenge_host'], @config.tls['challenge_port']]
-          aliases.each do |address|
-            own << [address, @config.tls['challenge_port']]
-            own << [address, @config.tls['challenge_public_port']]
-          end
-        end
-        own = own.filter_map { |host, port| [host, port] if IPAddr.new(host) rescue nil }
-        policy = Policy.new(allow: @config['allow'], deny: @config['deny'], own_endpoints: own)
-        streams = @config['max_streams']
-        @runtime_stage = 'connector_start'
-        @connector = TCPConnector.new(path: @core_path, policy:, limits: { streams:, tcp_buffer_bytes: @config['tcp_buffer_bytes'], stream_frames: @config['stream_queue_frames'], stream_bytes: @config['stream_queue_bytes'], event_frames: streams * @config['stream_queue_frames'], event_bytes: streams * @config['stream_queue_bytes'] }).start(@task)
+        @runtime = ChildProcess.new(argv, label: 'network', descriptors:).start(@task)
+        @children << @runtime
+        child_control.close
+        helper&.close
+        @connector = RuntimeControl.new(control).start(@task)
+        wait_ready { @connector.refresh; @connector.ready? }
         @runtime_stage = 'enrollment_start'
         start_enrollment
         @failure = nil
@@ -231,6 +201,12 @@ module Skvoz
         @healthy = @tls.valid?
         @runtime_stage = 'running'
         Diagnostics.emit('runtime_ready', revision: @state.revision)
+      rescue StandardError
+        control&.close unless control&.closed?
+        raise
+      ensure
+        child_control&.close unless child_control&.closed?
+        helper&.close unless helper&.closed?
       end
 
       def start_enrollment
@@ -239,7 +215,7 @@ module Skvoz
             raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
             candidate, id = @state.enroll(login, token)
             apply(candidate) if candidate
-            { v: 1, namespace: @config['namespace'], peer_id: id, daemon: '1.4.0', ipc: 1 }
+            { v: 2, namespace: @config['namespace'], peer_id: id, network_runtime: { network: 2, api: 1, version: '0.1.0', core: '3.1.0' } }
           end
         end.start(@task)
       end
@@ -452,15 +428,23 @@ module Skvoz
         end
       end
 
-      def children_alive? = @nats&.alive? && (@core.nil? || @core.alive?)
+      def children_alive?
+        if @helper_pid && !@helper_status
+          result = Process.waitpid2(@helper_pid, Process::WNOHANG)
+          @helper_status = result.last if result
+        end
+        @nats&.alive? && (@runtime.nil? || @runtime.alive?) && @helper_status.nil?
+      rescue Errno::ECHILD
+        @helper_status = :reaped
+        false
+      end
       def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       def sleep_until(deadline)
         @task.sleep([0.1, deadline - monotonic].min) while !@stopping && monotonic < deadline
       end
 
-      def stop_children
-        deadline = monotonic + @config['stop_timeout']
+      def stop_children(deadline = monotonic + @config['stop_timeout'])
         @children.each { |child| child.signal('TERM') }
         @children.each { |child| child.stop(deadline) }
         @children.clear
@@ -486,17 +470,42 @@ module Skvoz
         File.unlink(path)
       end
 
+      def reap_exited_children
+        loop { break unless Process.waitpid(-1, Process::WNOHANG) }
+      rescue Errno::ECHILD
+        nil
+      end
+
       def shutdown
+        deadline = monotonic + @config['stop_timeout']
         stop
         @listener&.close
-        @connector&.stop
+        @enrollment&.stop
+        begin
+          @connector&.prepare_shutdown(timeout: [5, deadline - monotonic].min)
+        rescue Error
+          @failure = 'network_shutdown_failed'
+        ensure
+          @connector&.stop
+        end
         @admin_clients.each { |task| task.stop if task.alive? }
         @admin_task&.stop if @admin_task&.alive?
-        stop_children
+        @helper_owner&.close unless @helper_owner&.closed?
+        stop_children(deadline)
         if @admin_path && File.socket?(@admin_path)
           stat = File.lstat(@admin_path)
           File.unlink(@admin_path) if @socket_identity[@admin_path] == [stat.dev, stat.ino]
         end
+        if @helper_pid
+          while !@helper_status && monotonic < deadline
+            result = Process.waitpid2(@helper_pid, Process::WNOHANG)
+            @helper_status = result.last if result
+            @task.sleep(0.02) unless @helper_status
+          end
+          raise Error, 'Helper cleanup deadline exceeded; container restart required' unless @helper_status.is_a?(Process::Status) && @helper_status.success?
+        end
+        # PID1 also reaps adopted short-lived descendants after owned children.
+        reap_exited_children
         @state.close
       end
     end

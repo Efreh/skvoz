@@ -1,7 +1,6 @@
 use adw::prelude::*;
 use skvoz_ubuntu_client::{
     backend::{Control, Engine, run},
-    proxy::Budgets,
     settings::{Settings, token},
     ui::View,
 };
@@ -161,11 +160,6 @@ fn qualify_desktop(view: &std::rc::Rc<View>) {
         .collect::<Vec<_>>();
     assert!(names.contains(&"Показать SKVOZ".into()));
     assert!(names.contains(&"Завершить SKVOZ".into()));
-    assert!(
-        !names
-            .iter()
-            .any(|text| text.contains("прокси") || text.contains("VPN"))
-    );
     view.window.close();
     tick(Duration::from_millis(50));
     assert!(!view.window.is_visible());
@@ -385,11 +379,7 @@ fn native_window_settings_and_backend_error() {
     app.register(None::<&gtk::gio::Cancellable>).unwrap();
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let (status_tx, status_rx) = std::sync::mpsc::sync_channel(32);
-    let engine = Engine::new(
-        settings.clone(),
-        "/does-not-exist".into(),
-        Budgets::default(),
-    );
+    let engine = Engine::new(settings.clone(), "/does-not-exist".into());
     let worker = std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -445,6 +435,15 @@ fn native_window_settings_and_backend_error() {
     tick(Duration::from_millis(200));
     let dialog = view.settings_window.borrow().clone().unwrap();
     let all = widgets(dialog.upcast_ref());
+    let mode = all
+        .iter()
+        .filter_map(|widget| widget.clone().downcast::<adw::ComboRow>().ok())
+        .find(|row| row.title() == "Режим")
+        .unwrap();
+    let choices = mode.model().unwrap().downcast::<gtk::StringList>().unwrap();
+    assert_eq!(choices.n_items(), 2);
+    assert_eq!(choices.string(0).unwrap(), "Прокси");
+    assert_eq!(choices.string(1).unwrap(), "ВПН");
     let rows: Vec<adw::EntryRow> = all
         .iter()
         .filter_map(|widget| widget.clone().downcast::<adw::EntryRow>().ok())

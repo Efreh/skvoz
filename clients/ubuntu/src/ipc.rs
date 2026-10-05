@@ -1,397 +1,414 @@
+//! Bounded API1 control owner. Payload never crosses this channel.
 use crate::{Error, Result};
-use std::{collections::VecDeque, path::Path, time::Duration};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
+use serde_json::{Value, json};
+use skvoz_network::local_api::{Event, HelperResponse, Response, parse_strict_json};
+use skvoz_network_native::{ControlFrame, IncrementalUnix};
+use std::{
+    collections::VecDeque,
+    os::fd::OwnedFd,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
-pub const OPENED: u16 = 0x9002;
-pub const REJECTED: u16 = 0x9003;
-pub const DATA: u16 = 0x9004;
-pub const WRITABLE: u16 = 0x9005;
-pub const REMOTE_FINISHED: u16 = 0x9006;
-pub const CLOSED: u16 = 0x9007;
-#[derive(Debug)]
-pub struct Event {
-    pub kind: u16,
-    pub handle: u128,
-    pub payload: Vec<u8>,
-}
-pub struct Reply {
-    pub code: u16,
-    pub value: u64,
-    pub handle: u128,
-    pub extra: Vec<u8>,
-}
-pub struct Session {
-    socket: UnixStream,
-    sequence: u64,
-    events: VecDeque<Event>,
-    bytes: usize,
-    count: usize,
-    frames: usize,
-    byte_limit: usize,
-}
-impl Session {
-    pub async fn connect(path: &Path, frames: usize, bytes: usize) -> Result<Self> {
-        let socket = UnixStream::connect(path).await?;
-        let mut session = Self {
-            socket,
-            sequence: 0,
-            events: VecDeque::new(),
-            bytes: 0,
-            count: 0,
-            frames,
-            byte_limit: bytes,
-        };
-        let reply = session.request(1, 0, &[0, 1, 0, 1, 0], &[0]).await?;
-        if reply.extra.len() != 46 || reply.extra[..2] != [0, 1] {
-            return Err(Error("version_mismatch"));
-        }
-        Ok(session)
-    }
-    async fn frame(&mut self) -> Result<(u16, u64, u128, Vec<u8>)> {
-        read_frame(&mut self.socket).await
-    }
-    pub async fn request(
-        &mut self,
-        kind: u16,
-        handle: u128,
-        payload: &[u8],
-        allowed: &[u16],
-    ) -> Result<Reply> {
-        if payload.len() > 65536 {
-            return Err(Error("ipc_failed"));
-        }
-        self.sequence = self.sequence.checked_add(1).ok_or(Error("ipc_failed"))?;
-        let operation = async {
-            let mut body = Vec::with_capacity(payload.len() + 36);
-            body.extend_from_slice(&((32 + payload.len()) as u32).to_be_bytes());
-            body.extend_from_slice(b"SKI1");
-            body.extend_from_slice(&1u16.to_be_bytes());
-            body.extend_from_slice(&kind.to_be_bytes());
-            body.extend_from_slice(&self.sequence.to_be_bytes());
-            body.extend_from_slice(&handle.to_be_bytes());
-            body.extend_from_slice(payload);
-            self.socket.write_all(&body).await?;
-            loop {
-                let (kind, request, handle, mut payload) = self.frame().await?;
-                if kind == 0x8000 {
-                    if request != self.sequence || payload.len() < 10 {
-                        return Err(Error("ipc_failed"));
-                    }
-                    let code = u16::from_be_bytes(
-                        payload[..2].try_into().map_err(|_| Error("ipc_failed"))?,
-                    );
-                    let value = u64::from_be_bytes(
-                        payload[2..10].try_into().map_err(|_| Error("ipc_failed"))?,
-                    );
-                    if !allowed.contains(&code) {
-                        return Err(Error("ipc_failed"));
-                    }
-                    return Ok(Reply {
-                        code,
-                        value,
-                        handle,
-                        extra: payload.split_off(10),
-                    });
-                }
-                self.enqueue(kind, request, handle, payload)?;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(5), operation)
-            .await
-            .map_err(|_| Error("ipc_failed"))?
-    }
-    fn enqueue(&mut self, kind: u16, request: u64, handle: u128, payload: Vec<u8>) -> Result<()> {
-        if !(OPENED..=CLOSED).contains(&kind)
-            || request != 0
-            || handle == 0
-            || self.count >= self.frames
-            || self.bytes + payload.len() > self.byte_limit
-        {
-            return Err(Error("ipc_overflow"));
-        }
-        self.count += 1;
-        self.bytes += payload.len();
-        self.events.push_back(Event {
-            kind,
-            handle,
-            payload,
-        });
-        Ok(())
-    }
-    pub async fn event(&mut self) -> Result<Event> {
-        if let Some(event) = self.events.pop_front() {
-            return Ok(event);
-        }
-        let (kind, request, handle, payload) = self.frame().await?;
-        self.enqueue(kind, request, handle, payload)?;
-        self.events.pop_front().ok_or(Error("ipc_failed"))
-    }
-    pub async fn close(&mut self) {
-        let _ = self.socket.shutdown().await;
-    }
-}
-
-async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> Result<(u16, u64, u128, Vec<u8>)> {
-    let size = reader.read_u32().await? as usize;
-    if !(32..=65568).contains(&size) {
-        return Err(Error("ipc_failed"));
-    }
-    let mut body = vec![0; size];
-    reader.read_exact(&mut body).await?;
-    if &body[..4] != b"SKI1" || body[4..6] != [0, 1] {
-        return Err(Error("ipc_failed"));
-    }
-    let kind = u16::from_be_bytes(body[6..8].try_into().map_err(|_| Error("ipc_failed"))?);
-    let request = u64::from_be_bytes(body[8..16].try_into().map_err(|_| Error("ipc_failed"))?);
-    let handle = u128::from_be_bytes(body[16..32].try_into().map_err(|_| Error("ipc_failed"))?);
-    Ok((kind, request, handle, body.split_off(32)))
-}
-
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
-type Pending = Arc<Mutex<Option<(u64, oneshot::Sender<Reply>)>>>;
+use tokio::sync::{mpsc, oneshot, watch};
 struct Command {
-    kind: u16,
-    handle: u128,
-    payload: Vec<u8>,
-    allowed: Vec<u16>,
-    reply: oneshot::Sender<Result<Reply>>,
+    op: String,
+    args: Value,
+    fd: Option<OwnedFd>,
+    reply: oneshot::Sender<Result<ControlFrame>>,
 }
-#[derive(Clone)]
-pub struct Commands(mpsc::Sender<Command>);
-pub struct AccountedEvent {
-    pub event: Event,
-    bytes: Arc<AtomicUsize>,
+struct AccountedEvent {
+    event: Event,
+    bytes: usize,
+    usage: Arc<AtomicUsize>,
     count: Arc<AtomicUsize>,
 }
 impl Drop for AccountedEvent {
     fn drop(&mut self) {
-        self.bytes
-            .fetch_sub(self.event.payload.len(), Ordering::Relaxed);
+        self.usage.fetch_sub(self.bytes, Ordering::Relaxed);
         self.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
-pub struct Owner {
-    pub commands: Commands,
-    pub events: mpsc::Receiver<AccountedEvent>,
-    pub failed: watch::Receiver<bool>,
+pub struct Session {
+    commands: mpsc::Sender<Command>,
+    events: mpsc::Receiver<AccountedEvent>,
+    failed: watch::Receiver<bool>,
     task: tokio::task::JoinHandle<()>,
+    queued: VecDeque<AccountedEvent>,
 }
-impl Drop for Owner {
+impl Session {
+    pub fn new(fd: OwnedFd, helper: bool) -> Result<Self> {
+        let mut socket = IncrementalUnix::from_owned_fd(fd)?;
+        if helper && socket.peer_credentials()?.uid != 0 {
+            return Err(Error("helper_untrusted"));
+        }
+        let (commands, mut input) = mpsc::channel::<Command>(1);
+        let (events, receiver) = mpsc::channel(128);
+        let (failure, failed) = watch::channel(false);
+        let usage = Arc::new(AtomicUsize::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(async move {
+            let mut id = 0u32;
+            let mut seq = 0;
+            let mut pending: Option<(
+                u32,
+                std::time::Instant,
+                oneshot::Sender<Result<ControlFrame>>,
+            )> = None;
+            let mut timer = tokio::time::interval(Duration::from_millis(5));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let run = async {
+                loop {
+                    tokio::select! {
+                        command = input.recv(), if pending.is_none() => {
+                            let Some(command) = command else { return Ok::<(),Error>(()); };
+                            id = id.checked_add(1).filter(|n| *n <= 2147483647).ok_or(Error("ipc_failed"))?;
+                            let body = serde_json::to_vec(&json!({"v":1,"id":id,"op":command.op,"args":command.args,"fd_count":u8::from(command.fd.is_some())})).map_err(|_|Error("ipc_failed"))?;
+                            socket.queue_frame(body, command.fd)?;
+                            pending = Some((id, std::time::Instant::now()+Duration::from_secs(5), command.reply));
+                        },
+                        _ = timer.tick() => {},
+                    }
+                    if pending
+                        .as_ref()
+                        .is_some_and(|(_, deadline, _)| std::time::Instant::now() >= *deadline)
+                    {
+                        return Err(Error("ipc_timeout"));
+                    }
+                    socket.check_deadlines()?;
+                    if socket.write_pending() {
+                        match socket.try_flush() {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    loop {
+                        let frame = match socket.try_receive_frame() {
+                            Ok(frame) => frame,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) => return Err(e.into()),
+                        };
+                        let value =
+                            parse_strict_json(&frame.body).map_err(|_| Error("ipc_failed"))?;
+                        if value.get("event").is_some() && !helper {
+                            let event =
+                                Event::parse_json(&frame.body).map_err(|_| Error("ipc_failed"))?;
+                            if event.v != 1
+                                || !matches!(
+                                    event.event.as_str(),
+                                    "RUNTIME_STATE"
+                                        | "CONFIGURED"
+                                        | "ACTIVE"
+                                        | "CLOSED"
+                                        | "STATS"
+                                        | "REQUEST"
+                                )
+                                || event.seq <= seq
+                                || event.seq > i64::MAX as u64
+                                || event.fd_count != 0
+                                || frame.fd.is_some()
+                            {
+                                return Err(Error("ipc_failed"));
+                            }
+                            seq = event.seq;
+                            let bytes = frame.body.len();
+                            if count.load(Ordering::Relaxed) >= 128
+                                || usage.load(Ordering::Relaxed) + bytes > 131072
+                            {
+                                return Err(Error("ipc_overflow"));
+                            }
+                            usage.fetch_add(bytes, Ordering::Relaxed);
+                            count.fetch_add(1, Ordering::Relaxed);
+                            events
+                                .try_send(AccountedEvent {
+                                    event,
+                                    bytes,
+                                    usage: usage.clone(),
+                                    count: count.clone(),
+                                })
+                                .map_err(|_| Error("ipc_overflow"))?;
+                        } else {
+                            let (expected, _, reply) = pending.take().ok_or(Error("ipc_failed"))?;
+                            let (v, received, count, valid) = if helper {
+                                let r = HelperResponse::parse_json(&frame.body)
+                                    .map_err(|_| Error("ipc_failed"))?;
+                                (
+                                    r.v,
+                                    r.id,
+                                    r.fd_count,
+                                    r.result.is_some() != r.error.is_some(),
+                                )
+                            } else {
+                                let r = Response::parse_json(&frame.body)
+                                    .map_err(|_| Error("ipc_failed"))?;
+                                (
+                                    r.v,
+                                    r.id,
+                                    r.fd_count,
+                                    r.result.is_some() != r.error.is_some(),
+                                )
+                            };
+                            if v != 1
+                                || received != expected
+                                || count != u8::from(frame.fd.is_some())
+                                || !valid
+                            {
+                                return Err(Error("ipc_failed"));
+                            }
+                            // A cancelled caller still leaves the actor draining its response.
+                            let _ = reply.send(Ok(frame));
+                        }
+                    }
+                }
+            };
+            let _ = run.await;
+            let _ = failure.send(true);
+        });
+        Ok(Self {
+            commands,
+            events: receiver,
+            failed,
+            task,
+            queued: VecDeque::new(),
+        })
+    }
+    pub async fn request(
+        &self,
+        op: &str,
+        args: Value,
+        fd: Option<OwnedFd>,
+    ) -> Result<ControlFrame> {
+        let (reply, answer) = oneshot::channel();
+        let command = Command {
+            op: op.into(),
+            args,
+            fd,
+            reply,
+        };
+        tokio::time::timeout(Duration::from_secs(6), async {
+            self.commands
+                .send(command)
+                .await
+                .map_err(|_| Error("ipc_failed"))?;
+            answer.await.map_err(|_| Error("ipc_failed"))?
+        })
+        .await
+        .map_err(|_| Error("ipc_timeout"))?
+    }
+    pub async fn call(&self, op: &str, args: Value) -> Result<Value> {
+        let frame = self.request(op, args, None).await?;
+        if frame.fd.is_some() {
+            return Err(Error("ipc_failed"));
+        }
+        let r = Response::parse_json(&frame.body).map_err(|_| Error("ipc_failed"))?;
+        r.result.ok_or_else(|| api_error(r.error))
+    }
+    pub async fn helper_call(&self, op: &str, args: Value) -> Result<ControlFrame> {
+        let expected_handle = args.get("handle").cloned();
+        let frame = self.request(op, args, None).await?;
+        let r = HelperResponse::parse_json(&frame.body).map_err(|_| Error("ipc_failed"))?;
+        if r.error.is_some() {
+            return Err(Error("helper_failed"));
+        }
+        if r.fd_count != u8::from(op == "PREPARE_CLIENT") {
+            return Err(Error("helper_failed"));
+        }
+        if op == "HELLO" && r.result != Some(json!({"api":1,"network":2,"role":"client"})) {
+            return Err(Error("version_mismatch"));
+        }
+        if matches!(op, "ACTIVATE_CLIENT" | "ABORT_CLIENT" | "RESTORE_CLIENT")
+            && r.result != Some(json!({"handle":expected_handle.ok_or(Error("helper_failed"))?}))
+        {
+            return Err(Error("helper_failed"));
+        }
+        Ok(frame)
+    }
+    pub async fn wait_event(&mut self, name: &str) -> Result<Event> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let event = tokio::time::timeout_at(deadline, self.events.recv())
+                .await
+                .map_err(|_| Error("network_timeout"))?
+                .ok_or(Error("ipc_failed"))?;
+            if event.event.event == name {
+                return Ok(event.event.clone());
+            }
+            if event.event.event == "CLOSED" {
+                let closed: skvoz_network::local_api::ClosedEvent =
+                    skvoz_network::local_api::arguments(&event.event.data)
+                        .map_err(|_| Error("ipc_failed"))?;
+                return Err(api_error(closed.error));
+            }
+            if self.queued.len() >= 128 {
+                return Err(Error("ipc_overflow"));
+            }
+            self.queued.push_back(event);
+        }
+    }
+    pub fn drain(&mut self) -> Vec<Event> {
+        let mut output: Vec<_> = self.queued.drain(..).map(|e| e.event.clone()).collect();
+        while let Ok(event) = self.events.try_recv() {
+            output.push(event.event.clone());
+        }
+        output
+    }
+    pub fn healthy(&self) -> bool {
+        !*self.failed.borrow()
+    }
+}
+impl Drop for Session {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
-impl Commands {
-    pub async fn request(
-        &self,
-        kind: u16,
-        handle: u128,
-        payload: &[u8],
-        allowed: &[u16],
-    ) -> Result<Reply> {
-        if payload.len() > 65536 {
-            return Err(Error("ipc_failed"));
-        }
-        let (reply, answer) = oneshot::channel();
-        let operation = async {
-            self.0
-                .send(Command {
-                    kind,
-                    handle,
-                    payload: payload.to_vec(),
-                    allowed: allowed.to_vec(),
-                    reply,
-                })
-                .await
-                .map_err(|_| Error("ipc_failed"))?;
-            answer.await.map_err(|_| Error("ipc_failed"))?
-        };
-        tokio::time::timeout(Duration::from_secs(5), operation)
-            .await
-            .map_err(|_| Error("ipc_failed"))?
-    }
-}
-impl Owner {
-    pub async fn connect(path: &Path, frames: usize, byte_limit: usize) -> Result<Self> {
-        let session = Session::connect(path, frames, byte_limit).await?;
-        let (mut reader, mut writer) = session.socket.into_split();
-        let mut sequence = session.sequence;
-        let pending: Pending = Arc::new(Mutex::new(None));
-        let (tx, mut commands) = mpsc::channel::<Command>(8);
-        let (events, receiver) = mpsc::channel(frames);
-        let bytes = Arc::new(AtomicUsize::new(0));
-        let count = Arc::new(AtomicUsize::new(0));
-        let (failure, failed) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            // The read future owns partial frames for its entire lifetime. It remains
-            // polled while the writer awaits replies, so SEND and DATA cannot deadlock.
-            let read = async {
-                loop {
-                    let (kind, request, handle, mut payload) = read_frame(&mut reader).await?;
-                    if kind == 0x8000 {
-                        if payload.len() < 10 {
-                            return Err(Error("ipc_failed"));
-                        }
-                        let (expected, reply) =
-                            pending.lock().await.take().ok_or(Error("ipc_failed"))?;
-                        if request != expected {
-                            return Err(Error("ipc_failed"));
-                        }
-                        let code = u16::from_be_bytes(
-                            payload[..2].try_into().map_err(|_| Error("ipc_failed"))?,
-                        );
-                        let value = u64::from_be_bytes(
-                            payload[2..10].try_into().map_err(|_| Error("ipc_failed"))?,
-                        );
-                        reply
-                            .send(Reply {
-                                code,
-                                value,
-                                handle,
-                                extra: payload.split_off(10),
-                            })
-                            .map_err(|_| Error("ipc_failed"))?;
-                    } else {
-                        if !(OPENED..=CLOSED).contains(&kind)
-                            || request != 0
-                            || handle == 0
-                            || count.load(Ordering::Relaxed) >= frames
-                            || bytes.load(Ordering::Relaxed) + payload.len() > byte_limit
-                        {
-                            return Err(Error("ipc_overflow"));
-                        }
-                        bytes.fetch_add(payload.len(), Ordering::Relaxed);
-                        count.fetch_add(1, Ordering::Relaxed);
-                        events
-                            .try_send(AccountedEvent {
-                                event: Event {
-                                    kind,
-                                    handle,
-                                    payload,
-                                },
-                                bytes: bytes.clone(),
-                                count: count.clone(),
-                            })
-                            .map_err(|_| Error("ipc_overflow"))?;
-                    }
-                }
-                #[allow(unreachable_code)]
-                Ok::<(), Error>(())
-            };
-            let write = async {
-                while let Some(command) = commands.recv().await {
-                    if command.reply.is_closed() {
-                        continue;
-                    }
-                    sequence = sequence.checked_add(1).ok_or(Error("ipc_failed"))?;
-                    let (reply, answer) = oneshot::channel();
-                    *pending.lock().await = Some((sequence, reply));
-                    let mut frame = Vec::with_capacity(command.payload.len() + 36);
-                    frame.extend_from_slice(&((32 + command.payload.len()) as u32).to_be_bytes());
-                    frame.extend_from_slice(b"SKI1");
-                    frame.extend_from_slice(&1u16.to_be_bytes());
-                    frame.extend_from_slice(&command.kind.to_be_bytes());
-                    frame.extend_from_slice(&sequence.to_be_bytes());
-                    frame.extend_from_slice(&command.handle.to_be_bytes());
-                    frame.extend_from_slice(&command.payload);
-                    writer.write_all(&frame).await?;
-                    let reply = tokio::time::timeout(Duration::from_secs(5), answer)
-                        .await
-                        .map_err(|_| Error("ipc_failed"))?
-                        .map_err(|_| Error("ipc_failed"))?;
-                    if !command.allowed.contains(&reply.code) {
-                        return Err(Error("ipc_failed"));
-                    }
-                    let _ = command.reply.send(Ok(reply));
-                }
-                Ok::<(), Error>(())
-            };
-            tokio::select! {
-                _ = read => {},
-                _ = write => {},
-            }
-            let _ = failure.send(true);
-        });
-        Ok(Self {
-            commands: Commands(tx),
-            events: receiver,
-            failed,
-            task,
-        })
-    }
+
+pub(crate) fn api_error(error: Option<skvoz_network::local_api::ApiError>) -> Error {
+    use skvoz_network::local_api::ApiError;
+    Error(match error {
+        Some(ApiError::UnsupportedVersion) => "version_mismatch",
+        Some(ApiError::InvalidRequest) => "invalid_request",
+        Some(ApiError::InvalidState) => "invalid_state",
+        Some(ApiError::UnknownHandle) => "unknown_handle",
+        Some(ApiError::Forbidden) => "forbidden",
+        Some(ApiError::Overloaded) => "overloaded",
+        Some(ApiError::LocalSetupFailed) => "local_setup_failed",
+        Some(ApiError::Timeout) => "network_timeout",
+        _ => "network_unavailable",
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skvoz_network_native::FramedUnix;
     #[tokio::test]
-    async fn idle_reader_does_not_block_commands() {
-        let path =
-            std::env::temp_dir().join(format!("skvoz-ipc-{}", crate::settings::token().unwrap()));
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            for expected in [1, 5, 5] {
-                let (kind, sequence, handle, payload) = read_frame(&mut socket).await.unwrap();
-                assert_eq!(kind, expected);
-                let mut extra = Vec::new();
-                let value = if kind == 1 {
-                    extra.resize(46, 0);
-                    extra[1] = 1;
-                    0u64
-                } else {
-                    assert!(payload == b"hello" || payload == vec![0xa5; 65536]);
-                    payload.len() as u64
-                };
-                let mut frame = Vec::new();
-                frame.extend_from_slice(&((42 + extra.len()) as u32).to_be_bytes());
-                frame.extend_from_slice(b"SKI1");
-                frame.extend_from_slice(&1u16.to_be_bytes());
-                frame.extend_from_slice(&0x8000u16.to_be_bytes());
-                frame.extend_from_slice(&sequence.to_be_bytes());
-                frame.extend_from_slice(&handle.to_be_bytes());
-                frame.extend_from_slice(&0u16.to_be_bytes());
-                frame.extend_from_slice(&value.to_be_bytes());
-                frame.extend_from_slice(&extra);
-                socket.write_all(&frame).await.unwrap();
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+    async fn owner_reads_events_while_waiting_for_correlated_reply() {
+        let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+        local.set_nonblocking(true).unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut channel = FramedUnix::from_owned_fd(remote.into()).unwrap();
+            let frame = channel
+                .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            let request: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(request["op"], "HELLO");
+            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":3,"event":"RUNTIME_STATE","data":{"state":"ready","error":null},"fd_count":0})).unwrap(),None).unwrap();
+            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":5,"event":"STATS","data":{"counters":skvoz_network::local_api::Counters::default()},"fd_count":0})).unwrap(),None).unwrap();
+            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"id":request["id"],"result":{"api":1,"network":2},"error":null,"fd_count":0})).unwrap(),None).unwrap();
+            channel
+                .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            channel
+                .send_frame(
+                    &serde_json::to_vec(
+                        &json!({"v":1,"id":2,"result":{},"error":null,"fd_count":0}),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
         });
-        let owner = Owner::connect(&path, 32, 16384).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let reply = tokio::time::timeout(
-            Duration::from_millis(500),
-            owner.commands.request(5, 1, b"hello", &[0]),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(reply.value, 5);
-        let bulk = vec![0xa5; 65536];
+        let mut session = Session::new(local.into(), false).unwrap();
         assert_eq!(
-            owner
-                .commands
-                .request(5, 1, &bulk, &[0])
+            session
+                .call("HELLO", json!({"api":1,"network":2}))
                 .await
-                .unwrap()
-                .value,
-            65536
+                .unwrap()["api"],
+            1
         );
+        assert_eq!(session.wait_event("RUNTIME_STATE").await.unwrap().seq, 3);
+        session.call("STATUS", json!({})).await.unwrap();
+        let events = session.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "STATS");
+        assert_eq!(events[0].seq, 5);
+        server.join().unwrap();
+    }
+    #[tokio::test]
+    async fn missing_counter_fields_are_terminal_instead_of_zero_defaults() {
+        let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+        local.set_nonblocking(true).unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut channel = FramedUnix::from_owned_fd(remote.into()).unwrap();
+            channel
+                .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":1,"event":"STATS","data":{"counters":{"tcp_open":1}},"fd_count":0})).unwrap(),None).unwrap();
+        });
+        let session = Session::new(local.into(), false).unwrap();
         assert!(
-            owner
-                .commands
-                .request(5, 1, &vec![0xa5; 65537], &[0])
+            session
+                .call("HELLO", json!({"api":1,"network":2}))
                 .await
                 .is_err()
         );
-        drop(owner);
-        server.abort();
-        std::fs::remove_file(path).unwrap();
+        server.join().unwrap();
+        assert!(!session.healthy());
+    }
+    #[tokio::test]
+    async fn wrong_response_id_terminates_owner() {
+        let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+        local.set_nonblocking(true).unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut channel = FramedUnix::from_owned_fd(remote.into()).unwrap();
+            channel
+                .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            channel
+                .send_frame(
+                    &serde_json::to_vec(
+                        &json!({"v":1,"id":2,"result":{},"error":null,"fd_count":0}),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+        });
+        let session = Session::new(local.into(), false).unwrap();
+        assert!(
+            session
+                .call("HELLO", json!({"api":1,"network":2}))
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+        assert!(!session.healthy());
+    }
+    #[tokio::test]
+    async fn unexpected_received_rights_are_rejected_and_closed() {
+        let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+        local.set_nonblocking(true).unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            use std::os::fd::AsFd;
+            let mut channel = FramedUnix::from_owned_fd(remote.into()).unwrap();
+            let file = std::fs::File::open("/dev/null").unwrap();
+            channel
+                .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            channel
+                .send_frame(
+                    &serde_json::to_vec(
+                        &json!({"v":1,"id":1,"result":{},"error":null,"fd_count":0}),
+                    )
+                    .unwrap(),
+                    Some(file.as_fd()),
+                )
+                .unwrap();
+        });
+        let session = Session::new(local.into(), false).unwrap();
+        assert!(
+            session
+                .call("HELLO", json!({"api":1,"network":2}))
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
     }
 }

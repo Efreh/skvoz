@@ -14,9 +14,30 @@ use std::{
 use tokio::sync::mpsc;
 pub fn message(code: &str) -> &'static str {
     match code {
+        "helper_authorization_failed" => "Не получено системное разрешение для ВПН.",
+        "helper_untrusted" | "helper_failed" => {
+            "Системная служба соединения недоступна. Защита сети сохраняется; повторите отключение."
+        }
+        "guarded_transport_unknown" => {
+            "Сохранённый адрес этого соединения отсутствует. Отключитесь, чтобы восстановить сеть."
+        }
+        "invalid_network_settings" => {
+            "Проверьте семейства адресов и MTU (IPv6 требует MTU не менее 1280)."
+        }
+        "network_unavailable" | "network_timeout" | "ipc_timeout" => {
+            "Соединение с сетевым модулем потеряно."
+        }
         "invalid_address" => "Проверьте IP-адрес или имя сервера.",
         "invalid_port" => "Укажите допустимый порт. Локальный: 1024–65535; серверный: 1–65535.",
         "port_conflict" => "HTTP и SOCKS5 должны использовать разные порты.",
+        "local_setup_failed" => {
+            "Не удалось настроить локальный вход. Проверьте порты и системную службу."
+        }
+        "forbidden" => "Сервер отклонил запрошенное соединение.",
+        "overloaded" => "Достигнут текущий предел соединений. Повторите позже.",
+        "invalid_state" | "invalid_request" | "unknown_handle" => {
+            "Сетевой модуль отклонил состояние соединения. Отключитесь и повторите подключение."
+        }
         "port_busy" => "Локальный порт занят. Измените его в настройках.",
         "invalid_login" => "Логин: латинские буквы, цифры, дефис или подчёркивание.",
         "invalid_password" => "Пароль должен содержать от 12 до 72 байт UTF-8.",
@@ -40,6 +61,7 @@ pub fn state_name(state: &str) -> &'static str {
         "connecting" => "Подключение…",
         "connected" => "Подключено",
         "reconnecting" => "Восстановление соединения…",
+        "guarded" => "Соединение потеряно · сеть заблокирована",
         "error" => "Не удалось подключиться",
         _ => "Отключено",
     }
@@ -392,7 +414,9 @@ impl View {
             let Some(captured) = captured.upgrade() else {
                 return;
             };
-            if ["connecting", "connected", "reconnecting"].contains(&captured.state.get()) {
+            if ["connecting", "connected", "reconnecting", "guarded"]
+                .contains(&captured.state.get())
+            {
                 let _ = captured.commands.try_send(Control::Disconnect);
             } else {
                 let password = captured.password.text().to_string();
@@ -430,7 +454,7 @@ impl View {
         Ok(view)
     }
     pub fn active(&self) -> bool {
-        ["connecting", "connected", "reconnecting"].contains(&self.state.get())
+        ["connecting", "connected", "reconnecting", "guarded"].contains(&self.state.get())
     }
     pub fn settings_value(&self) -> Option<crate::settings::Preferences> {
         self.settings.lock().ok().map(|s| s.value.clone())
@@ -562,11 +586,16 @@ impl View {
     }
     pub fn apply(&self, status: &Status) {
         self.state.set(status.state);
+        let proxy = self
+            .settings_value()
+            .is_some_and(|s| s.mode == crate::settings::Mode::Proxy);
+        self.http.set_visible(proxy);
+        self.socks.set_visible(proxy);
         self.status.set_label(state_name(status.state));
         self.status_icon.set_icon_name(Some(match status.state {
             "connected" => "network-transmit-receive-symbolic",
             "connecting" | "reconnecting" => "network-idle-symbolic",
-            "error" => "network-error-symbolic",
+            "error" | "guarded" => "network-error-symbolic",
             _ => "network-offline-symbolic",
         }));
         for class in ["success", "warning", "error"] {
@@ -574,12 +603,12 @@ impl View {
         }
         if status.state == "connected" {
             self.status_icon.add_css_class("success");
-        } else if status.state == "error" {
+        } else if status.state == "error" || status.state == "guarded" {
             self.status_icon.add_css_class("error");
         } else if status.state == "connecting" || status.state == "reconnecting" {
             self.status_icon.add_css_class("warning");
         }
-        let active = ["connecting", "connected", "reconnecting"].contains(&status.state);
+        let active = ["connecting", "connected", "reconnecting", "guarded"].contains(&status.state);
         self.button.set_label(if active {
             "Отключиться"
         } else {
@@ -645,6 +674,43 @@ impl View {
         save.add_css_class("suggested-action");
 
         page.add(&group);
+        let network = adw::PreferencesGroup::builder()
+            .title("Режим соединения")
+            .build();
+        let mode = adw::ComboRow::builder()
+            .title("Режим")
+            .model(&gtk::StringList::new(&["Прокси", "ВПН"]))
+            .selected(u32::from(value.mode == crate::settings::Mode::Vpn))
+            .build();
+        let families = adw::ComboRow::builder()
+            .title("Семейства адресов")
+            .model(&gtk::StringList::new(&[
+                "IPv4 и IPv6",
+                "Только IPv4",
+                "Только IPv6",
+            ]))
+            .selected(match value.families.as_slice() {
+                [4] => 1,
+                [6] => 2,
+                _ => 0,
+            })
+            .build();
+        let mtu = adw::EntryRow::builder()
+            .title("MTU")
+            .text(value.max_mtu.to_string())
+            .build();
+        network.add(&mode);
+        network.add(&families);
+        network.add(&mtu);
+        network.add(
+            &adw::ActionRow::builder()
+                .title("ВПН требует разрешения системы")
+                .subtitle(
+                    "При потере соединения сеть остаётся заблокированной до явного отключения.",
+                )
+                .build(),
+        );
+        page.add(&network);
         let advanced=adw::PreferencesGroup::builder().title("Дополнительно").description("По умолчанию используются системные доверенные сертификаты. Для частного сервера укажите PEM-файл CA, полученный от администратора.").build();
         let ca = adw::EntryRow::builder()
             .title("Файл частного CA (необязательно)")
@@ -699,13 +765,31 @@ impl View {
                 value.http_port = port(&http.text(), true)?;
                 value.socks_port = port(&socks.text(), true)?;
                 value.ca_file = ca.text().trim().to_owned();
+                value.mode = if mode.selected() == 1 {
+                    crate::settings::Mode::Vpn
+                } else {
+                    crate::settings::Mode::Proxy
+                };
+                value.families = match families.selected() {
+                    1 => vec![4],
+                    2 => vec![6],
+                    _ => vec![4, 6],
+                };
+                value.max_mtu = mtu
+                    .text()
+                    .parse()
+                    .map_err(|_| Error("invalid_network_settings"))?;
+                value.validate_network()?;
                 if value.ca_file.len() > 4096 {
                     return Err(Error("invalid_ca"));
                 }
                 if captured.active()
                     && (value.http_port != settings.value.http_port
                         || value.socks_port != settings.value.socks_port
-                        || value.ca_file != settings.value.ca_file)
+                        || value.ca_file != settings.value.ca_file
+                        || value.mode != settings.value.mode
+                        || value.families != settings.value.families
+                        || value.max_mtu != settings.value.max_mtu)
                 {
                     return Err(Error("already_connected"));
                 }

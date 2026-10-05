@@ -1,83 +1,72 @@
 # frozen_string_literal: true
 require_relative 'spec_helper'
 
-RSpec.describe 'Server destination and persistent identity contract' do
+RSpec.describe 'Server network and durable identity contract' do
+  def value
+    { 'address' => 'example.org', 'tls' => { 'email' => 'test@example.com', 'terms_agreed' => true } }
+  end
 
-  it 'preserves public IPC vectors in its encoder and decoder' do
-    path = File.expand_path('../../../daemon/tests/fixtures/ipc-v1.tsv', __dir__)
-    count = 0
-    File.foreach(path) do |line|
-      next if line.start_with?('#') || line.strip.empty?
-      _name, hex = line.strip.split("\t")
-      encoded = [hex].pack('H*')
-      body = encoded.byteslice(4..)
-      _magic, _version, kind, request, high, low = body.unpack('a4nnQ>Q>Q>')
-      frame = Skvoz::Server::Protocol.encode(kind, request, (high << 64) | low, body.byteslice(32..))
-      expect(frame.unpack1('H*')).to eq(hex)
-      count += 1
+  it 'requires current settings and rejects removed dataplane settings and old rules' do
+    %w[core_binary receive_window stream_queue_bytes tcp_buffer_bytes].each do |key|
+      expect { Skvoz::Server::Configuration.new(value.merge(key => 1)) }.to raise_error(Skvoz::Server::Error)
     end
-    expect(count).to eq(5)
+    expect { Skvoz::Server::Configuration.new(value.merge('v' => 2)) }.to raise_error(Skvoz::Server::Error)
+    expect { Skvoz::Server::Configuration.new(value.merge('allow' => ['127.0.0.0/8'])) }.to raise_error(Skvoz::Server::Error)
+    expect { Skvoz::Server::Configuration.new(value.merge('max_identities' => 129)) }.to raise_error(Skvoz::Server::Error)
   end
 
-  it 'loads the standalone IPC adapter without destination policy dependencies' do
-    code = 'require "skvoz/server/ipc_session"; abort unless Skvoz::Server::Protocol::OPENED == 0x9002; abort if defined?(Skvoz::Server::Destination)'
-    library = File.expand_path('../lib', __dir__)
-    expect(system(RbConfig.ruby, '-I', library, '-e', code)).to be(true)
+  it 'rejects duplicate fields with the pinned JSON3.0.2 decoder used by settings and API1' do
+    expect(JSON::VERSION).to eq('3.0.2')
+    expect { JSON.parse('{"network":{"families":[],"families":[4]}}', allow_duplicate_key: false) }.to raise_error(JSON::ParserError)
   end
 
-  it 'rejects ambiguous metadata, unicode, invalid port and numeric lookalikes' do
-    [ { v: 1, type: 'tcp', host: '127.1', port: 80 }, { v: 1, type: 'tcp', host: 'münich.example', port: 80 },
-      { v: 1, type: 'tcp', host: '[::1]', port: 80 }, { v: 1, type: 'tcp', host: 'fe80::1%br-example', port: 80 },
-      { v: 1, type: 'tcp', host: 'example.org', port: '80' },
-      { v: 1, type: 'tcp', host: 'example.org', port: 80, password: 'discard' } ].each do |metadata|
-      expect { Skvoz::Server::Destination.new(Skvoz::Server::Protocol.metadata(metadata)) }.to raise_error(Skvoz::Server::DestinationError, 'invalid_destination')
-    end
-    expect { Skvoz::Server::Destination.new('{"v":1,"type":"tcp","host":"example.org","host":"127.0.0.1","port":80}') }.to raise_error(Skvoz::Server::DestinationError, 'invalid_destination')
+  it 'emits TCP-only and strict NAT44/routed IPv6 policies with finite canonical limits' do
+    standard = Skvoz::Server::NetworkConfiguration.new(Skvoz::Server::Configuration.new(value))
+    expect(standard.network).to include('families' => [4])
+    expect(standard.server).to include('ipv4' => { 'pool' => '10.203.0.0/16', 'egress' => 'nat44', 'interface' => 'eth0' },
+      'ipv6' => nil, 'dns_servers' => ['1.1.1.1'])
+    tcp = Skvoz::Server::NetworkConfiguration.new(Skvoz::Server::Configuration.new(value.merge('network' => {})))
+    expect(tcp.network).to include('families' => [])
+    expect(tcp.server).to include('ipv4' => nil, 'ipv6' => nil, 'dns_servers' => [])
+    network = { 'ipv4' => { 'pool' => '10.253.0.0/16', 'egress' => 'nat44', 'interface' => 'eth0' },
+      'ipv6' => { 'pool' => '2001:db8:10::/64', 'egress' => 'routed', 'interface' => 'eth0' },
+      'dns_servers' => ['1.1.1.1', '2606:4700:4700::1111'] }
+    policy = Skvoz::Server::NetworkConfiguration.new(Skvoz::Server::Configuration.new(value.merge('network' => network)))
+    expect(policy.network).to include('families' => [4, 6])
+    expect(policy.network.fetch('limits')).to include('core_streams' => 512, 'runtime_buffer_bytes' => 268435456, 'receive_window' => 65536)
+    expect { Skvoz::Server::Configuration.new(value.merge('network' => network.merge('ipv6' => network['ipv6'].merge('egress' => 'nat66')))) }.to raise_error(Skvoz::Server::Error)
+    expect { Skvoz::Server::Configuration.new(value.merge('network' => network.merge('dns_servers' => ['::ffff:1.1.1.1']))) }.to raise_error(Skvoz::Server::Error)
   end
 
-  it 'denies special/local/mapped addresses by default and permits an explicit port bridge' do
-    interfaces = Socket.ip_address_list
-    bridge_address = instance_double(Addrinfo, ipv4?: false, ipv6?: true, ip_address: 'fe80::1%br-example')
-    allow(Socket).to receive(:ip_address_list).and_return(interfaces + [bridge_address])
-    default = Skvoz::Server::Policy.new
-    %w[127.0.0.1 10.1.2.3 169.254.169.254 192.0.2.1 ::1 ::ffff:127.0.0.1 2001:db8::1 3fff::1 ff02::1].each do |address|
-      expect(default.allowed?(address, 8081)).to be(false)
-    end
-    expect(default.allowed?('8.8.8.8', 443)).to be(true)
-    expect(default.allowed?('2606:4700:4700::1111', 443)).to be(true)
-    bridge = Skvoz::Server::Policy.new(allow: [{ 'cidr' => '127.0.0.0/8', 'ports' => [8081, 4222] }], own_endpoints: [['0.0.0.0', 4222]])
-    expect(bridge.allowed?('127.0.0.1', 8081)).to be(true)
-    expect(bridge.allowed?('::ffff:127.0.0.1', 8081)).to be(true)
-    expect(bridge.allowed?('127.0.0.1', 8082)).to be(false)
-    expect(bridge.allowed?('127.0.0.2', 4222)).to be(false)
-    expect { bridge.check!(%w[8.8.8.8 10.0.0.1], 443) }.to raise_error(Skvoz::Server::DestinationError, 'forbidden')
+  it 'retains explicitly configured mapped management endpoints beside local inventory' do
+    input = { 'server_addresses' => ['203.0.113.10'], 'management_endpoints' => [{ 'address' => '203.0.113.10', 'protocol' => 6, 'port' => 31422 }] }
+    config = Skvoz::Server::Configuration.new(value.merge('network' => input))
+    allow(Socket).to receive(:ip_address_list).and_return([Addrinfo.ip('127.0.0.1'), Addrinfo.ip('10.0.0.2')])
+    allow(Resolv).to receive(:getaddresses).with('example.org').and_return(['203.0.113.11'])
+    policy = Skvoz::Server::NetworkConfiguration.new(config).inventory!(config)
+    expect(policy.server.fetch('server_addresses')).to include('203.0.113.10', '203.0.113.11')
+    expect(policy.server.fetch('management_endpoints')).to include(input['management_endpoints'].first,
+      { 'address' => '203.0.113.11', 'protocol' => 6, 'port' => 4222 })
   end
 
-  it 'bounds both queue counts and bytes until actual release' do
-    Async do
-      global = Skvoz::Server::Budget.new(count: 2, bytes: 16)
-      queue = Skvoz::Server::Queue.new(count: 2, bytes: 16, global:)
-      expect(queue.push('first', bytes: 8)).to be(true)
-      item, bytes = queue.pop
-      expect(item).to eq('first')
-      expect(queue.push('second', bytes: 8)).to be(true)
-      expect(queue.push('third', bytes: 1)).to be(false)
-      queue.release(bytes)
-      expect(queue.push('third', bytes: 1)).to be(true)
-      queue.close
-      expect(global.count).to eq(0)
-      expect(global.bytes).to eq(0)
+  it 'transfers only assigned inherited descriptors through the child parent-death guard' do
+    owner, child = UNIXSocket.pair
+    Async do |task|
+      process = Skvoz::Server::ChildProcess.new([RbConfig.ruby, '-rsocket', '-e', 'socket = UNIXSocket.for_fd(3); socket.write("owned"); socket.close'], label: 'fixture', descriptors: { 3 => child }).start(task)
+      child.close
+      expect(task.with_timeout(3) { owner.read(5) }).to eq('owned')
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+      task.sleep(0.01) while process.alive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      process.stop(deadline)
+      expect(process.status.success?).to be(true)
+      expect(owner.read(1)).to be_nil
     end.wait
+  ensure
+    owner.close unless owner.closed?
+    child.close unless child.closed?
   end
 
-  it 'rejects a receive window that its bounded host queue cannot hold' do
-    value = { 'address' => 'example.org', 'tls' => { 'email' => 'test@example.com', 'terms_agreed' => true } }
-    expect { Skvoz::Server::Configuration.new(value.merge('stream_queue_bytes' => 8192)) }.to raise_error(Skvoz::Server::Error, 'Configured stream queue cannot hold receive window')
-    expect { Skvoz::Server::Configuration.new(value.merge('receive_window' => 8192, 'stream_queue_bytes' => 8192)) }.not_to raise_error
-    expect { Skvoz::Server::Configuration.new(value.merge('receive_window' => 1_048_577)) }.to raise_error(Skvoz::Server::Error, 'Invalid server configuration limit')
-  end
-
-  it 'creates private state beneath a safe0755 parent and rejects symlink/writable ancestors' do
+  it 'creates private state beneath a safe parent and rejects symlink/writable ancestors' do
     Dir.mktmpdir do |temporary|
       parent = File.join(temporary, 'parent')
       Dir.mkdir(parent, 0o755)
@@ -91,11 +80,9 @@ RSpec.describe 'Server destination and persistent identity contract' do
     end
   end
 
-  it 'allocates unique durable device profiles and burns historical IDs without burning active capacity' do
+  it 'allocates durable devices without reusing removed peer IDs and emits the joint runtime profile' do
     Dir.mktmpdir do |temporary|
-      config = Skvoz::Server::Configuration.new('state_dir' => File.join(temporary, 'state'), 'address' => 'example.org',
-                                 'devices_per_user' => 2, 'max_identities' => 2,
-                                 'tls' => { 'email' => 'test@example.com', 'terms_agreed' => true })
+      config = Skvoz::Server::Configuration.new(value.merge('state_dir' => File.join(temporary, 'state'), 'devices_per_user' => 2, 'max_identities' => 2))
       state = Skvoz::Server::State.new(config)
       first, id = state.mutate('add', 'shared', password: 'long enough password')
       state.commit(first)
@@ -103,16 +90,20 @@ RSpec.describe 'Server destination and persistent identity contract' do
       state.commit(second)
       expect(another).not_to eq(id)
       expect { state.mutate('device-add', 'shared', password: 'long enough password') }.to raise_error(Skvoz::Server::Error, 'Device pool exhausted')
-      removed, = state.mutate('remove', 'shared')
-      state.commit(removed)
-      replacement, next_id = state.mutate('add', 'new', password: 'long enough password')
-      state.commit(replacement)
+      removed, = state.mutate('remove', 'shared'); state.commit(removed)
+      replacement, next_id = state.mutate('add', 'new', password: 'long enough password'); state.commit(replacement)
       expect(next_id).to be > another
+      candidate = state.candidate; candidate['tls'] = { 'certificate' => 'unused.pem', 'key' => 'unused.key' }; state.commit(candidate)
+      profile = state.profile(Skvoz::Server::NetworkConfiguration.new(config))
+      expect(profile).to include('v' => 1, 'role' => 'server')
+      expect(profile.fetch('core')).to include('peer_id' => '0', 'membership' => 'broker_authorized', 'ca_file' => nil, 'tls_server_name' => 'example.org')
+      expect(state.nats_config).to include('skvoz.enroll.v2.')
+      expect(state.export('new', next_id, 'long enough password')).to include('v' => 2,
+        'network_runtime' => { 'network' => 2, 'api' => 1, 'version' => '0.1.0', 'core' => '3.1.0' })
       state.close
       reopened = Skvoz::Server::State.new(config)
       expect(reopened.value['next_id']).to eq(5)
       expect(reopened.value['users']['new']['assigned']).to eq([next_id])
-      expect(reopened.value['users']['new']['hash']).not_to eq('long enough password')
       reopened.close
     end
   end

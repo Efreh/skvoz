@@ -1,0 +1,29 @@
+[Unit]
+Description=SKVOZ authorized network helper for UID %i
+Requires=skvoz-network-helper@%i.socket
+After=skvoz-network-helper@%i.socket systemd-resolved.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/libexec/skvoz-network-helper --config /etc/skvoz-network-helper/%i.json --listen-fd 3
+StateDirectory=skvoz-network-helper/%i
+StateDirectoryMode=0700
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+PrivateTmp=yes
+LockPersonality=yes
+UMask=0077
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=5s

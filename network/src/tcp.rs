@@ -1,0 +1,575 @@
+//! Native stream ownership: partial SEND and write prefixes advance independently.
+use crate::{
+    NetworkEngine, NetworkError,
+    budget::{Budget, Reservation},
+};
+use skvoz_core::runtime::RuntimeKey;
+use skvoz_core::{Event, SendOutcome};
+use std::{
+    collections::VecDeque,
+    io::{self, Read, Write},
+    net::{Shutdown, TcpStream},
+    os::fd::{AsFd, OwnedFd},
+    os::unix::net::UnixStream,
+    time::{Duration, Instant},
+};
+
+trait CorePort {
+    fn send(&mut self, key: RuntimeKey, bytes: &[u8]) -> Result<SendOutcome, NetworkError>;
+    fn consume(&mut self, key: RuntimeKey, offset: u64) -> Result<(), NetworkError>;
+    fn finish(&mut self, key: RuntimeKey) -> Result<(), NetworkError>;
+    fn allowance(&self, peer: skvoz_core::PeerId) -> (usize, usize, usize);
+    fn account(&mut self, peer: skvoz_core::PeerId, send: usize, receive: usize, records: usize);
+}
+impl CorePort for NetworkEngine {
+    fn send(&mut self, key: RuntimeKey, bytes: &[u8]) -> Result<SendOutcome, NetworkError> {
+        self.runtime.send(key, bytes).map_err(Into::into)
+    }
+    fn consume(&mut self, key: RuntimeKey, offset: u64) -> Result<(), NetworkError> {
+        self.runtime
+            .consume_through(key, offset)
+            .map_err(Into::into)
+    }
+    fn finish(&mut self, key: RuntimeKey) -> Result<(), NetworkError> {
+        self.runtime.finish(key).map_err(Into::into)
+    }
+    fn allowance(&self, peer: skvoz_core::PeerId) -> (usize, usize, usize) {
+        self.tcp_allowance(peer)
+    }
+    fn account(&mut self, peer: skvoz_core::PeerId, send: usize, receive: usize, records: usize) {
+        self.account_native(peer, send, receive, records)
+    }
+}
+pub(crate) enum Socket {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+impl Socket {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(s) => s.read(b),
+            Self::Unix(s) => s.read(b),
+        }
+    }
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(s) => s.write(b),
+            Self::Unix(s) => s.write(b),
+        }
+    }
+    fn shutdown_write(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.shutdown(Shutdown::Write),
+            Self::Unix(s) => s.shutdown(Shutdown::Write),
+        }
+    }
+}
+struct WritePending {
+    _reservation: Reservation,
+    bytes: Box<[u8]>,
+    cursor: usize,
+    offset: u64,
+}
+pub(crate) struct TcpConnection {
+    pub key: RuntimeKey,
+    socket: Socket,
+    send: Vec<u8>,
+    send_cursor: usize,
+    receive: VecDeque<WritePending>,
+    receive_bytes: usize,
+    local_eof: bool,
+    finished: bool,
+    remote_eof: bool,
+    write_shutdown: bool,
+    write_deadline: Option<Instant>,
+    pub opened: bool,
+    pub reply: Option<(u32, crate::SessionId, OwnedFd)>,
+    pub success: Vec<u8>,
+    pub failure: Vec<u8>,
+    pub uploaded: u64,
+    pub downloaded: u64,
+    core_closed: bool,
+    rejected: bool,
+    pub rejection: Option<crate::local_api::ApiError>,
+    prefix: Vec<u8>,
+    prefix_cursor: usize,
+    budget: Budget,
+    _reservation: Reservation,
+}
+impl TcpConnection {
+    pub fn new(
+        key: RuntimeKey,
+        socket: Socket,
+        budget: &Budget,
+        initial: Vec<u8>,
+    ) -> Result<Self, NetworkError> {
+        let fd = match &socket {
+            Socket::Tcp(s) => s.as_fd(),
+            Socket::Unix(s) => s.as_fd(),
+        };
+        skvoz_network_native::configure_socket_buffers(fd, 131072)
+            .map_err(|_| NetworkError::InvalidState)?;
+        let reservation = budget.reserve(65536 + 16384 + 65536 + 4096, 4)?;
+        if initial.len() > 65536 {
+            return Err(NetworkError::Overloaded);
+        }
+        Ok(Self {
+            key,
+            socket,
+            send: initial,
+            send_cursor: 0,
+            receive: VecDeque::new(),
+            receive_bytes: 0,
+            local_eof: false,
+            finished: false,
+            remote_eof: false,
+            write_shutdown: false,
+            write_deadline: None,
+            opened: false,
+            reply: None,
+            success: Vec::new(),
+            failure: Vec::new(),
+            uploaded: 0,
+            downloaded: 0,
+            core_closed: false,
+            rejected: false,
+            rejection: None,
+            prefix: Vec::new(),
+            prefix_cursor: 0,
+            budget: budget.clone(),
+            _reservation: reservation,
+        })
+    }
+    pub fn core_finished(&self) -> bool {
+        self.core_closed || self.rejected
+    }
+    pub fn gracefully_finished(&self) -> bool {
+        self.core_closed && self.receive.is_empty() && self.write_shutdown
+    }
+    pub fn event(&mut self, event: Event) -> Result<bool, NetworkError> {
+        match event {
+            Event::Opened { .. } => {
+                self.opened = true;
+                self.prefix = std::mem::take(&mut self.success);
+                if !self.prefix.is_empty() {
+                    self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+                }
+            }
+            Event::Data { offset, bytes } => {
+                if self.remote_eof
+                    || self.receive.len() >= 128
+                    || self
+                        .receive_bytes
+                        .checked_add(bytes.len())
+                        .is_none_or(|n| n > 65536)
+                {
+                    return Err(NetworkError::Overloaded);
+                }
+                self.receive_bytes += bytes.len();
+                let reservation = self.budget.reserve(0, 1)?;
+                self.receive.push_back(WritePending {
+                    _reservation: reservation,
+                    bytes,
+                    cursor: 0,
+                    offset,
+                });
+                self.write_deadline
+                    .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
+            }
+            Event::RemoteFinished => self.remote_eof = true,
+            Event::Closed {
+                reason: skvoz_core::CloseReason::Finished,
+            } => {
+                self.core_closed = true;
+                self.remote_eof = true;
+            }
+            Event::Rejected { reason } => {
+                self.rejection = Some(reject_error(&reason));
+                if self.failure.is_empty() {
+                    return Ok(false);
+                }
+                self.opened = true;
+                self.rejected = true;
+                self.prefix = std::mem::take(&mut self.failure);
+                self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+            }
+            Event::Closed { .. } => return Ok(false),
+            Event::Writable => {}
+            Event::IncomingOpen { .. } => return Err(NetworkError::InvalidState),
+        }
+        Ok(true)
+    }
+    pub fn turn(&mut self, engine: &mut NetworkEngine) -> Result<(), NetworkError> {
+        self.turn_port(engine)
+    }
+    fn turn_port(&mut self, engine: &mut impl CorePort) -> Result<(), NetworkError> {
+        if !self.opened {
+            return Ok(());
+        }
+        if self.write_deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(NetworkError::Timeout);
+        }
+        // Native preamble is written before any remote payload, and creates no Core credit.
+        if self.prefix_cursor < self.prefix.len() {
+            match self.socket.write(&self.prefix[self.prefix_cursor..]) {
+                Ok(0) => return Err(NetworkError::InvalidState),
+                Ok(n) => {
+                    self.prefix_cursor += n;
+                    self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err(NetworkError::InvalidState),
+            }
+            if self.prefix_cursor < self.prefix.len() {
+                return Ok(());
+            }
+            self.prefix.clear();
+            self.write_deadline = None;
+        }
+        if self.rejected {
+            return Err(NetworkError::InvalidState);
+        }
+        let (_, mut receive_limit, record_limit) = engine.allowance(self.key.stream.peer);
+        for _ in 0..record_limit {
+            if receive_limit == 0 {
+                break;
+            }
+            let Some(front) = self.receive.front_mut() else {
+                break;
+            };
+            match self.socket.write(
+                &front.bytes[front.cursor..front.bytes.len().min(front.cursor + receive_limit)],
+            ) {
+                Ok(0) => return Err(NetworkError::InvalidState),
+                Ok(n) => {
+                    front.cursor += n;
+                    self.receive_bytes -= n;
+                    receive_limit -= n;
+                    self.downloaded = self.downloaded.saturating_add(n as u64);
+                    engine.account(self.key.stream.peer, 0, n, 1);
+                    let consumed = front
+                        .offset
+                        .checked_add(front.cursor as u64)
+                        .ok_or(NetworkError::InvalidState)?;
+                    // Only this completed native write can grant remote credit.
+                    if !self.core_closed {
+                        engine.consume(self.key, consumed)?;
+                    }
+                    self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
+                    if front.cursor == front.bytes.len() {
+                        self.receive.pop_front();
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => return Err(NetworkError::InvalidState),
+            }
+        }
+        if self.receive.is_empty() {
+            self.write_deadline = None;
+        }
+        if self.remote_eof && self.receive.is_empty() && !self.write_shutdown {
+            self.socket
+                .shutdown_write()
+                .map_err(|_| NetworkError::InvalidState)?;
+            self.write_shutdown = true;
+        }
+        if self.core_closed {
+            if self.receive.is_empty() && self.write_shutdown {
+                return Err(NetworkError::InvalidState);
+            }
+            return Ok(());
+        }
+        if self.send_cursor == self.send.len() {
+            self.send.clear();
+            self.send_cursor = 0;
+            if !self.local_eof {
+                let mut buffer = [0u8; 16384];
+                match self.socket.read(&mut buffer) {
+                    Ok(0) => self.local_eof = true,
+                    Ok(n) => self.send.extend_from_slice(&buffer[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => return Err(NetworkError::InvalidState),
+                }
+            }
+        }
+        let (send_limit, _, record_limit) = engine.allowance(self.key.stream.peer);
+        if self.send_cursor < self.send.len() && send_limit > 0 && record_limit > 0 {
+            match engine.send(
+                self.key,
+                &self.send[self.send_cursor..self.send.len().min(self.send_cursor + send_limit)],
+            )? {
+                SendOutcome::Accepted(n) => {
+                    self.send_cursor += n;
+                    self.uploaded = self.uploaded.saturating_add(n as u64);
+                    engine.account(self.key.stream.peer, n, 0, 1);
+                }
+                SendOutcome::WouldBlock => {}
+            }
+        }
+        if self.local_eof && self.send_cursor == self.send.len() && !self.finished {
+            engine.finish(self.key)?;
+            self.finished = true;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn reject_error(bytes: &[u8]) -> crate::local_api::ApiError {
+    use crate::local_api::ApiError;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Rejection {
+        v: u8,
+        #[serde(rename = "type")]
+        kind: String,
+        error: String,
+    }
+    let Ok(value) = crate::local_api::parse_strict_json_bounded(bytes, 512) else {
+        return ApiError::InvalidRequest;
+    };
+    let Ok(rejection) = serde_json::from_value::<Rejection>(value) else {
+        return ApiError::InvalidRequest;
+    };
+    if rejection.v != 2 || rejection.kind != "tcp" {
+        return ApiError::InvalidRequest;
+    }
+    match rejection.error.as_str() {
+        "forbidden" => ApiError::Forbidden,
+        "overloaded" => ApiError::Overloaded,
+        "timeout" => ApiError::Timeout,
+        "unsupported_version" => ApiError::UnsupportedVersion,
+        "network_unavailable" => ApiError::NetworkUnavailable,
+        _ => ApiError::InvalidRequest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skvoz_core::{PeerId, StreamKey};
+    struct Port {
+        script: VecDeque<usize>,
+        sent: Vec<u8>,
+        consumed: Vec<u64>,
+        finished: bool,
+        used: (usize, usize),
+    }
+    impl CorePort for Port {
+        fn send(&mut self, _key: RuntimeKey, bytes: &[u8]) -> Result<SendOutcome, NetworkError> {
+            let n = self
+                .script
+                .pop_front()
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            if n == 0 {
+                return Ok(SendOutcome::WouldBlock);
+            }
+            self.sent.extend_from_slice(&bytes[..n]);
+            Ok(SendOutcome::Accepted(n))
+        }
+        fn consume(&mut self, _key: RuntimeKey, offset: u64) -> Result<(), NetworkError> {
+            self.consumed.push(offset);
+            Ok(())
+        }
+        fn finish(&mut self, _key: RuntimeKey) -> Result<(), NetworkError> {
+            self.finished = true;
+            Ok(())
+        }
+        fn allowance(&self, _peer: PeerId) -> (usize, usize, usize) {
+            let bytes = 32768usize.saturating_sub(self.used.0);
+            (bytes, bytes, 16usize.saturating_sub(self.used.1))
+        }
+        fn account(&mut self, _peer: PeerId, send: usize, receive: usize, records: usize) {
+            self.used.0 += send + receive;
+            self.used.1 += records;
+        }
+    }
+    fn port() -> Port {
+        Port {
+            script: VecDeque::new(),
+            sent: Vec::new(),
+            consumed: Vec::new(),
+            finished: false,
+            used: (0, 0),
+        }
+    }
+    fn key() -> RuntimeKey {
+        RuntimeKey {
+            epoch: 1,
+            incarnation: 1,
+            stream: StreamKey {
+                peer: PeerId(0),
+                stream_id: 1,
+            },
+        }
+    }
+    fn pair(initial: Vec<u8>) -> (TcpConnection, UnixStream) {
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let mut c = TcpConnection::new(
+            key(),
+            Socket::Unix(a),
+            &Budget::new(1_000_000, 256),
+            initial,
+        )
+        .unwrap();
+        c.opened = true;
+        (c, b)
+    }
+    #[test]
+    fn rejected_stream_drains_native_failure_after_core_retirement() {
+        let (mut connection, mut socket) = pair(Vec::new());
+        connection.opened = false;
+        let failure = vec![5, 1, 0, 1, 0, 0, 0, 0, 0, 0];
+        connection.failure = failure.clone();
+        assert!(
+            connection
+                .event(Event::Rejected {
+                    reason: br#"{"v":2,"type":"tcp","error":"forbidden"}"#
+                        .to_vec()
+                        .into_boxed_slice(),
+                })
+                .unwrap()
+        );
+        assert!(connection.core_finished());
+        let mut port = port();
+        assert!(connection.turn_port(&mut port).is_err());
+        let mut received = [0; 10];
+        socket.read_exact(&mut received).unwrap();
+        assert_eq!(received.as_slice(), failure);
+        assert!(port.sent.is_empty());
+        assert!(port.consumed.is_empty());
+        assert!(!port.finished);
+    }
+    #[test]
+    fn partial_core_acceptance_retains_exact_suffix_and_fin_waits() {
+        let initial: Vec<u8> = (0..241).map(|n| n as u8).collect();
+        let (mut c, socket) = pair(initial.clone());
+        socket.shutdown(Shutdown::Write).unwrap();
+        let mut port = port();
+        port.script = VecDeque::from([1, 0, 3, 0, 17, 2, 0, 218]);
+        for _ in 0..16 {
+            port.used = (0, 0);
+            c.turn_port(&mut port).unwrap();
+            if port.finished {
+                break;
+            }
+            assert!(port.sent.len() <= initial.len());
+        }
+        assert_eq!(port.sent, initial);
+        assert_eq!(c.uploaded, 241);
+        assert!(port.finished);
+    }
+    #[test]
+    fn copying_remote_data_never_consumes_native_write_grants_exact_prefix() {
+        let (mut c, mut socket) = pair(Vec::new());
+        let mut port = port();
+        let bytes: Vec<u8> = (0..65536).map(|n| (n % 251) as u8).collect();
+        c.event(Event::Data {
+            offset: 0,
+            bytes: bytes.clone().into_boxed_slice(),
+        })
+        .unwrap();
+        assert!(port.consumed.is_empty());
+        assert_eq!(c.downloaded, 0);
+        let mut received = Vec::new();
+        for _ in 0..8 {
+            port.used = (0, 0);
+            c.turn_port(&mut port).unwrap();
+            let mut chunk = [0u8; 32768];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(n) if n > 0 => received.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    other => panic!("unexpected native read: {other:?}"),
+                }
+            }
+            if received.len() == bytes.len() {
+                break;
+            }
+        }
+        assert_eq!(received, bytes);
+        assert_eq!(port.consumed.last(), Some(&65536));
+        assert_eq!(c.downloaded, 65536);
+        assert!(port.consumed.windows(2).all(|p| p[0] < p[1]));
+    }
+    #[test]
+    fn remote_halfclose_waits_for_native_payload_then_preserves_reverse_direction() {
+        let (mut c, mut socket) = pair(Vec::new());
+        let mut port = port();
+        c.event(Event::Data {
+            offset: 0,
+            bytes: b"payload".to_vec().into_boxed_slice(),
+        })
+        .unwrap();
+        c.event(Event::RemoteFinished).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            socket.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        c.turn_port(&mut port).unwrap();
+        let mut data = [0; 7];
+        socket.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"payload");
+        assert_eq!(socket.read(&mut byte).unwrap(), 0);
+        socket.write_all(b"reply").unwrap();
+        c.turn_port(&mut port).unwrap();
+        assert_eq!(&port.sent, b"reply");
+        assert!(!port.finished);
+    }
+    #[test]
+    fn graceful_core_closed_retains_already_received_native_bytes() {
+        let (mut c, mut socket) = pair(Vec::new());
+        let mut port = port();
+        c.event(Event::Data {
+            offset: 0,
+            bytes: b"tail".to_vec().into_boxed_slice(),
+        })
+        .unwrap();
+        assert!(
+            c.event(Event::Closed {
+                reason: skvoz_core::CloseReason::Finished
+            })
+            .unwrap()
+        );
+        assert_eq!(c.turn_port(&mut port), Err(NetworkError::InvalidState));
+        let mut tail = [0; 4];
+        socket.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"tail");
+        assert!(c.gracefully_finished());
+        assert!(port.consumed.is_empty());
+    }
+    #[test]
+    fn repeated_or_early_remote_fin_data_is_terminal() {
+        let (mut c, _) = pair(Vec::new());
+        c.event(Event::RemoteFinished).unwrap();
+        assert!(
+            c.event(Event::Data {
+                offset: 0,
+                bytes: b"late".to_vec().into_boxed_slice()
+            })
+            .is_err()
+        );
+    }
+    #[test]
+    fn exhausted_receive_record_quantum_prevents_an_extra_send() {
+        let (mut c, _socket) = pair(b"send-after-writes".to_vec());
+        let mut port = port();
+        for offset in 0..16 {
+            c.event(Event::Data {
+                offset,
+                bytes: vec![1].into_boxed_slice(),
+            })
+            .unwrap();
+        }
+        c.turn_port(&mut port).unwrap();
+        assert_eq!(port.used.1, 16);
+        assert!(port.sent.is_empty());
+        assert_eq!(c.send_cursor, 0);
+        port.used = (0, 0);
+        c.turn_port(&mut port).unwrap();
+        assert_eq!(port.sent, b"send-after-writes");
+    }
+}

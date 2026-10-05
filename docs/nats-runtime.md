@@ -1,7 +1,7 @@
 # Динамический NATS runtime
 
 `skvoz_core::runtime::NatsRuntime` — опциональный runtime одной универсальной
-Core library. Он добавляет authenticated join, смену peer session, проверку
+Core library 3.1.0. Он добавляет authenticated join, смену peer session, проверку
 живости и восстановление транспорта для новых byte streams. Включается feature
 `nats`; HTTP/SOCKS parsing, DNS, сокеты, GUI и выдача credentials принадлежат host.
 Статический [NatsNode](../core/src/nats.rs) используется простым TCP relay
@@ -95,6 +95,8 @@ bytes плюс runtime envelope 24 bytes. Runtime отвергает и мень
 | Подтвердить обработку полученных байтов | `consume_through(key, end_offset)` |
 | Завершить отправляющее направление / отменить поток | `finish(key)` / `close(key)` |
 | Обслужить транспорт, negotiation и таймеры | `turn(wait).await` |
+| Прервать только ожидание idle-транспорта по готовности внешнего I/O | `turn_with_wake(wait, wake).await` |
+| Прочитать локальный профиль / проверенные лимиты удалённого потока | `limits()` / `peer_limits(key)` |
 | Получить состояние / подробные данные о буферах | `status()` / `resources()` |
 | Завершить peer / отозвать его локальное разрешение | `terminate_peer(peer)` / `revoke_peer(peer)` |
 | Завершить работу runtime | `shutdown().await` |
@@ -109,6 +111,21 @@ bytes плюс runtime envelope 24 bytes. Runtime отвергает и мень
 абсолютную конечную позицию действительно обработанных байтов. `finish` допускает
 ответ второй стороны после EOF; `close` отменяет поток. Подробный byte-credit/EOF
 контракт определён в [движке](stream-engine.md).
+
+`limits()` возвращает настроенный `ManagerConfig`, а `peer_limits(key)` —
+`PeerLimits { receive_window, max_frame }` из проверенного OPEN или ACCEPT.
+Для отсутствующего потока или устаревшего epoch/incarnation возвращается `None`.
+Эти операции не меняют лимиты и не требуют I/O. Коннектор может отвергнуть
+несовместимый профиль до выделения своих буферов.
+
+При отсутствии работы `turn` ждёт готовности существующих подписок NATS и
+ближайшего transport timer. Пришедшее сообщение обрабатывается до возврата
+из ожидания. `turn_with_wake` также принимает `Future<Output = ()>` от host:
+он опрашивается только в idle-ветке после завершения передачи извлечённых
+output frames. Готовность host завершает это ожидание с нулевым transport
+progress; обработка внешнего I/O остаётся обязанностью коннектора.
+Host должен ожидать завершения всего turn. Внешний `select` с отменой активного
+turn может потерять владение уже извлечёнными output frames и завершить транспорт.
 
 `join_peer` идемпотентен для pending flight. Для уже ready peer прямой Core API
 начинает новую negotiation: подтверждённая pair session replacement закрывает
@@ -177,6 +194,12 @@ peer остаётся неготовым до matching nonce PONG на ново�
 до CONTROL SUB на той же connection; успешный lane roundtrip подтверждает путь.
 Первый потерянный warmup PING/PONG повторяется без продления исходного deadline.
 `peer_ready` и `open` требуют этого доказательства.
+
+Доказательство готовности локально: одна сторона может уже видеть ready,
+пока другая ещё ждёт своего PONG. Полученный authenticated OPEN и действующий
+ключ в этот момент не означают потерю поколения. Коннектор удерживает
+согласование в пределах своего deadline и проверяет собственный `peer_ready`
+перед активацией внешнего I/O.
 
 ```mermaid
 sequenceDiagram
@@ -271,6 +294,12 @@ profile с255-byte hostname; parser в Core не входит.
 membership slots (включая pending), connections/retries/last error. `peer_status`
 даёт явную per-peer диагностику; token/nonce не являются authentication secrets.
 `resources()` остаётся O(stream count) диагностикой buffer occupancy.
+Transport counters также включают число успешных DATA publish commands,
+payload bytes, пять групп размеров DATA (`<1500`, `1500…8191`, `8192…16383`,
+`16384`, `>16384`), WINDOW publish commands и завершённых socket flushes.
+`output_elapsed_ns` измеряет суммарное wall time output batches, включая
+ожидание publish/flush. Счётчики насыщаются на `u64::MAX`; они не измеряют CPU
+и не подтверждают доставку или потребление payload удалённым приложением.
 Configured transport bound считает только queued payload:
 `(join_capacity + 2*shards*subscription_capacity + (shards+1)*client_capacity) * 65588`.
 Это конечная верхняя граница payload queue slots, не RSS: headers, allocator,
@@ -290,3 +319,17 @@ server/client applications и broker отдельно. Delay forwarder заде�
 TLS bytes, но также pacing8KiB chunks; это не полная эмуляция WAN. Hold после
 active transfer проверяет bounded idle/liveness soak, не непрерывный traffic soak.
 Local runs не устанавливают users/throughput/latency, mobile или whole-host SLA.
+
+
+## Встраивание в сетевой runtime
+
+[Общий TCP/IP runtime](network-runtime.md) встраивает один NatsRuntime и
+единолично управляет событиями Core. Host на Ruby/GTK передаёт только команды;
+обычные sockets/TUN и кредит после фактической записи обслуживает Rust.
+Самостоятельный daemon/IPC остаётся независимым компонентом.
+
+Публичный `verified_tls_config(&Trust, identity)` строит тот же проверяемый
+ClientConfig для host, которому нужен dial на заранее подтверждённый numeric IP,
+например enrollment при активном capture. Identity остаётся исходным DNS/IP SAN;
+проверка цепочки и подписей TLS сохраняется. Host отвечает за фиксированный
+адрес и lifecycle; этот builder не добавляет маршрутизацию в Core.

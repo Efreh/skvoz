@@ -8,6 +8,16 @@ pub enum Trust {
     System,
     ManagedCa(PathBuf),
 }
+
+/// Build mandatory verified TLS for a trusted host dialing a frozen address.
+/// Certificate-chain and handshake-signature checks are unchanged; `identity`
+/// remains the original DNS name or IP SAN instead of the numeric dial address.
+pub fn verified_tls_config(
+    trust: &Trust,
+    identity: &str,
+) -> Result<async_nats::rustls::ClientConfig, RuntimeError> {
+    crate::runtime_tls::config(trust, identity)
+}
 #[derive(Clone)]
 pub struct Authentication {
     pub username: String,
@@ -122,7 +132,41 @@ pub struct Counters {
     pub invalid_input: u64,
     pub retries: u64,
     pub join_overflows: u64,
+    /// Successful DATA publish commands; payload bytes exclude all framing.
+    pub data_frames_published: u64,
+    pub data_payload_bytes_published: u64,
+    /// Payload sizes: <1500, 1500..8192, 8192..16384, exactly16384, >16384.
+    pub data_frame_size_bins: [u64; 5],
+    pub window_frames_published: u64,
+    pub socket_flushes_completed: u64,
+    /// Wall time in output batches including publish/flush waits; not CPU time.
+    pub output_elapsed_ns: u64,
 }
+impl Counters {
+    pub(crate) fn published(&mut self, frame: &crate::Frame) {
+        match frame {
+            crate::Frame::Data { bytes, .. } => {
+                self.data_frames_published = self.data_frames_published.saturating_add(1);
+                self.data_payload_bytes_published = self
+                    .data_payload_bytes_published
+                    .saturating_add(bytes.len() as u64);
+                let bin = match bytes.len() {
+                    0..1500 => 0,
+                    1500..8192 => 1,
+                    8192..16384 => 2,
+                    16384 => 3,
+                    _ => 4,
+                };
+                self.data_frame_size_bins[bin] = self.data_frame_size_bins[bin].saturating_add(1);
+            }
+            crate::Frame::WindowUpdate { .. } => {
+                self.window_frames_published = self.window_frames_published.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PeerStatus {
     pub generation: u128,
@@ -244,5 +288,35 @@ impl RuntimeConfig {
             .and_then(|n| n.checked_add(self.client_capacity.checked_mul(self.shards + 1)?))
             .and_then(|n| n.checked_mul(TRANSPORT_PACKET_BYTES))
             .ok_or(RuntimeError::Config)
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+    #[test]
+    fn transport_size_bins_and_published_counters_saturate() {
+        let mut counters = Counters::default();
+        for size in [1499, 1500, 8191, 8192, 16383, 16384, 16385, 65536] {
+            counters.published(&crate::Frame::Data {
+                offset: 0,
+                bytes: vec![0; size].into(),
+            });
+        }
+        assert_eq!(counters.data_frame_size_bins, [1, 2, 2, 1, 2]);
+        assert_eq!(counters.data_frames_published, 8);
+        counters.data_frames_published = u64::MAX;
+        counters.data_payload_bytes_published = u64::MAX;
+        counters.data_frame_size_bins[0] = u64::MAX;
+        counters.window_frames_published = u64::MAX;
+        counters.published(&crate::Frame::Data {
+            offset: 0,
+            bytes: vec![0; 1].into(),
+        });
+        counters.published(&crate::Frame::WindowUpdate { consumed: 1 });
+        assert_eq!(counters.data_frames_published, u64::MAX);
+        assert_eq!(counters.data_payload_bytes_published, u64::MAX);
+        assert_eq!(counters.data_frame_size_bins[0], u64::MAX);
+        assert_eq!(counters.window_frames_published, u64::MAX);
     }
 }

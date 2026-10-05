@@ -1,0 +1,30 @@
+[package]
+name = "skvoz-network"
+version = "0.1.0"
+description = "Shared bounded network adapter for the universal SKVOZ Core"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+linux-runtime = ["dep:skvoz-network-native"]
+
+[[bin]]
+name = "skvoz-network-runtime"
+path = "src/bin/skvoz-network-runtime.rs"
+required-features = ["linux-runtime"]
+
+[dependencies]
+skvoz-core = { path = "../core", features = ["nats"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+getrandom = "=0.4.3"
+tokio = { version = "=1.53.1", features = ["rt", "macros", "time", "net", "sync", "io-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+skvoz-network-native = { path = "native", optional = true }
+
+[lints]
+workspace = true

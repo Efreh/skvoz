@@ -7,11 +7,11 @@ require 'timeout'
 module UbuntuSystem
   ROOT = Pathname.new(__dir__).join('../../../..').expand_path
   CLIENT = ENV.fetch('SKVOZ_TEST_CLIENT', ROOT.join('target/release/skvoz-client-test-driver').to_s)
-  CORE = ENV.fetch('SKVOZ_TEST_CORE', ROOT.join('target/release/skvoz-core-daemon').to_s)
+  RUNTIME = ENV.fetch('SKVOZ_TEST_RUNTIME', ROOT.join('target/release/skvoz-network-runtime').to_s)
 
   class Application
     attr_reader :ready, :http, :socks, :process, :directory
-    def initialize(directory, server, username: 'shared', password: 'process-test-password', ca: true, host: 'localhost', server_port: nil, budgets: {}, http_port: nil, socks_port: nil, daemon: CORE, wait_ready: true, request_log: true)
+    def initialize(directory, server, username: 'shared', password: 'process-test-password', ca: true, host: 'localhost', server_port: nil, http_port: nil, socks_port: nil, runtime: RUNTIME, wait_ready: true, request_log: true)
       @directory = Pathname.new(directory)
       @http, @socks = http_port || ServerSystem.free_port, socks_port || ServerSystem.free_port
       @stdin, @stdout, @stderr, @process = Open3.popen3(CLIENT)
@@ -23,9 +23,9 @@ module UbuntuSystem
           ''
         end
       end
-      @stdin.puts(JSON.generate(directory: @directory.to_s, daemon:, host:, port: server_port || server.port,
+      @stdin.puts(JSON.generate(directory: @directory.to_s, runtime:, host:, port: server_port || server.port,
                                username:, password:, ca_file: ca ? server.directory.join('ca.pem').to_s : '',
-                               http_port: @http, socks_port: @socks, budgets:, request_log:))
+                               http_port: @http, socks_port: @socks, request_log:))
       @stdin.flush
       @ready = wait_ready ? event { |value| value['ready'] || value['failed'] } : nil
     rescue Exception

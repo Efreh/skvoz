@@ -1,7 +1,7 @@
 //! Bounded metadata history and payload counters; no payload inspection or disk I/O.
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -26,6 +26,7 @@ pub struct Telemetry {
     pub downloaded: AtomicU64,
     enabled: AtomicBool,
     history: Mutex<VecDeque<Request>>,
+    runtime_live: Mutex<BTreeSet<u64>>,
     revision: AtomicU64,
     epoch: AtomicU64,
     next_id: AtomicU64,
@@ -48,6 +49,9 @@ impl Telemetry {
         if let Ok(mut history) = self.history.lock() {
             self.epoch.fetch_add(1, Ordering::Relaxed);
             history.clear();
+            if let Ok(mut live) = self.runtime_live.lock() {
+                live.clear();
+            }
             self.skipped.store(0, Ordering::Relaxed);
             self.revision.fetch_add(1, Ordering::Relaxed);
         }
@@ -83,6 +87,73 @@ impl Telemetry {
             .as_secs();
         history.push_back(request);
         self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn runtime_request(&self, data: &serde_json::Value) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        let protocol = match data["protocol"].as_str() {
+            Some("HTTP") => "HTTP",
+            Some("CONNECT") => "CONNECT",
+            Some("SOCKS5") => "SOCKS5",
+            Some("TCP") => "TCP",
+            _ => return,
+        };
+        let result = match data["result"].as_str() {
+            Some("opening") => "opening",
+            Some("active") => "active",
+            Some("finished") => "finished",
+            Some("cancelled") => "cancelled",
+            Some("forbidden") => "forbidden",
+            Some("overloaded") => "overloaded",
+            Some("network_unavailable") => "network_unavailable",
+            Some("timeout") => "timeout",
+            Some("local_setup_failed") => "local_setup_failed",
+            Some("invalid_request") => "invalid_request",
+            _ => return,
+        };
+        let (Some(id), Some(host), Some(port), Some(uploaded), Some(downloaded)) = (
+            data["id"].as_u64(),
+            data["host"].as_str(),
+            data["port"].as_u64(),
+            data["uploaded"].as_u64(),
+            data["downloaded"].as_u64(),
+        ) else {
+            return;
+        };
+        if id == 0 || host.len() > 253 || port == 0 || port > 65535 {
+            return;
+        }
+        {
+            let Ok(mut live) = self.runtime_live.lock() else {
+                return;
+            };
+            if result == "opening" {
+                if live.len() >= 32 && !live.contains(&id) {
+                    return;
+                }
+                live.insert(id);
+            } else if !live.contains(&id) {
+                return;
+            }
+            if result != "opening" && result != "active" {
+                live.remove(&id);
+            }
+        }
+        self.record(
+            Request {
+                id,
+                time: 0,
+                protocol,
+                host: host.into(),
+                port: port as u16,
+                result,
+                uploaded,
+                downloaded,
+            },
+            epoch,
+        );
     }
     pub fn flow(self: &Arc<Self>) -> Flow {
         Flow {
@@ -249,5 +320,37 @@ mod tests {
             telemetry.downloaded.load(Ordering::Relaxed),
             17 * HISTORY_LIMIT as u64 + 9
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn clearing_or_disabling_does_not_restore_old_runtime_flows() {
+        let telemetry = Telemetry::new(true);
+        let mut event = json!({"id":1,"protocol":"CONNECT","host":"example.org","port":443,"result":"opening","uploaded":0,"downloaded":0});
+        telemetry.runtime_request(&event);
+        assert_eq!(telemetry.history().len(), 1);
+        telemetry.clear();
+        event["result"] = json!("active");
+        telemetry.runtime_request(&event);
+        assert!(telemetry.history().is_empty());
+        event["id"] = json!(2);
+        event["result"] = json!("opening");
+        telemetry.runtime_request(&event);
+        telemetry.enable(false);
+        telemetry.enable(true);
+        event["result"] = json!("finished");
+        telemetry.runtime_request(&event);
+        assert!(telemetry.history().is_empty());
+        event["id"] = json!(3);
+        event["result"] = json!("opening");
+        telemetry.runtime_request(&event);
+        event["result"] = json!("finished");
+        event["downloaded"] = json!(12);
+        telemetry.runtime_request(&event);
+        assert_eq!(telemetry.history().last().unwrap().downloaded, 12);
     }
 }

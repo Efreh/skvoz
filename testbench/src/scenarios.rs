@@ -15,9 +15,19 @@ pub async fn pair(case: &str, config: BenchConfig) -> Result<(Node, Node), Bench
 
 pub async fn establish(user: &mut Node, consumer: &mut Node) -> Result<u64, BenchError> {
     let id = user.open(&[0, 255]).await?;
-    consumer.turn(Duration::from_secs(1)).await?;
+    let started = Instant::now();
+    let progress = consumer.turn(Duration::from_secs(1)).await?;
     let events = consumer.poll_events();
-    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events.len(),
+        1,
+        "IncomingOpen observation: elapsed={:?} progress={progress} events={events:?} user_failure={:?} consumer_failure={:?} user_snapshot={:?} consumer_snapshot={:?}",
+        started.elapsed(),
+        user.failure_kind(),
+        consumer.failure_kind(),
+        user.snapshot(id),
+        consumer.snapshot(id)
+    );
     assert_eq!(events[0].stream_id, id);
     assert_eq!(
         events[0].event,

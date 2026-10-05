@@ -9,10 +9,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Proxy,
+    Vpn,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     pub v: u8,
+    pub mode: Mode,
+    pub families: Vec<u8>,
+    pub max_mtu: u16,
+    pub transport_snapshots: BTreeMap<String, String>,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -29,7 +40,11 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            v: 1,
+            v: 2,
+            mode: Mode::Proxy,
+            families: vec![4, 6],
+            max_mtu: 1500,
+            transport_snapshots: BTreeMap::new(),
             host: String::new(),
             port: 4222,
             username: String::new(),
@@ -47,6 +62,40 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub fn validate_network(&self) -> Result<()> {
+        if self.v != 2
+            || !matches!(self.families.as_slice(), [4] | [6] | [4, 6])
+            || !(576..=1500).contains(&self.max_mtu)
+            || self.families.contains(&6) && self.max_mtu < 1280
+        {
+            return Err(Error("invalid_network_settings"));
+        }
+        if self.transport_snapshots.len() > 64
+            || self.transport_snapshots.iter().any(|(key, ip)| {
+                let Ok((host, port, user, device, mode)) =
+                    serde_json::from_str::<(String, u16, String, String, String)>(key)
+                else {
+                    return true;
+                };
+                port == 0
+                    || host_name(&host).is_ok_and(|h| h != host)
+                    || host_name(&host).is_err()
+                    || !login(&user)
+                    || !valid_token(&device)
+                    || mode != "vpn"
+                    || ip.parse::<IpAddr>().is_err()
+                    || ip.parse::<IpAddr>().is_ok_and(|i| {
+                        i.to_string() != *ip
+                            || i.is_unspecified()
+                            || i.is_multicast()
+                            || i.to_canonical() != i
+                    })
+            })
+        {
+            return Err(Error("unsafe_settings"));
+        }
+        Ok(())
+    }
     pub fn saved_password(&self, host: &str, port: u16, user: &str) -> String {
         let Ok(host) = host_name(host) else {
             return String::new();
@@ -272,7 +321,7 @@ impl Settings {
         } else {
             Preferences::default()
         };
-        if value.v != 1
+        if value.v != 2
             || value.port == 0
             || !value.valid_passwords()
             || value.devices.len() > 64
@@ -283,6 +332,7 @@ impl Settings {
         {
             return Err(Error("unsafe_settings"));
         }
+        value.validate_network()?;
         ports(value.http_port, value.socks_port)?;
         Ok(Self {
             directory,
@@ -298,6 +348,7 @@ impl Settings {
         Ok(base.join("skvoz"))
     }
     pub fn save(&mut self, candidate: Preferences) -> Result<()> {
+        candidate.validate_network()?;
         ports(candidate.http_port, candidate.socks_port)?;
         if !candidate.valid_passwords() {
             return Err(Error("unsafe_settings"));
@@ -345,6 +396,38 @@ pub fn valid_token(input: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn network_settings_reject_unusable_families_and_unbound_transport_cache() {
+        let mut value = Preferences {
+            max_mtu: 1279,
+            ..Preferences::default()
+        };
+        assert!(value.validate_network().is_err());
+        value.families = vec![4];
+        assert!(value.validate_network().is_ok());
+        value.families = vec![6, 4];
+        assert!(value.validate_network().is_err());
+        value.families = vec![4, 6];
+        value.max_mtu = 1500;
+        let key =
+            serde_json::to_string(&("example.org", 4222, "owner", "a".repeat(32), "vpn")).unwrap();
+        value
+            .transport_snapshots
+            .insert(key.clone(), "203.0.113.5".into());
+        assert!(value.validate_network().is_ok());
+        value
+            .transport_snapshots
+            .insert(key, "::ffff:203.0.113.5".into());
+        assert!(value.validate_network().is_err());
+        value.transport_snapshots.clear();
+        value
+            .transport_snapshots
+            .insert("[\"example.org\",4222]".into(), "203.0.113.5".into());
+        assert!(value.validate_network().is_err());
+        value.transport_snapshots.clear();
+        value.v = 1;
+        assert!(value.validate_network().is_err());
+    }
+    #[test]
     fn addresses_and_ports() {
         assert_eq!(host_name("[::1]"), Ok("::1".into()));
         for value in ["127.1", "bad host", "fe80::1%lo", "tls://host"] {
@@ -369,6 +452,10 @@ mod persistence_tests {
         let current = serde_json::to_value(&settings.value).unwrap();
         drop(settings);
         for name in [
+            "mode",
+            "families",
+            "max_mtu",
+            "transport_snapshots",
             "passwords",
             "autostart",
             "auto_connect",

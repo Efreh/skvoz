@@ -1,15 +1,15 @@
 [package]
 name = "skvoz-ubuntu-client"
-version = "1.1.0"
-description = "Native Ubuntu HTTP CONNECT and SOCKS5 desktop client"
+version = "2.0.0"
+description = "Native Ubuntu client for the shared SKVOZ network runtime"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
-gtk = { package = "gtk4", version = "=0.11.5", features = ["v4_14"] }
-adw = { package = "libadwaita", version = "=0.9.2", features = ["v1_5"] }
+gtk = { package = "gtk4", version = "=0.11.5", features = ["v4_14"], optional = true }
+adw = { package = "libadwaita", version = "=0.9.2", features = ["v1_5"], optional = true }
 async-nats = { version = "=0.50.0", default-features = false, features = ["ring"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", features = ["rt", "macros", "time", "net", "sync", "process", "io-util", "io-std", "signal"] }
@@ -19,18 +19,29 @@ getrandom = "=0.4.3"
 url = "=2.5.8"
 libc = "=0.2.183"
 
+skvoz-core = { path = "../../core", features = ["nats"] }
+skvoz-network = { path = "../../network" }
+skvoz-network-native = { path = "../../network/native" }
+
 [lints]
 workspace = true
 
 [features]
-default = []
+default = ["desktop"]
+desktop = ["dep:gtk", "dep:adw"]
 qualification = []
 
 [[bin]]
 name = "skvoz-client"
 path = "src/main.rs"
+required-features = ["desktop"]
 
 [[bin]]
 name = "skvoz-client-test-driver"
 path = "src/bin/test_driver.rs"
 required-features = ["qualification"]
+
+[[test]]
+name = "ui"
+path = "tests/ui.rs"
+required-features = ["desktop"]

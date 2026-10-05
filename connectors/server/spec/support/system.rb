@@ -9,13 +9,16 @@ require 'rbconfig'
 require 'securerandom'
 require 'socket'
 require 'timeout'
-require_relative '../../../../clients/ruby/skvoz_ipc'
+require 'io/nonblock'
+require_relative '../../lib/skvoz/server/service'
+require_relative 'runtime_client'
 
 module ServerSystem
   extend self
   COMPONENT = Pathname.new(__dir__).join('../..').expand_path
   ROOT = COMPONENT.join('../..').expand_path
   CORE = ENV.fetch('SKVOZ_TEST_CORE', 'skvoz-core-daemon')
+  RUNTIME = ENV.fetch('SKVOZ_TEST_RUNTIME', 'skvoz-network-runtime')
   NATS = ENV.fetch('SKVOZ_TEST_NATS', 'nats-server')
   PEBBLE = ENV.fetch('SKVOZ_TEST_PEBBLE', 'pebble')
 
@@ -180,86 +183,29 @@ module ServerSystem
     socket.write('after-fin:'.b + request.reverse)
   end
 
-  def device_ready(path)
-    return false unless File.socket?(path)
-    client = SkvozIPC::Client.new(path.to_s)
-    client.request(11, 0, [0].pack('Q>'))[3] == "\1".b
+  def device_ready(client)
+    response, = client.request('STATUS')
+    response.dig('result', 'lifecycle') == 'ready'
   rescue IOError, SystemCallError
     false
-  ensure
-    client&.close
   end
 
-  def open_client(path, port, host: '127.0.0.1')
-    client = SkvozIPC::Client.new(path.to_s)
-    metadata = JSON.generate(v: 1, type: 'tcp', host:, port:)
-    code, _, handle = client.request(2, 0, [0].pack('Q>') + metadata)
-    raise IOError, "OPEN admission failed #{code}" unless code.zero?
-    Timeout.timeout(10) do
-      loop do
-        kind, _, event_handle, payload = client.event
-        raise IOError, 'Unexpected stream handle' unless event_handle == handle
-        return [client, handle] if kind == SkvozIPC::OPENED && JSON.parse(payload)['status'] == 'connected'
-        raise IOError, "OPEN failed #{kind}" if [SkvozIPC::CLOSED, SkvozIPC::REJECTED].include?(kind)
-      end
-    end
-  rescue Exception
-    client&.close
-    raise
-  end
-
-  def closed(client, handle)
-    Timeout.timeout(12) do
-      loop do
-        kind, _, event_handle, payload = client.event
-        raise IOError, 'Unexpected stream handle' unless event_handle == handle
-        return payload if kind == SkvozIPC::CLOSED
-        raise IOError, 'Unexpected stream rejection' if kind == SkvozIPC::REJECTED
-      end
-    end
-  end
-
-  def transfer(path, port, payload = ''.b, host: '127.0.0.1', reject: nil, metadata: nil, timeout: 15, receive_delay: 0)
-    client = SkvozIPC::Client.new(path.to_s)
-    metadata ||= JSON.generate(v: 1, type: 'tcp', host:, port:)
-    code, _, handle = client.request(2, 0, [0].pack('Q>') + metadata)
-    raise IOError, "OPEN admission failed #{code}" unless code.zero?
-    pending, received = payload.b, ''.b
-    accepted = finished = false
+  def transfer(client, port, payload = ''.b, host: '127.0.0.1', reject: nil, timeout: 15, receive_delay: 0)
     Timeout.timeout(timeout) do
-      loop do
-        if accepted && !pending.empty?
-          code, count = client.request(5, handle, pending.byteslice(0, 1024))
-          raise IOError, "SEND failed #{code}" unless [0, 1].include?(code)
-          pending = pending.byteslice(count..)
-        elsif accepted && !finished
-          raise IOError, 'FINISH failed' unless client.request(7, handle)[0].zero?
-          finished = true
-          sleep receive_delay
-        end
-        next unless !client.events.empty? || IO.select([client.socket], nil, nil, 0.005)
-        kind, _, event_handle, bytes = client.event
-        raise IOError, 'Unexpected stream handle' unless event_handle == handle
-        case kind
-        when SkvozIPC::OPENED
-          raise IOError, 'False connected response' unless JSON.parse(bytes)['status'] == 'connected'
-          accepted = true
-        when SkvozIPC::REJECTED
-          error = JSON.parse(bytes)['error']
-          raise IOError, "Unexpected REJECT #{error}, expected #{reject}" unless error == reject
-          return nil
-        when SkvozIPC::DATA
-          raise IOError, 'DATA offset mismatch' unless bytes.unpack1('Q>') == received.bytesize
-          received << bytes.byteslice(8..)
-          client.consume(handle, received.bytesize)
-        when SkvozIPC::REMOTE_FINISHED, SkvozIPC::CLOSED
-          raise IOError, "Early terminal #{kind}: #{bytes.unpack1('H*')}" unless !reject && accepted && pending.empty?
-          return received
-        end
+      begin
+        socket = client.open(host, port)
+      rescue IOError
+        raise unless reject
+        return nil
       end
+      raise IOError, 'Expected destination rejection' if reject
+      socket.write(payload)
+      socket.close_write
+      sleep receive_delay
+      socket.read
+    ensure
+      socket&.close
     end
-  ensure
-    client&.close
   end
 
   def credentials_work(server, username, password, subject: nil)
@@ -288,13 +234,13 @@ module ServerSystem
 
   class Server
     attr_reader :directory, :state, :config, :value, :port, :monitor, :process, :log, :cli
-    def initialize(directory, overrides: {}, core: CORE, nats: NATS, allow: [])
+    def initialize(directory, overrides: {}, nats: NATS, allow: [])
       @directory = Pathname.new(directory)
       @cli = [RbConfig.ruby, COMPONENT.join('bin/skvoz-server').to_s]
       @state, @config, @log = %w[server-state server.json server.log].map { |name| @directory.join(name) }
       @port, @monitor = ServerSystem.free_port, ServerSystem.free_port
       @value = { 'state_dir' => @state.to_s, 'address' => 'localhost', 'bind' => '127.0.0.1', 'port' => @port,
-                 'monitor_port' => @monitor, 'nats_binary' => nats.to_s, 'core_binary' => core.to_s, 'allow' => allow,
+                 'monitor_port' => @monitor, 'nats_binary' => nats.to_s, 'runtime_binary' => RUNTIME, 'allow' => allow, 'network' => {},
                  'tls' => { 'mode' => 'provided', 'certificate' => @directory.join('server.pem').to_s,
                             'key' => @directory.join('server.key').to_s, 'ca' => @directory.join('ca.pem').to_s } }.merge(overrides)
       ServerSystem.private_json(@config, @value)
@@ -343,21 +289,21 @@ module ServerSystem
 
   class Device
     attr_reader :path, :profile, :process, :log
-    def initialize(directory, bundle, core = CORE, server_port = nil)
+    def initialize(directory, bundle, server_port = nil)
       directory = Pathname.new(directory)
       directory.mkdir(0o700)
-      @path, @profile, @log = %w[core.sock profile.json daemon.log].map { |name| directory.join(name) }
-      @core = core.to_s
-      if server_port && bundle['port'] != server_port
-        raise ArgumentError, 'Exported port differs from published server port'
-      end
+      @profile, @log = %w[profile.json runtime.log].map { |name| directory.join(name) }
+      raise ArgumentError, 'Exported port mismatch' if server_port && bundle['port'] != server_port
       ca = directory.join('ca.pem')
       ca.write(bundle.fetch('ca_pem')); ca.chmod(0o600)
-      ServerSystem.private_json(@profile, { 'ipc_path' => @path.to_s, 'url' => "tls://127.0.0.1:#{bundle.fetch('port')}",
-        'tls_server_name' => bundle.fetch('address'), 'trust' => 'managed_ca', 'ca_file' => ca.to_s,
-        'username' => bundle.fetch('username'), 'password' => bundle.fetch('password'), 'namespace' => bundle.fetch('namespace'),
-        'peer_id' => bundle.fetch('peer_id'), 'allowed_peers' => [0], 'initiate' => [0],
-        'limits' => { 'owners' => 64, 'output_frames' => 2048, 'output_bytes' => 1_048_576, 'subscription_frames' => 256 } })
+      limits = Skvoz::Server::NetworkConfiguration::LIMITS.merge('ip_sessions' => 1, 'core_streams' => 32,
+        'lease_identities' => 1, 'core_receive_bytes' => 2097152, 'core_send_bytes' => 2097152,
+        'runtime_buffer_bytes' => 16777216, 'runtime_buffer_records' => 4096)
+      ServerSystem.private_json(@profile, { v: 1, role: 'client', server: nil,
+        core: { url: "tls://127.0.0.1:#{bundle.fetch('port')}", tls_server_name: bundle.fetch('address'),
+          trust: 'managed_ca', ca_file: ca.to_s, username: bundle.fetch('username'), password: bundle.fetch('password'),
+          namespace: bundle.fetch('namespace'), peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: ['0'], initiate: ['0'] },
+        network: { families: [4], max_mtu: 1400, channels: 1, limits: } })
       @output = File.open(@log, 'ab')
       start
     rescue Exception
@@ -366,22 +312,40 @@ module ServerSystem
     end
 
     def start
-      @process = Process.spawn(@core, '--config', @profile.to_s, out: @output, err: @output)
+      owner, child = UNIXSocket.pair
+      owner.nonblock = child.nonblock = true
+      @process = Process.spawn(RUNTIME, '--config', @profile.to_s, '--control-fd', '3', 3 => child, out: @output, err: @output)
+      child.close
+      @path = RuntimeClient.new(owner)
+      hello, = @path.request('HELLO', { api: 1, network: 2 })
+      raise IOError, 'Runtime HELLO rejected' if hello['error']
       ServerSystem.wait_until do
         raise IOError, "Device startup failed: #{@log.read}" if ServerSystem.process_dead(@process)
-        ServerSystem.device_ready(@path)
+        response, = @path.request('STATUS')
+        response.dig('result', 'lifecycle') == 'ready'
       end
+      response, = @path.request('START_PROXY', { http_bind: nil, socks_bind: nil })
+      raise IOError, 'Runtime mode admission failed' if response['error']
     end
 
     def restart
-      ServerSystem.terminate(@process, timeout: 8) if @process
-      @process = nil
+      stop
       start
     end
 
-    def close
+    def stop
+      begin
+        @path&.request('PREPARE_SHUTDOWN')
+      rescue IOError, Timeout::Error
+        nil
+      end
+      @path&.close
       ServerSystem.terminate(@process, timeout: 8) if @process
       @process = nil
+    end
+
+    def close
+      stop
     ensure
       @output&.close unless @output&.closed?
     end

@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-testbench"
-version = "1.1.1"
+version = "1.2.0"
 description = "Experimental two-sided SKVOZ harness over real NATS"
 edition.workspace = true
 rust-version.workspace = true
@@ -14,9 +14,14 @@ real-nats = ["skvoz-core/fault-injection"]
 serde_json = "=1.0.151"
 skvoz-tcp = { path = "../connectors/tcp" }
 skvoz-core = { path = "../core", features = ["nats"] }
+skvoz-network = { path = "../network" }
+skvoz-network-native = { path = "../network/native" }
 async-nats = { version = "=0.50.0", default-features = false, features = ["ring"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+
+[dev-dependencies]
+skvoz-network-ffi = { path = "../network/ffi" }
 
 [[test]]
 name = "multi_owner"

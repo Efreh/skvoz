@@ -1,16 +1,19 @@
+#[cfg(feature = "desktop")]
 pub mod app;
 pub mod backend;
+#[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod enrollment;
 pub mod ipc;
-pub mod proxy;
+
 pub mod settings;
 pub mod telemetry;
+#[cfg(feature = "desktop")]
 pub mod tray;
+#[cfg(feature = "desktop")]
 pub mod ui;
-pub const DAEMON_VERSION: &str = "1.4.0";
-pub const RECEIVE_WINDOW: usize = 1024 * 1024;
-pub const DATA_BLOCK: usize = 32 * 1024;
+pub const RUNTIME_VERSION: &str = "0.1.0";
+
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Error(pub &'static str);

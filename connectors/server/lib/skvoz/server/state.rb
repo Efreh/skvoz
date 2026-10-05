@@ -1,42 +1,52 @@
 # frozen_string_literal: true
 require 'bcrypt'
 require 'securerandom'
-require_relative 'tls'
-require_relative 'policy'
+require 'json'
+require 'uri'
+require_relative 'process'
+require_relative 'network_configuration'
 
 module Skvoz
   module Server
     class Configuration
-      DEFAULTS = { 'state_dir' => '/var/lib/skvoz', 'address' => nil, 'port' => 4222, 'advertised_port' => nil, 'bind' => '0.0.0.0',
-                   'namespace' => 'skvoz.application', 'core_binary' => 'skvoz-core-daemon', 'nats_binary' => 'nats-server',
+      DEFAULTS = { 'v' => 3, 'state_dir' => '/var/lib/skvoz', 'address' => nil, 'port' => 4222, 'advertised_port' => nil, 'bind' => '0.0.0.0',
+                   'namespace' => 'skvoz.application', 'runtime_binary' => 'skvoz-network-runtime', 'helper_binary' => 'skvoz-network-helper', 'nats_binary' => 'nats-server',
                    'monitor_port' => 8222, 'admin_timeout' => 5, 'stop_timeout' => 8,
-                   'max_streams' => 64, 'receive_window' => 1_048_576, 'stream_queue_frames' => 128, 'stream_queue_bytes' => 2_097_152, 'tcp_buffer_bytes' => 262_144, 'max_identities' => 128, 'devices_per_user' => 8,
-                   'allow' => [], 'deny' => [], 'tls' => {} }.freeze
+                   'max_identities' => 128, 'devices_per_user' => 8,
+                   'allow' => [], 'deny' => [],
+                   'network' => { 'ipv4' => { 'pool' => '10.203.0.0/16', 'egress' => 'nat44', 'interface' => 'eth0' }.freeze,
+                                  'dns_servers' => ['1.1.1.1'].freeze }.freeze,
+                   'tls' => {} }.freeze
       attr_reader :value
 
       def initialize(value)
         raise Error, 'Invalid server configuration' unless value.is_a?(Hash) && (value.keys - DEFAULTS.keys).empty?
         @value = DEFAULTS.merge(value)
-        %w[state_dir core_binary nats_binary namespace bind].each do |key|
+        %w[state_dir runtime_binary helper_binary nats_binary namespace bind].each do |key|
           item = @value[key]
           raise Error, 'Invalid server configuration string' unless item.is_a?(String) && item.bytesize.between?(1, 4096) && !item.include?("\0")
         end
         raise Error, 'State directory must be absolute' unless @value['state_dir'].start_with?('/')
         @value['advertised_port'] = @value['port'] if @value['advertised_port'].nil?
         address = @value['address']
-        Destination.new(Protocol.metadata(v: 1, type: 'tcp', host: address, port: @value['port']))
+        raise Error, 'Invalid server address' unless address.is_a?(String) && address.bytesize.between?(1, 253) && address.ascii_only? && !address.include?('%') && !address.include?('/') && !address.include?('[')
+        begin
+          IPAddr.new(address)
+        rescue IPAddr::InvalidAddressError
+          raise Error, 'Invalid server address' if address.match?(/\A[\d.]+\z/) || !address.split('.').all? { |label| label.match?(/\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\z/) }
+        end
+        raise Error, 'Unsupported server configuration version' unless @value['v'].is_a?(Integer) && @value['v'] == 3
         bind = IPAddr.new(@value['bind'])
         raise Error, 'Bind must accept the internal IPv4 loopback dial' unless bind.ipv4? && (bind.to_i.zero? || bind.to_s == '127.0.0.1')
-        { 'port' => 1..65_535, 'advertised_port' => 1..65_535, 'tcp_buffer_bytes' => 1024..262144, 'monitor_port' => 1..65_535, 'max_streams' => 1..1024, 'receive_window' => 8192..1_048_576, 'stream_queue_frames' => 1..128, 'stream_queue_bytes' => 8192..8_388_608, 'max_identities' => 1..512,
+        { 'port' => 1..65_535, 'advertised_port' => 1..65_535, 'monitor_port' => 1..65_535, 'max_identities' => 1..128,
           'devices_per_user' => 1..64, 'admin_timeout' => 1..30, 'stop_timeout' => 1..60 }.each do |key, range|
           raise Error, 'Invalid server configuration limit' unless @value[key].is_a?(Integer) && range.cover?(@value[key])
         end
-        raise Error, 'Configured stream queue cannot hold receive window' if @value['stream_queue_bytes'] < @value['receive_window']
         raise Error, 'Identity allocation exceeds configured budget' if @value['devices_per_user'] > @value['max_identities']
         raise Error, 'Port settings conflict' if @value['port'] == @value['monitor_port']
         raise Error, 'Invalid namespace' unless @value['namespace'].match?(/\A[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\z/) && @value['namespace'].bytesize <= 256
         raise Error, 'Invalid policy configuration' unless @value['allow'].is_a?(Array) && @value['deny'].is_a?(Array) && @value['allow'].length + @value['deny'].length <= 128
-        Policy.new(allow: @value['allow'], deny: @value['deny'])
+        NetworkConfiguration.new(self)
         validate_tls
       rescue IPAddr::InvalidAddressError, KeyError, TypeError, URI::InvalidURIError
         raise Error, 'Invalid server configuration'
@@ -159,11 +169,11 @@ module Skvoz
         raise Error, 'TLS material missing' unless tls
         namespace = @config['namespace']
         server_permissions = { 'publish' => ["#{namespace}.join.*.0", "#{namespace}.lane.*.*.0.*.0.*"],
-                               'subscribe' => ["#{namespace}.join.0.*", "#{namespace}.lane.0.*.*.*.*.*", 'skvoz.enroll.v1.*'] }
+                               'subscribe' => ["#{namespace}.join.0.*", "#{namespace}.lane.0.*.*.*.*.*", 'skvoz.enroll.v2.*'] }
         server_permissions['publish'] << 'skvoz.enroll.reply.*.*'
         users = [{ 'user' => INTERNAL, 'password' => state.fetch('internal_hash'), 'permissions' => server_permissions }]
         state.fetch('users').each do |login, user|
-          publish, subscribe = ["skvoz.enroll.v1.#{login}"], ["skvoz.enroll.reply.#{login}.*"]
+          publish, subscribe = ["skvoz.enroll.v2.#{login}"], ["skvoz.enroll.reply.#{login}.*"]
           user.fetch('assigned').each do |id|
             publish.concat(["#{namespace}.join.0.#{id}", "#{namespace}.lane.0.*.#{id % 8}.*.#{id}.*"])
             subscribe.concat(["#{namespace}.join.#{id}.*", "#{namespace}.lane.#{id}.*.*.*.*.*"])
@@ -187,28 +197,22 @@ module Skvoz
         CONF
       end
 
-      def profile
+      def profile(policy)
         tls = @value.fetch('tls')
-        window, streams = @config['receive_window'], @config['max_streams']
-        frame = [32_768, window].min
-        profile = { 'ipc_path' => File.join(@directory, 'core.sock'), 'url' => "tls://127.0.0.1:#{@config['port']}",
-                    'tls_server_name' => @config['address'], 'trust' => tls['ca'] ? 'managed_ca' : 'system',
-                    'username' => INTERNAL, 'password' => @value.fetch('internal_password'), 'namespace' => @config['namespace'],
-                    'peer_id' => 0, 'broker_authorized' => true,
-                    'limits' => { 'owners' => 8, 'streams_per_owner' => [streams + 16, 1024].min, 'streams' => streams + 16,
-                                  'streams_per_peer' => streams + 16, 'peers' => @config['max_identities'],
-                                  'receive_window' => window, 'max_frame' => frame,
-                                  'receive_bytes' => [window * (streams + 16), 536_870_912].min, 'receive_bytes_per_peer' => [window * (streams + 16), 67_108_864].min,
-                                  'send_bytes' => [frame * 8 * streams, 67_108_864].min, 'send_bytes_per_peer' => [frame * 8 * streams, 8_388_608].min,
-                                  'output_frames' => [streams * 128, 4096].min, 'output_bytes' => [streams * @config['stream_queue_bytes'], 8_388_608].min,
-                                  'subscription_frames' => [streams * (window / frame + 4), 128].max, 'join_frames' => 1024 } }
-        profile['ca_file'] = tls['ca'] if tls['ca']
-        profile
+        identity = @config['address']
+        url = "tls://127.0.0.1:#{@config['port']}"
+        { 'v' => 1, 'role' => 'server', 'network' => policy.network, 'server' => policy.server,
+          'core' => { 'url' => url, 'tls_server_name' => identity,
+            'trust' => tls['ca'] ? 'managed_ca' : 'system', 'ca_file' => tls['ca'],
+            'username' => INTERNAL, 'password' => @value.fetch('internal_password'),
+            'namespace' => @config['namespace'], 'peer_id' => '0', 'membership' => 'broker_authorized',
+            'allowed_peers' => [], 'initiate' => [] } }
       end
 
       def export(login, id, password)
-        { 'v' => 1, 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login,
+        { 'v' => 2, 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login,
           'password' => password, 'namespace' => @config['namespace'], 'peer_id' => id,
+          'network_runtime' => { 'network' => 2, 'api' => 1, 'version' => '0.1.0', 'core' => '3.1.0' },
           'allowed_peers' => [0], 'initiate' => [0], 'shards' => 8,
           'trust' => @value.fetch('tls')['ca'] ? 'managed_ca' : 'system' }
       end

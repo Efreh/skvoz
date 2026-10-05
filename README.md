@@ -7,7 +7,7 @@ SKVOZ доставляет двунаправленные байтовые по�
 
 | Задача | С чего начать |
 | --- | --- |
-| Использовать настольное приложение | [Клиент Ubuntu](docs/ubuntu-client.md): установка deb, подключение, локальные HTTP/CONNECT/SOCKS5 интерфейсы. |
+| Использовать настольное приложение | [Клиент Ubuntu](docs/ubuntu-client.md): установка deb, подключение и два режима работы. |
 | Развернуть серверный коннектор | [Руководство сервера](docs/server-connector.md): Docker/Compose, NATS, учётные данные и TLS. |
 | Встроить доставку данных в своё приложение | [Библиотека Core](core/README.md) для Rust или [демон и IPC](docs/daemon-ipc.md) для других языков. |
 | Разрабатывать и проверять проект | [Первый запуск стенда](docs/getting-started.md), [карта исходников](docs/repository.md), [архитектура](docs/architecture.md). |
@@ -18,8 +18,9 @@ SKVOZ доставляет двунаправленные байтовые по�
 | --- | --- |
 | [core/](core/README.md) | Общая Rust-библиотека: Stream/Manager без I/O, кодек, статический NatsNode и динамический NatsRuntime. |
 | [daemon/](daemon/README.md) | Linux-процесс с той же библиотекой Core, закрытым Unix-сокетом и IPC v1. |
-| [connectors/server/](connectors/server/README.md) | TCP-коннектор на Ruby, управление NATS/Core, пользователями и сертификатами; один образ для GHCR и локальной сборки. |
-| [clients/ubuntu/](clients/ubuntu/README.md) | Нативное приложение GTK4/libadwaita с комплектным демоном Core. |
+| [network/](network/README.md) | Общий TCP/IP runtime со встроенным Core, API 1, native boundary, Linux helper и FFI; сетевая квалификация новой интеграции продолжается. |
+| [connectors/server/](connectors/server/README.md) | Ruby host общего Rust runtime, управление NATS, пользователями и сертификатами; один образ для GHCR и локальной сборки. |
+| [clients/ubuntu/](clients/ubuntu/README.md) | Нативное GTK4/libadwaita приложение с общим runtime, локальными подключениями и сетевым интерфейсом. |
 | [clients/python/](clients/python/README.md), [clients/ruby/](clients/ruby/README.md) | Самостоятельные IPC-примеры на стандартных библиотеках. |
 | [connectors/tcp/](connectors/tcp/README.md) | Экспериментальный ретранслятор одного TCP-сокета через встроенный Core. |
 | [testbench/](testbench/README.md) | Реальные NATS/TCP-сценарии и измерения нагрузки; отдельный стенд, не зависимость продукта. |
@@ -46,7 +47,9 @@ Core/daemon/TCP и реальные транспортные сценарии. �
 Динамический NatsRuntime поддерживает присоединение, проверку живости участников
 и восстановление для новых потоков. Прерванная передача байтов не возобновляется.
 Логические бюджеты Core не гарантируют RSS всего процесса; интерфейсы ядра и
-формат пакетов остаются экспериментальными.
+формат пакетов остаются экспериментальными. Общая TCP/IP интеграция описана
+в [сетевом контракте](docs/network-runtime.md); compiler и unit tests не заменяют
+реальную квалификацию gateway и установки приложений.
 
 [Указатель документации](docs/README.md) связывает действующие контракты,
 инструкции и [направления развития](docs/concept.md).

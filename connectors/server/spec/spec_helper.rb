@@ -2,7 +2,10 @@
 require 'bundler/setup'
 require 'rspec'
 require 'tmpdir'
-require_relative '../lib/skvoz/server/service'
+require 'async'
+require_relative '../lib/skvoz/server/state'
+require_relative '../lib/skvoz/server/runtime_control'
+require_relative '../lib/skvoz/server/enrollment'
 
 RSpec.configure do |config|
   config.order = :random

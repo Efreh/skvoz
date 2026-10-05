@@ -22,6 +22,7 @@ RSpec.describe 'Server deployment through Compose', compose: true do
       expect(server.fetch('environment').fetch('SKVOZ_ADVERTISED_PORT')).to eq('31422')
       expect(server.fetch('ports').find { |port| port.fetch('target') == 4222 }.fetch('published')).to eq('31422')
       expect(server.fetch('environment').fetch('SKVOZ_ACME_TERMS_AGREED')).to eq('false')
+      expect(server.fetch('environment')).not_to have_key('SKVOZ_NETWORK')
     end
   end
 
@@ -30,20 +31,23 @@ RSpec.describe 'Server deployment through Compose', compose: true do
       image = ENV.fetch('SKVOZ_TEST_IMAGE', 'skvoz-server:qualification')
       compose = ENV['SKVOZ_TEST_COMPOSE'] ? [ENV.fetch('SKVOZ_TEST_COMPOSE')] : %w[docker compose]
       token = SecureRandom.hex(6)
-      project, volume, helper = %w[skvoz-spec skvoz-state skvoz-input].map { |prefix| "#{prefix}-#{token}" }
+      project, volume, helper, network_volume = %w[skvoz-spec skvoz-state skvoz-input skvoz-network-state].map { |prefix| "#{prefix}-#{token}" }
       target = ServerSystem::Target.new(host: '0.0.0.0') { |socket| after_fin(socket) }
       devices = []
       base = nil
       directory = nil
       begin
         execute('docker', 'volume', 'create', volume)
+        execute('docker', 'volume', 'create', network_volume)
         directory = Pathname.new(Dir.mktmpdir('skvoz-compose-'))
         certificates(directory)
         gateway = JSON.parse(execute('docker', 'network', 'inspect', 'bridge')).first.fetch('IPAM').fetch('Config').first.fetch('Gateway')
         published_port = free_port
         private_json(directory.join('server.json'), {
           advertised_port: published_port, state_dir: '/var/lib/skvoz', address: 'localhost',
-          allow: [{ cidr: "#{gateway}/32", ports: [target.port] }],
+          **(source ? { network: { ipv4: { pool: '10.203.0.0/24', egress: 'nat44', interface: 'eth0' },
+                                  dns_servers: ['1.1.1.1'] } } : {}),
+          allow: [{ cidr: "#{gateway}/32", protocols: [6], ports: [target.port] }],
           tls: { mode: 'provided', certificate: '/var/lib/skvoz/input/server.pem',
                  key: '/var/lib/skvoz/input/server.key', ca: '/var/lib/skvoz/input/ca.pem' }
         })
@@ -52,10 +56,13 @@ RSpec.describe 'Server deployment through Compose', compose: true do
           services:
             server:
               image: #{JSON.generate(image)}
-              command: [serve, --config, /var/lib/skvoz/input/server.json]
+              command: [serve, --config, /var/lib/skvoz-network/server.json]
               ports: !override ["127.0.0.1:#{published_port}:4222"]
               extra_hosts: ["host.docker.internal:host-gateway"]
           volumes:
+            network-state:
+              external: true
+              name: #{network_volume}
             state:
               external: true
               name: #{volume}
@@ -74,23 +81,31 @@ RSpec.describe 'Server deployment through Compose', compose: true do
           JSON.parse(execute(*argv))
         end
         execute('docker', 'run', '-d', '--name', helper, '--user', '0', '--entrypoint', 'sleep',
-                '-v', "#{volume}:/var/lib/skvoz", image, '120')
+                '-v', "#{volume}:/var/lib/skvoz", '-v', "#{network_volume}:/var/lib/skvoz-network", image, '120')
         execute('docker', 'exec', helper, 'mkdir', '-m', '0700', '/var/lib/skvoz/input')
-        %w[server.pem server.key ca.pem server.json].each do |name|
+        %w[server.pem server.key ca.pem].each do |name|
           execute('docker', 'cp', directory.join(name), "#{helper}:/var/lib/skvoz/input/#{name}")
         end
         execute('docker', 'exec', helper, 'chown', '-R', '10001:10001', '/var/lib/skvoz')
+        execute('docker', 'exec', helper, 'mkdir', '-p', '/var/lib/skvoz-network')
+        execute('docker', 'exec', helper, 'chmod', '0700', '/var/lib/skvoz-network')
+        execute('docker', 'cp', directory.join('server.json'), "#{helper}:/var/lib/skvoz-network/server.json")
+        execute('docker', 'exec', helper, 'chown', '0:0', '/var/lib/skvoz-network/server.json')
+        execute('docker', 'exec', helper, 'chmod', '0600', '/var/lib/skvoz-network/server.json')
         execute('docker', 'rm', '-f', helper)
         command.call('config', '--quiet')
         command.call('build', 'server', timeout: 1800) if source
         command.call('up', '-d', '--pull', 'never')
         wait_until(timeout: 30, &health)
         cid = command.call('ps', '-q', 'server')
+        links = JSON.parse(execute('docker', 'exec', cid, 'ip', '-d', '-j', 'address', 'show'))
+        expect(links.find { |link| link.fetch('ifname') == 'skvoz0' }.fetch('ifalias')).to start_with('skvoz:')
+        expect(execute('docker', 'exec', cid, 'nft', 'list', 'tables')).to include('table inet skvoz_network')
         port = command.call('port', 'server', '4222').split(':').last.to_i
         bundle = admin.call('add', 'shared')
         expect(bundle.fetch('port')).to eq(published_port)
         expect(port).to eq(published_port)
-        device = ServerSystem::Device.new(directory.join('first'), bundle, ServerSystem::CORE, port)
+        device = ServerSystem::Device.new(directory.join('first'), bundle, port)
         devices << device
         expect(transfer(device.path, target.port, 'container', host: 'host.docker.internal')).to eq('after-fin:reniatnoc')
         users = admin.call('list')
@@ -105,8 +120,8 @@ RSpec.describe 'Server deployment through Compose', compose: true do
 
         old_pids = execute('docker', 'top', cid, '-eo', 'pid,comm').lines.drop(1).map { |line| Integer(line.split.first) }
         expect(old_pids).not_to be_empty
-        execute('docker', 'exec', cid, 'ruby', '-rjson', '-e',
-                'Process.kill("KILL", JSON.parse(File.read("/var/lib/skvoz/admin-owner.json")).fetch("pid"))')
+        execute('docker', 'exec', '--user', '10001:10001', cid, 'ruby', '-rjson', '-e',
+                'owner = JSON.parse(File.read("/var/lib/skvoz/admin-owner.json")).fetch("pid"); children = File.read("/proc/#{owner}/task/#{owner}/children").split.map(&:to_i); runtime = children.find { |pid| File.read("/proc/#{pid}/comm").strip == "skvoz-network-r" }; abort "Runtime child missing" unless runtime && runtime != 1; Process.kill("KILL", runtime)')
         wait_until(timeout: 10) { old_pids.all? { |pid| process_dead(pid) } }
         wait_until(timeout: 30, &health)
         wait_until { device_ready(device.path) }
@@ -125,6 +140,7 @@ RSpec.describe 'Server deployment through Compose', compose: true do
         cleanups << -> { execute(*base, 'down', '--timeout', '15') } if base
         cleanups << -> { ServerSystem.capture('docker', 'rm', '-f', helper, timeout: 10) }
         cleanups << -> { execute('docker', 'volume', 'rm', volume) }
+        cleanups << -> { execute('docker', 'volume', 'rm', network_volume) }
         cleanups << -> { target.close }
         cleanups << -> { FileUtils.remove_entry(directory) } if directory
         cleanups.each do |cleanup|

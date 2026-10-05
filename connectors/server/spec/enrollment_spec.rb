@@ -17,8 +17,8 @@ RSpec.describe 'Authenticated device enrollment', integration: true do
         raise IOError, 'Enrollment permission rejected' if !line || line.start_with?('-ERR')
         break if line == "PONG\r\n"
       end
-      payload ||= JSON.generate(v: 1, device: token)
-      tls.write("PUB skvoz.enroll.v1.#{request_login} #{reply_target || reply} #{payload.bytesize}\r\n#{payload}\r\nPING\r\n")
+      payload ||= JSON.generate(v: 2, device: token)
+      tls.write("PUB skvoz.enroll.v2.#{request_login} #{reply_target || reply} #{payload.bytesize}\r\n#{payload}\r\nPING\r\n")
       loop do
         line = tls.gets("\r\n", 4096)
         raise IOError, 'Enrollment permission rejected' if !line || line.start_with?('-ERR')
@@ -65,8 +65,8 @@ RSpec.describe 'Authenticated device enrollment', integration: true do
   it 'rejects cross-login subjects/replies, malformed bodies and bounded exhaustion' do
     expect { enrollment(@server, 'shared', 'process-test-password', 'a' * 32, request_login: 'other') }.to raise_error(IOError)
     expect { enrollment(@server, 'shared', 'process-test-password', 'a' * 32, reply_login: 'other') }.to raise_error(IOError)
-    expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":1,"device":"bad","login":"other"}')).to include('error' => 'enrollment_failed')
-    expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":1,"v":1,"device":"' + 'a' * 32 + '"}')).to include('error' => 'enrollment_failed')
+    expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":2,"device":"bad","login":"other"}')).to include('error' => 'enrollment_failed')
+    expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":2,"v":2,"device":"' + 'a' * 32 + '"}')).to include('error' => 'enrollment_failed')
     expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: 'x' * 65_000)).to include('error' => 'invalid_request')
     %w[a b c].each { |letter| expect(enrollment(@server, 'shared', 'process-test-password', letter * 32)).to have_key('peer_id') }
     expect(enrollment(@server, 'shared', 'process-test-password', 'd' * 32)).to include('error' => 'device_limit')
@@ -90,26 +90,16 @@ RSpec.describe 'Authenticated device enrollment', integration: true do
       nil
     end
     @server.stop
-    @server.value['allow'] = [{ 'cidr' => '127.0.0.1/32', 'ports' => [target.port] }]
+    @server.value['allow'] = [{ 'cidr' => '127.0.0.1/32', 'protocols' => [6], 'ports' => [target.port] }]
     private_json(@server.config, @server.value)
     @server.start
     bundle = @server.command('device-add', 'other', 'process-other-password')
     device = ServerSystem::Device.new(@server.directory.join('device'), bundle)
-    client, handle = open_client(device.path, target.port)
+    client = device.path.open('127.0.0.1', target.port)
     children = File.read("/proc/#{@server.process}/task/#{@server.process}/children").split
     exchange = lambda do |bytes|
-      expect(client.request(5, handle, bytes)[1]).to eq(bytes.bytesize)
-      Timeout.timeout(5) do
-        loop do
-          kind, _, actual, payload = client.event
-          next if kind == SkvozIPC::WRITABLE
-          expect(actual).to eq(handle)
-          expect(kind).to eq(SkvozIPC::DATA)
-          expect(payload.byteslice(8..)).to eq(bytes)
-          client.consume(handle, payload.unpack1('Q>') + bytes.bytesize)
-          break
-        end
-      end
+      client.write(bytes)
+      Timeout.timeout(5) { expect(client.read(bytes.bytesize)).to eq(bytes) }
     end
     exchange.call('before-control'.b)
     expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: 'x' * 65_000)).to include('error' => 'invalid_request')

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::{
     CloseReason, Config, Direction, Error, Event, Frame, MAX_BATCH_EVENTS, MAX_FRAME_BYTES,
-    MAX_RECEIVE_WINDOW, ProtocolError, SendOutcome, Snapshot, State,
+    MAX_RECEIVE_WINDOW, PeerLimits, ProtocolError, SendOutcome, Snapshot, State,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +87,15 @@ impl Stream {
                 (true, true) => State::Draining,
             },
         }
+    }
+
+    /// Peer limits are unknown until a valid OPEN or ACCEPT has been received.
+    /// Reading them does not extract frames, consume bytes, or change credit.
+    pub fn peer_limits(&self) -> Option<PeerLimits> {
+        (self.peer_window != 0).then_some(PeerLimits {
+            receive_window: self.peer_window,
+            max_frame: self.peer_max_frame,
+        })
     }
 
     pub fn snapshot(&self) -> Snapshot {

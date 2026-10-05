@@ -1,5 +1,5 @@
 use crate::{
-    DAEMON_VERSION, Error, Result,
+    Error, RUNTIME_VERSION, Result,
     settings::{login, token, valid_token},
 };
 use futures_util::StreamExt;
@@ -11,8 +11,15 @@ pub struct Enrollment {
     pub v: u8,
     pub namespace: String,
     pub peer_id: u64,
-    pub daemon: String,
-    pub ipc: u8,
+    pub network_runtime: RuntimeVersion,
+}
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVersion {
+    pub version: String,
+    pub api: u8,
+    pub network: u8,
+    pub core: String,
 }
 #[derive(Clone)]
 pub struct Credentials {
@@ -21,6 +28,7 @@ pub struct Credentials {
     pub username: String,
     pub password: String,
     pub ca_file: String,
+    pub dial_ip: Option<std::net::IpAddr>,
 }
 impl Drop for Credentials {
     fn drop(&mut self) {
@@ -52,10 +60,25 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         if !credentials.ca_file.is_empty() {
             options = options.add_root_certificates(PathBuf::from(&credentials.ca_file));
         }
-        let host = if credentials.host.contains(':') {
-            format!("[{}]", credentials.host)
+        if credentials.dial_ip.is_some() {
+            let trust = if credentials.ca_file.is_empty() {
+                skvoz_core::runtime::Trust::System
+            } else {
+                skvoz_core::runtime::Trust::ManagedCa(PathBuf::from(&credentials.ca_file))
+            };
+            options = options.tls_client_config(
+                skvoz_core::runtime::verified_tls_config(&trust, &credentials.host)
+                    .map_err(|_| Error("certificate_failed"))?,
+            );
+        }
+        let dial_host = credentials
+            .dial_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| credentials.host.clone());
+        let host = if dial_host.contains(':') {
+            format!("[{}]", dial_host)
         } else {
-            credentials.host.clone()
+            dial_host
         };
         let client = options
             .connect(format!("tls://{host}:{}", credentials.port))
@@ -88,11 +111,11 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             .flush()
             .await
             .map_err(|_| Error("enrollment_failed"))?;
-        let body = serde_json::to_vec(&serde_json::json!({"v":1,"device":device}))
+        let body = serde_json::to_vec(&serde_json::json!({"v":2,"device":device}))
             .map_err(|_| Error("enrollment_failed"))?;
         client
             .publish_with_reply(
-                format!("skvoz.enroll.v1.{}", credentials.username),
+                format!("skvoz.enroll.v2.{}", credentials.username),
                 reply,
                 body.into(),
             )
@@ -116,7 +139,12 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         }
         let result: Enrollment =
             serde_json::from_value(value).map_err(|_| Error("version_mismatch"))?;
-        if result.v != 1 || result.daemon != DAEMON_VERSION || result.ipc != 1 {
+        if result.v != 2
+            || result.network_runtime.version != RUNTIME_VERSION
+            || result.network_runtime.api != 1
+            || result.network_runtime.network != 2
+            || result.network_runtime.core != "3.1.0"
+        {
             return Err(Error("version_mismatch"));
         }
         if result.peer_id == 0

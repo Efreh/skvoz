@@ -5,6 +5,8 @@
 !core/**
 !daemon/
 !daemon/**
+!network/
+!network/**
 !clients/
 clients/**
 !clients/ruby/

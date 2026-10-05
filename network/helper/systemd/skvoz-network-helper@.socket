@@ -1,0 +1,16 @@
+[Unit]
+Description=SKVOZ private network helper socket for UID %i
+
+[Socket]
+ListenStream=/run/skvoz-network-helper/%i/control.sock
+FileDescriptorName=control
+SocketUser=%i
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0711
+Backlog=1
+RemoveOnStop=yes
+Service=skvoz-network-helper@%i.service
+
+[Install]
+WantedBy=sockets.target

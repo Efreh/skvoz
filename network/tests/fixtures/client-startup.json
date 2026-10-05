@@ -1,0 +1,57 @@
+{
+  "v": 1,
+  "role": "client",
+  "core": {
+    "url": "tls://127.0.0.1:1",
+    "tls_server_name": null,
+    "trust": "system",
+    "ca_file": null,
+    "username": "fixture-user",
+    "password": "fixture-password",
+    "namespace": "network_fixture",
+    "peer_id": "1",
+    "membership": "allowlist",
+    "allowed_peers": [
+      "0"
+    ],
+    "initiate": [
+      "0"
+    ]
+  },
+  "network": {
+    "families": [
+      4
+    ],
+    "max_mtu": 1500,
+    "channels": 1,
+    "limits": {
+      "ip_sessions": 1,
+      "core_streams": 32,
+      "streams_per_peer": 32,
+      "lease_identities": 1,
+      "receive_window": 65536,
+      "max_frame": 16384,
+      "core_receive_bytes": 2097152,
+      "core_receive_peer_bytes": 2097152,
+      "core_send_bytes": 2097152,
+      "core_send_peer_bytes": 2097152,
+      "packet_queue_bytes": 262144,
+      "packet_queue_records": 256,
+      "control_queue_bytes": 32768,
+      "control_queue_records": 8,
+      "runtime_buffer_bytes": 16777216,
+      "runtime_buffer_records": 4096,
+      "api_queue_bytes": 131072,
+      "api_queue_records": 128,
+      "subscription_frames": 32,
+      "join_frames": 32,
+      "client_frames": 16,
+      "core_shards": 8,
+      "flow_buckets": 1024,
+      "setup_timeout_ms": 15000,
+      "teardown_timeout_ms": 3000,
+      "packet_io_timeout_ms": 1000
+    }
+  },
+  "server": null
+}

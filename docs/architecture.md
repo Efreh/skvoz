@@ -10,16 +10,21 @@
 опциональная возможность `nats` добавляет статический NatsNode и динамический
 NatsRuntime на Tokio/async-nats. Роль приложения не меняет реализацию или контракт ядра.
 
-[Серверный коннектор](server-connector.md) сейчас реализован на Ruby и управляет
-отдельными процессами NATS и демона Core, выдаёт учётные данные пользователей
-NATS и профили устройств, поддерживает жизненный цикл TLS. Через IPC он получает
-метаданные назначения с версией формата и разбирает их, затем передаёт прикладные
-байты TCP-сервисам, включая HTTP, без разбора прикладного протокола.
-По умолчанию разрешены публичные адреса Интернета; явные правила доступа
-позволяют строить мосты к частным и локальным сервисам.
-Граница коннектора не зависит от языка и допускает другую реализацию в будущем.
+[Серверный коннектор](server-connector.md) 3.0.0 на Ruby управляет NATS,
+пользователями, профилями устройств и TLS. TCP/IP I/O выполняет
+[общий Rust runtime](network-runtime.md) 0.1.0 с тем же Core 3.1.0;
+Ruby получает только управляющие события. Узкий helper создаёт общий Linux TUN,
+маршруты и policy gateway. Default policy допускает публичные unicast назначения,
+а обычные private/local сервисы требуют явных правил.
+Граница сервера не зависит от клиентской ОС, языка или local ingress.
 
-[Клиент Ubuntu](ubuntu-client.md) — нативный Rust-процесс с GTK4/libadwaita и локальными HTTP/HTTPS CONNECT/SOCKS5 адаптерами. Он автоматически выделяет устройство через broker-authorized enrollment и управляет комплектным Core daemon через закрытый IPC; прикладной TLS CONNECT остаётся непрозрачными байтами.
+[Клиент Ubuntu](ubuntu-client.md) 2.0.0 использует GTK4/libadwaita и тот же
+runtime с двумя режимами: локальные HTTP/CONNECT/SOCKS5 TCP-интерфейсы и L3
+IPv4/IPv6 через TUN. UI не копирует packet payload через API.
+Root helper настраивает клиентские маршруты/DNS/guard с разрешением polkit.
+Согласование network 2, локальный API 1 и FFI ABI 1 имеют отдельные версии;
+Core wire остаётся 1. Источники новой интеграции ещё требуют квалификации
+установленных приложений и реального gateway.
 
 Manager привязывает поток к `(PeerId, stream_id)`, при допуске резервирует всё
 объявленное окно приёма, ограничивает число активных и закрывающихся потоков,
@@ -44,21 +49,25 @@ Manager привязывает поток к `(PeerId, stream_id)`, при до�
 
 ```mermaid
 flowchart TB
-    subgraph clients["Клиентские процессы"]
-        host["Клиент Ubuntu Rust: GTK, HTTP / CONNECT / SOCKS5"]
-        runtime["Дочерний Core daemon: та же библиотека NatsRuntime / Manager / Streams"]
-        host <-->|"Закрытый IPC 1 / события с проверкой поколения"| runtime
+    subgraph client["Клиент Ubuntu"]
+        ui["GTK: окно, соединение и настройки"]
+        cr["Rust runtime: тот же Core, TCP/TUN I/O"]
+        ch["Root helper: маршруты, DNS и guard"]
+        ui <-->|"API 1: команды, события, TUN FD"| cr
+        ui <-->|"Polkit, helper API 1, TUN FD"| ch
     end
-    subgraph remote["Сервер: отдельные процессы и их ресурсы"]
-        server["Коннектор Ruby: TCP, пользователи, ACME, управление процессами"]
-        daemon["Демон сервера: та же библиотека Core / NatsRuntime"]
-        target["TCP-сервис / назначение в Интернете"]
-        server <-->|"Закрытый IPC 1 / ограниченные очереди событий"| daemon
-        server <-->|"Прикладные байты TCP"| target
-        broker["NATS: TLS, учётные данные, ACL отправителя / получателя / сегмента"]
-        daemon <-->|"Соединение присоединения и каналы по необходимости"| broker
+    subgraph server["Серверный контейнер"]
+        host["Ruby UID 10001: процессы, пользователи, TLS"]
+        sr["Rust runtime UID 10001: тот же Core, TCP/TUN I/O"]
+        sh["Helper: NET_ADMIN, grants и gateway"]
+        broker["NATS UID 10001: TLS и ACL"]
+        target["TCP/IP назначение"]
+        host <-->|"API 1: команды и состояние"| sr
+        sr <-->|"Единственный канал helper"| sh
+        sr <-->|"Общие потоки Core"| broker
+        sr <-->|"Native сокет / TUN и kernel gateway"| target
     end
-    runtime <-->|"TLS: присоединение и транспортные каналы"| broker
+    cr <-->|"Потоки Core через TLS"| broker
 ```
 
 ## Статическое встраивание и TCP-пример

@@ -1,155 +1,159 @@
 # frozen_string_literal: true
 require_relative 'spec_helper'
 
-RSpec.describe Skvoz::Server::IPCSession do
-  def exact(socket, count)
-    result = ''.b
-    result << socket.readpartial(count - result.bytesize) while result.bytesize < count
-    result
+RSpec.describe Skvoz::Server::RuntimeControl do
+  def serve(socket)
+    size = socket.read(4).unpack1('N')
+    request = JSON.parse(socket.read(size))
+    yield request
   end
 
-  def read_command(socket)
-    length = exact(socket, 4).unpack1('N')
-    body = exact(socket, length)
-    _magic, _version, kind, request, high, low = body.unpack('a4nnQ>Q>Q>')
-    [kind, request, (high << 64) | low, body.byteslice(32..)]
+  def reply(socket, value)
+    bytes = JSON.generate(value)
+    socket.write([bytes.bytesize].pack('N') + bytes)
   end
 
-  def respond(socket, command, code: 0, value: 0, extra: ''.b)
-    socket.write(Skvoz::Server::Protocol.encode(0x8000, command[1], command[2], [code, value].pack('nQ>') + extra))
+  def hello_result
+    { api: 1, network: 2, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }
   end
 
-  def hello(socket)
-    command = read_command(socket)
-    expect(command[0]).to eq(1)
-    capabilities = [1, 7, 9, 15, 65_536, 512, 8192, 64, 2048, 1_048_576].pack('nQ>Q>NNNNNNN')
-    respond(socket, command, extra: capabilities)
-  end
-
-  it 'preserves a rejected command code independently of its exception message' do
-    Dir.mktmpdir do |directory|
-      listener = UNIXServer.new(File.join(directory, 'core.sock'))
-      Async do |root|
-        peer = nil
-        server = root.async do
-          peer = listener.accept
-          hello(peer)
-          respond(peer, read_command(peer), code: 4)
+  it 'keeps one entire command in flight while concurrent status and shutdown retain ordered IDs' do
+    owner, child = UNIXSocket.pair
+    Async do |task|
+      server = task.async do
+        serve(child) { |request| reply(child, v: 1, id: request['id'], result: hello_result, error: nil, fd_count: 0) }
+        serve(child) do |request|
+          expect(request).to include('op' => 'STATUS', 'id' => 2)
+          task.sleep(0.03)
+          expect(child.recv_nonblock(1, exception: false)).to eq(:wait_readable)
+          reply(child, v: 1, id: request['id'], result: {}, error: nil, fd_count: 0)
         end
-        session = described_class.new(listener.path) { |_frame, _error| nil }.start(root)
-        reply = session.request(6, 1, [0].pack('Q>'))
-        expect { session.check(reply) }.to raise_error(Skvoz::Server::Error) do |error|
-          expect(error).to respond_to(:code)
-          expect(error.code).to eq(4)
-          allow(error).to receive(:message).and_raise('Diagnostics must not read IPC exception text')
-          expect(Skvoz::Server::Diagnostics.error_fields(error)).to include(ipc_code: 4)
+        serve(child) do |request|
+          expect(request).to include('op' => 'PREPARE_SHUTDOWN', 'id' => 3)
+          reply(child, v: 1, id: request['id'], result: {}, error: nil, fd_count: 0)
         end
-        expect(session.check(reply, allowed: [0, 4])).to equal(reply)
-        server.wait
-      ensure
-        session&.stop
-        peer&.close
-        listener.close
-      end.wait
-    end
+      end
+      control = described_class.new(owner).start(task)
+      first = task.async { control.request('STATUS') }
+      second = task.async { control.prepare_shutdown }
+      expect(first.wait).to eq({})
+      expect(second.wait).to eq({})
+      server.wait
+      control.stop
+    end.wait
+  ensure
+    owner.close unless owner.closed?
+    child.close unless child.closed?
   end
 
-  it 'routes reversed concurrent replies without allowing multiple socket readers' do
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, 'core.sock')
-      listener = UNIXServer.new(path)
-      Async do |root|
-        server = root.async do
-          socket = listener.accept
-          hello(socket)
-          commands = 12.times.map { read_command(socket) }
-          commands.reverse_each { |command| respond(socket, command, value: command[2]) }
-          socket.close
-        end
-        session = described_class.new(path) { |_frame, _error| nil }.start(root)
-        requests = 12.times.map { |number| root.async { session.request(6, number + 1, [0].pack('Q>')) } }
-        expect(requests.map(&:wait).map(&:value)).to eq((1..12).to_a)
-        session.stop
-        server.wait
-      ensure
-        listener.close
-      end.wait
-    end
-  end
-
-  it 'fails queued and pending requests immediately on owner shutdown' do
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, 'core.sock')
-      listener = UNIXServer.new(path)
-      Async do |root|
-        peer = nil
-        server = root.async do
-          peer = listener.accept
-          hello(peer)
-          root.sleep(30)
-        end
-        session = described_class.new(path, timeout: 10) { |_frame, _error| nil }.start(root)
-        requests = 128.times.map do |number|
-          root.async do
-            session.request(number < 112 ? 5 : 8, number + 1, number < 112 ? 'x' * 1024 : ''.b)
-          rescue Skvoz::Server::Error
-            :closed
+  it 'bounds callers waiting behind the sole in-flight command' do
+    owner, child = UNIXSocket.pair
+    Async do |task|
+      release = Async::Condition.new
+      waiting = false
+      server = task.async do
+        serve(child) { |request| reply(child, v: 1, id: request['id'], result: hello_result, error: nil, fd_count: 0) }
+        8.times do |index|
+          serve(child) do |request|
+            if index.zero?
+              waiting = true
+              release.wait
+            end
+            reply(child, v: 1, id: request['id'], result: {}, error: nil, fd_count: 0)
           end
         end
-        root.sleep(0.05)
-        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        session.stop
-        expect(requests.map(&:wait).uniq).to eq([:closed])
-        expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1
-        server.stop
-        peer.close
-      ensure
-        listener.close
+      end
+      control = described_class.new(owner).start(task)
+      calls = [task.async { control.request('STATUS') }]
+      task.sleep(0.001) until waiting
+      7.times { calls << task.async { control.request('STATUS') } }
+      expect { control.request('STATUS') }.to raise_error(Skvoz::Server::Error, 'Runtime request budget exceeded')
+      release.signal
+      calls.each { |call| expect(call.wait).to eq({}) }
+      server.wait
+      control.stop
+    end.wait
+  ensure
+    owner.close unless owner.closed?
+    child.close unless child.closed?
+  end
+
+  it 'closes on duplicate JSON, unknown errors, overflowing event sequences and malformed capabilities' do
+    vectors = [
+      '{"v":1,"id":1,"id":1,"result":{},"error":null,"fd_count":0}',
+      JSON.generate(v: 1, id: 1, result: nil, error: 'unknown_error', fd_count: 0),
+      JSON.generate(v: 1, seq: (1 << 63), event: 'RUNTIME_STATE', data: { state: 'ready', error: nil }, fd_count: 0),
+      JSON.generate(v: 1, seq: 1, event: 'RUNTIME_STATE', data: { state: 'ready', error: 'unknown_error' }, fd_count: 0),
+      JSON.generate(v: 1, id: 1, result: hello_result.merge(capabilities: {}), error: nil, fd_count: 0)
+    ]
+    vectors.each do |bytes|
+      owner, child = UNIXSocket.pair
+      Async do |task|
+        server = task.async { serve(child) { child.write([bytes.bytesize].pack('N') + bytes) } }
+        control = described_class.new(owner)
+        expect { control.start(task) }.to raise_error(Skvoz::Server::Error)
+        expect(control.ready?).to be(false)
+        expect(owner).to be_closed
+        server.wait
       end.wait
+    ensure
+      owner.close unless owner.closed?
+      child.close unless child.closed?
     end
   end
 
-  it 'reserves control admission while canceled SENDs retain ownership until replies' do
-    Dir.mktmpdir do |directory|
-      path = File.join(directory, 'core.sock')
-      listener = UNIXServer.new(path)
-      Async do |root|
-        commands = []
-        ready = Async::Condition.new
-        socket = nil
-        peer = root.async do
-          socket = listener.accept
-          hello(socket)
-          loop do
-            commands << read_command(socket)
-            ready.signal
-          end
-        rescue EOFError, IOError
-          nil
+  it 'processes state events before a HELLO reply and returns aggregate status without a payload path' do
+    owner, child = UNIXSocket.pair
+    Async do |task|
+      server = task.async do
+        serve(child) do |request|
+          expect(request).to include('op' => 'HELLO', 'args' => { 'api' => 1, 'network' => 2 })
+          reply(child, v: 1, seq: 1, event: 'RUNTIME_STATE', data: { state: 'ready', error: nil }, fd_count: 0)
+          reply(child, v: 1, id: request['id'], result: { api: 1, network: 2, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }, error: nil, fd_count: 0)
         end
-        session = described_class.new(path, timeout: 10) { |_frame, _error| nil }.start(root)
-        sends = 112.times.map { root.async { session.request(5, 1, 'x') } }
-        ready.wait until commands.length == 112
-        sends.each(&:stop)
-        extra = root.async { session.request(5, 1, 'y') }
-        control = root.async { session.request(8, 1) }
-        ready.wait until commands.length == 113
-        expect(commands.last[0]).to eq(8)
-        respond(socket, commands.last)
-        expect(control.wait.code).to eq(0)
-        root.sleep(0.02)
-        expect(commands.length).to eq(113)
-        respond(socket, commands.first, value: 1)
-        ready.wait until commands.length == 114
-        expect(commands.last[0]).to eq(5)
-        respond(socket, commands.last, value: 1)
-        expect(extra.wait.value).to eq(1)
-        session.stop
-        peer.stop
-        socket.close
-      ensure
-        listener.close
-      end.wait
-    end
+        serve(child) { |request| reply(child, v: 1, id: request['id'], result: { lifecycle: 'ready', mode: 'server', session: nil, counters: described_class::COUNTERS.to_h { |name| [name, name == 'tcp_open' ? 3 : 0] } }, error: nil, fd_count: 0) }
+      end
+      control = described_class.new(owner).start(task)
+      expect(control.ready?).to be(true)
+      control.refresh
+      expect(control.statistics).to include('tcp_open' => 3)
+      server.wait
+      control.stop
+    end.wait
+  ensure
+    owner.close unless owner.closed?
+    child.close unless child.closed?
+  end
+
+  it 'fails pending commands and readiness when its sole runtime owner closes' do
+    owner, child = UNIXSocket.pair
+    Async do |task|
+      task.async { serve(child) { child.close } }
+      control = described_class.new(owner)
+      expect { control.start(task) }.to raise_error(Skvoz::Server::Error, 'Runtime control unavailable')
+      expect(control.ready?).to be(false)
+      expect(control.failure).to eq('runtime_control_failed')
+    end.wait
+  ensure
+    owner.close unless owner.closed?
+    child.close unless child.closed?
+  end
+
+  it 'rejects unsolicited SCM_RIGHTS and closes received descriptors' do
+    owner, child = UNIXSocket.pair
+    input, output = IO.pipe
+    Async do |task|
+      task.async do
+        serve(child) do |request|
+          bytes = JSON.generate(v: 1, id: request['id'], result: {}, error: nil, fd_count: 1)
+          child.sendmsg([bytes.bytesize].pack('N') + bytes, 0, nil, Socket::AncillaryData.unix_rights(input))
+        end
+      end
+      control = described_class.new(owner)
+      expect { control.start(task) }.to raise_error(Skvoz::Server::Error)
+      expect(control.ready?).to be(false)
+    end.wait
+  ensure
+    [owner, child, input, output].each { |io| io.close unless io.closed? }
   end
 end
