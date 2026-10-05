@@ -16,11 +16,19 @@ module UbuntuSystem
       @http, @socks = http_port || ServerSystem.free_port, socks_port || ServerSystem.free_port
       @stdin, @stdout, @stderr, @process = Open3.popen3(CLIENT)
       @buffer = ''.b
-      @errors = Thread.new do
+      @errors = ''.b
+      @error_lock = Mutex.new
+      @error_reader = Thread.new do
         begin
-          @stderr.read
-        rescue IOError
-          ''
+          loop do
+            chunk = @stderr.readpartial(4096)
+            @error_lock.synchronize do
+              @errors << chunk
+              @errors = @errors.byteslice(-8192, 8192) if @errors.bytesize > 8192
+            end
+          end
+        rescue EOFError, IOError
+          nil
         end
       end
       @stdin.puts(JSON.generate(directory: @directory.to_s, runtime:, host:, port: server_port || server.port,
@@ -38,17 +46,24 @@ module UbuntuSystem
       loop do
         unless @buffer.include?("\n")
           remaining = deadline - ServerSystem.monotonic
-          raise Timeout::Error, 'Application event deadline exceeded' if remaining <= 0
+          raise Timeout::Error, "Application event deadline exceeded: #{diagnostics}" if remaining <= 0
           next unless IO.select([@stdout], nil, nil, [remaining, 0.5].min)
           @buffer << @stdout.readpartial(4096)
         end
         next unless @buffer.include?("\n")
         line, @buffer = @buffer.split("\n", 2)
         value = JSON.parse(line)
+        @last_event = value.slice('state', 'error', 'failed', 'ready', 'peer_id', 'pid', 'info')
         return value if yield value
       end
     rescue EOFError
-      raise IOError, 'Application exited before expected event: ' + (@errors&.value || '')
+      @error_reader&.join(1)
+      raise IOError, "Application exited before expected event: #{diagnostics}"
+    end
+
+    def diagnostics
+      errors = @error_lock.synchronize { @errors.dup }
+      "process_alive=#{@process.alive?}, last_event=#{JSON.generate(@last_event)}, stderr=#{errors.inspect}"
     end
 
     def command(command)
@@ -69,12 +84,13 @@ module UbuntuSystem
         end
         Timeout.timeout(12) { @process.join }
       end
-      @stdin&.close; @stdout&.close
-      @errors&.join(1)
-      @stderr&.close
     rescue Timeout::Error
       Process.kill('KILL', @process.pid) rescue Errno::ESRCH
       @process.join(5)
+    ensure
+      [@stdin, @stdout].compact.each { |io| io.close unless io.closed? }
+      @error_reader&.join(1)
+      @stderr.close if @stderr && !@stderr.closed?
     end
   end
 end

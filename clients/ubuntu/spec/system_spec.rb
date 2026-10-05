@@ -225,6 +225,8 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     offline = UbuntuSystem::Application.new(@directory.join('offline'), @server, wait_ready: false)
     @applications << offline
     offline.event { |value| value['state'] == 'reconnecting' }
+    expect { offline.event(timeout: 0.1) { |value| value['ready'] } }
+      .to raise_error(Timeout::Error, /process_alive=true, last_event=.*"state":"reconnecting".*"error":"server_unavailable"/)
     # Info and resume notifications during a retry must not cancel intent.
     offline.command('info'); offline.command('resume')
     @server.start
