@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return Err("invalid arguments".into());
                 }
-                println!("skvoz-network-runtime 0.2.0 network=2 api=1 core=3.1.0");
+                println!("skvoz-network-runtime 0.2.1 network=2 api=1 core=3.1.0");
                 return Ok(());
             }
             "--help" => {

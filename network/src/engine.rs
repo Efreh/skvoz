@@ -348,7 +348,6 @@ impl NetworkEngine {
             (send, receive, records)
         }
     }
-    #[cfg(feature = "linux-runtime")]
     pub(crate) fn native_allowance(&self, peer: PeerId) -> (usize, usize, usize) {
         let send = self.native_send.get(&peer).copied().unwrap_or((0, 0));
         let receive = self.native_receive.get(&peer).copied().unwrap_or((0, 0));
@@ -360,7 +359,6 @@ impl NetworkEngine {
             16usize.saturating_sub(send.1.max(receive.1) + ip.1),
         )
     }
-    #[cfg(feature = "linux-runtime")]
     pub(crate) fn account_native(
         &mut self,
         peer: PeerId,

@@ -370,9 +370,35 @@ async fn out_of_order_data_and_bad_version_travel_through_real_broker() {
 }
 
 struct RestartBroker(String);
+impl RestartBroker {
+    fn restore(&self) -> std::io::Result<()> {
+        let started = Command::new("docker").args(["start", &self.0]).output()?;
+        if !started.status.success() {
+            return Err(std::io::Error::other("test broker restart failed"));
+        }
+        // Restore the fixture before the next Cargo integration-test binary.
+        // Docker start completes before the NATS listener is necessarily ready.
+        let ready = Command::new("python3")
+            .args([
+                "-c",
+                "import os,time,urllib.request\ndeadline=time.monotonic()+15\nwhile True:\n try:\n  urllib.request.urlopen(os.environ['SKVOZ_NATS_MONITOR']+'/healthz',timeout=.2).close(); break\n except OSError:\n  if time.monotonic()>=deadline: raise\n  time.sleep(.02)",
+            ])
+            .output()?;
+        if !ready.status.success() {
+            return Err(std::io::Error::other("test broker readiness deadline"));
+        }
+        Ok(())
+    }
+}
 impl Drop for RestartBroker {
     fn drop(&mut self) {
-        let _ = Command::new("docker").args(["start", &self.0]).output();
+        if let Err(error) = self.restore() {
+            if std::thread::panicking() {
+                eprintln!("Test broker restore failed during cleanup: {error}");
+            } else {
+                panic!("Test broker restore failed: {error}");
+            }
+        }
     }
 }
 

@@ -12,7 +12,7 @@ pub mod telemetry;
 pub mod tray;
 #[cfg(feature = "desktop")]
 pub mod ui;
-pub const RUNTIME_VERSION: &str = "0.2.0";
+pub const RUNTIME_VERSION: &str = "0.2.1";
 
 pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -99,7 +99,7 @@ RSpec.describe 'Server network and durable identity contract' do
       expect(profile.fetch('core')).to include('peer_id' => '0', 'membership' => 'broker_authorized', 'ca_file' => nil, 'tls_server_name' => 'example.org')
       expect(state.nats_config).to include('skvoz.enroll.v2.')
       expect(state.export('new', next_id, 'long enough password')).to include('v' => 2,
-        'network_runtime' => { 'network' => 2, 'api' => 1, 'version' => '0.2.0', 'core' => '3.1.0' })
+        'network_runtime' => { 'network' => 2, 'api' => 1, 'version' => '0.2.1', 'core' => '3.1.0' })
       state.close
       reopened = Skvoz::Server::State.new(config)
       expect(reopened.value['next_id']).to eq(5)

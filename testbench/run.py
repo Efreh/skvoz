@@ -182,6 +182,8 @@ def main():
         return
     if args.mode == "check":
         command(cargo + ["fmt", "--all", "--", "--check"])
+        # Check the portable library separately: workspace FFI enables linux-runtime.
+        command(cargo + ["test", "-p", "skvoz-network", "--no-default-features", "--all-targets", *extra])
         command(cargo + ["clippy", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra, "--", "-D", "warnings"])
     if args.mode in ("check", "daemon"):
         command(cargo + ["build", "--release", "-p", "skvoz-daemon", *extra])
