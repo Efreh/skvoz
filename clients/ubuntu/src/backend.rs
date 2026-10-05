@@ -626,11 +626,19 @@ fn require_success(body: &[u8]) -> Result<Value> {
 }
 async fn resolve_brokers(host: &str, port: u16) -> Result<Vec<IpAddr>> {
     let operation = async {
-        let addresses = tokio::net::lookup_host((host, port)).await?;
+        let addresses = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| {
+                #[cfg(feature = "qualification")]
+                eprintln!("Broker address lookup failed: host={host}, port={port}, error={error}");
+                Error::from(error)
+            })?;
         let mut result = Vec::new();
         for a in addresses {
             let ip = a.ip();
             if ip.to_canonical() != ip || ip.is_unspecified() || ip.is_multicast() {
+                #[cfg(feature = "qualification")]
+                eprintln!("Broker address rejected: host={host}, address={ip}");
                 return Err(Error("server_unavailable"));
             }
             if !result.contains(&ip) {
@@ -643,11 +651,17 @@ async fn resolve_brokers(host: &str, port: u16) -> Result<Vec<IpAddr>> {
         if result.is_empty() {
             return Err(Error("server_unavailable"));
         }
+        #[cfg(feature = "qualification")]
+        eprintln!("Broker addresses resolved: host={host}, addresses={result:?}");
         Ok(result)
     };
     tokio::time::timeout(Duration::from_secs(5), operation)
         .await
-        .map_err(|_| Error("server_unavailable"))?
+        .map_err(|_| {
+            #[cfg(feature = "qualification")]
+            eprintln!("Broker address lookup deadline exceeded: host={host}, port={port}");
+            Error("server_unavailable")
+        })?
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

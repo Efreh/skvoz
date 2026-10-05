@@ -97,7 +97,7 @@ jobs:
           sudo --preserve-env=PATH,GEM_HOME,GEM_PATH,BUNDLE_PATH,BUNDLE_APP_CONFIG,BUNDLE_GEMFILE,BUNDLE_FROZEN,SKVOZ_INTEGRATION,SKVOZ_TEST_RUNTIME,SKVOZ_TEST_CLIENT,SKVOZ_TEST_NATS \
             setpriv --reuid 10001 --regid 10001 --clear-groups --no-new-privs \
             --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
-            "$(command -v bundle)" exec rspec ../../clients/ubuntu/spec
+            "$(command -v bundle)" exec rspec ../../clients/ubuntu/spec --fail-fast
       - name: Build and install deb
         run: |
           cargo build --release --locked -p skvoz-ubuntu-client --bin skvoz-client

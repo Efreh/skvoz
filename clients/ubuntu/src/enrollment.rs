@@ -91,6 +91,17 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
                     text.push_str(&error.to_string().to_ascii_lowercase());
                     source = error.source();
                 }
+                #[cfg(feature = "qualification")]
+                {
+                    let details = text
+                        .replace(&credentials.password.to_ascii_lowercase(), "[redacted]")
+                        .replace(&credentials.username.to_ascii_lowercase(), "[redacted]");
+                    eprintln!(
+                        "Enrollment connection failed: address={host}:{}, kind={:?}, details={details}",
+                        credentials.port,
+                        error.kind()
+                    );
+                }
                 if text.contains("authorization") || text.contains("authentication") {
                     Error("authentication_failed")
                 } else if text.contains("certificate")
@@ -102,6 +113,11 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
                     Error("server_unavailable")
                 }
             })?;
+        #[cfg(feature = "qualification")]
+        eprintln!(
+            "Enrollment transport connected: address={host}:{}",
+            credentials.port
+        );
         let reply = format!("skvoz.enroll.reply.{}.{}", credentials.username, token()?);
         let mut subscription = client
             .subscribe(reply.clone())
@@ -125,6 +141,8 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             .next()
             .await
             .ok_or(Error("enrollment_failed"))?;
+        #[cfg(feature = "qualification")]
+        eprintln!("Enrollment reply received: bytes={}", message.payload.len());
         if message.payload.len() > 512 {
             return Err(Error("enrollment_failed"));
         }
@@ -163,5 +181,9 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
     };
     tokio::time::timeout(Duration::from_secs(20), operation)
         .await
-        .map_err(|_| Error("server_unavailable"))?
+        .map_err(|_| {
+            #[cfg(feature = "qualification")]
+            eprintln!("Enrollment deadline exceeded");
+            Error("server_unavailable")
+        })?
 }
