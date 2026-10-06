@@ -54,12 +54,12 @@ RSpec.describe 'Automatic ACME certificate lifecycle', integration: true do
   end
 
   def start_issuer
-    acme, management, challenge = free_port, free_port, free_port
+    acme, management, challenge, tls_challenge = free_ports(4)
     config = @directory.join('pebble.json')
     private_json(config, 'pebble' => {
       'listenAddress' => "127.0.0.1:#{acme}", 'managementListenAddress' => "127.0.0.1:#{management}",
       'certificate' => @directory.join('server.pem').to_s, 'privateKey' => @directory.join('server.key').to_s,
-      'httpPort' => challenge, 'tlsPort' => free_port, 'externalAccountBindingRequired' => false,
+      'httpPort' => challenge, 'tlsPort' => tls_challenge, 'externalAccountBindingRequired' => false,
       'retryAfter' => { 'authz' => 1, 'order' => 1 },
       'profiles' => { 'shortlived' => { 'description' => 'bounded system test', 'validityPeriod' => 30 } }
     })

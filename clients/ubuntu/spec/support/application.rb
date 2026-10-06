@@ -13,7 +13,9 @@ module UbuntuSystem
     attr_reader :ready, :http, :socks, :process, :directory
     def initialize(directory, server, username: 'shared', password: 'process-test-password', ca: true, host: 'localhost', server_port: nil, http_port: nil, socks_port: nil, runtime: RUNTIME, wait_ready: true, request_log: true)
       @directory = Pathname.new(directory)
-      @http, @socks = http_port || ServerSystem.free_port, socks_port || ServerSystem.free_port
+      selected = [http_port, socks_port]
+      available = ServerSystem.free_ports(selected.count(nil), except: selected.compact)
+      @http, @socks = selected.map { |port| port || available.shift }
       @stdin, @stdout, @stderr, @process = Open3.popen3(CLIENT)
       @buffer = ''.b
       @errors = ''.b

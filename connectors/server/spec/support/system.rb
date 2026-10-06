@@ -22,9 +22,21 @@ module ServerSystem
   NATS = ENV.fetch('SKVOZ_TEST_NATS', 'nats-server')
   PEBBLE = ENV.fetch('SKVOZ_TEST_PEBBLE', 'pebble')
 
-  def free_port
-    TCPServer.open('127.0.0.1', 0) { |socket| socket.addr[1] }
+  def free_ports(count, except: [])
+    sockets, ports = [], []
+    # Keep reservations, including excluded ports, until the whole group is selected.
+    until ports.length == count
+      socket = TCPServer.open('127.0.0.1', 0)
+      sockets << socket
+      port = socket.addr[1]
+      ports << port unless except.include?(port)
+    end
+    ports
+  ensure
+    sockets&.each(&:close)
   end
+
+  def free_port = free_ports(1).first
 
   def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
@@ -238,7 +250,10 @@ module ServerSystem
       @directory = Pathname.new(directory)
       @cli = [RbConfig.ruby, COMPONENT.join('bin/skvoz-server').to_s]
       @state, @config, @log = %w[server-state server.json server.log].map { |name| @directory.join(name) }
-      @port, @monitor = ServerSystem.free_port, ServerSystem.free_port
+      selected = overrides.values_at('port', 'monitor_port')
+      excluded = selected.compact + [overrides.dig('tls', 'challenge_port')].compact
+      available = ServerSystem.free_ports(selected.count(nil), except: excluded)
+      @port, @monitor = selected.map { |port| port || available.shift }
       @value = { 'state_dir' => @state.to_s, 'address' => 'localhost', 'bind' => '127.0.0.1', 'port' => @port,
                  'monitor_port' => @monitor, 'nats_binary' => nats.to_s, 'runtime_binary' => RUNTIME, 'allow' => allow, 'network' => {},
                  'tls' => { 'mode' => 'provided', 'certificate' => @directory.join('server.pem').to_s,
