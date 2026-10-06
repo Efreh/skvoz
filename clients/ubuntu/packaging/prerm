@@ -22,7 +22,9 @@ if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
   check_services
   check_state
   if [ -d /run/systemd/system ]; then
-    sockets=$(systemctl list-unit-files --plain --no-legend 'skvoz-network-helper@*.socket')
+    # Unit files include templates; only loaded instances can be stopped.
+    socket_files=$(systemctl list-unit-files --plain --no-legend 'skvoz-network-helper@*.socket')
+    sockets=$(systemctl list-units --all --plain --no-legend 'skvoz-network-helper@*.socket')
     original_active=$(systemctl list-units --state=active --plain --no-legend 'skvoz-network-helper@*.socket')
     # Stop admission before the second durable-state check. Keep enablement intact
     # until safe removal is proven, so a rejected removal can restore admission.
@@ -36,7 +38,7 @@ if [ "$1" = remove ] || [ "$1" = deconfigure ]; then
       echo "SKVOZ removal rejected: retained network state changed. Socket admission restored; disconnect and retry." >&2
       exit 1
     fi
-    printf '%s\n' "$sockets" | while read -r unit rest; do
+    printf '%s\n' "$socket_files" | while read -r unit rest; do
       if [ -n "$unit" ]; then systemctl disable "$unit"; fi
     done
   fi
