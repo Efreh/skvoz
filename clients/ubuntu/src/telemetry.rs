@@ -260,23 +260,86 @@ impl Drop for Flow {
         }
     }
 }
-pub const RATE_GUIDE: &str = "↓ 999999.99 КиБ/с   ↑ 999999.99 КиБ/с";
-pub fn rate(bytes: u64, seconds: f64) -> String {
-    // A fixed unit avoids resizing panel hosts that ignore XAyatanaLabelGuide.
-    // Figure spaces reserve digit cells without distracting leading zeroes.
-    let value = bytes as f64 / seconds.max(0.001) / 1024.0;
-    let mut number = format!("{value:.2}");
-    if number.len() > 9 {
-        number = format!("{value:.2e}");
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedUnit {
+    Bytes,
+    Bits,
+    Kilobytes,
+    #[default]
+    Kibibytes,
+    Megabytes,
+    Mebibytes,
+    Kilobits,
+    Megabits,
+}
+impl SpeedUnit {
+    pub const ALL: [Self; 8] = [
+        Self::Bytes,
+        Self::Bits,
+        Self::Kilobytes,
+        Self::Kibibytes,
+        Self::Megabytes,
+        Self::Mebibytes,
+        Self::Kilobits,
+        Self::Megabits,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bytes => "Б/с",
+            Self::Bits => "бит/с",
+            Self::Kilobytes => "КБ/с",
+            Self::Kibibytes => "КиБ/с",
+            Self::Megabytes => "МБ/с",
+            Self::Mebibytes => "МиБ/с",
+            Self::Kilobits => "Кбит/с",
+            Self::Megabits => "Мбит/с",
+        }
     }
+    fn scale(self) -> f64 {
+        match self {
+            Self::Bytes => 1.0,
+            Self::Bits => 8.0,
+            Self::Kilobytes => 1.0 / 1000.0,
+            Self::Kibibytes => 1.0 / 1024.0,
+            Self::Megabytes => 1.0 / 1_000_000.0,
+            Self::Mebibytes => 1.0 / 1_048_576.0,
+            Self::Kilobits => 8.0 / 1000.0,
+            Self::Megabits => 8.0 / 1_000_000.0,
+        }
+    }
+    pub fn guide(self) -> String {
+        format!("↓999.99 {} ↑999.99 {}", self.label(), self.label())
+    }
+}
+pub fn rate(bytes: u64, seconds: f64, unit: SpeedUnit) -> String {
+    let value = bytes as f64 / seconds.max(0.001) * unit.scale();
+    let mut number = format!("{value:.2}");
+    for precision in [1, 0] {
+        if number.len() <= 6 {
+            break;
+        }
+        number = format!("{value:.precision$}");
+    }
+    if number.len() > 5 && !number.contains('.') {
+        number = format!("{value:.1e}");
+    }
+    // Keep the decimal glyph's advance even for integer precision, and reserve
+    // digit cells after the unit so arrows stay close to the visible number.
+    let punctuation = if number.contains('.') { "" } else { "\u{2008}" };
+    let digits = number.len() - usize::from(number.contains('.'));
     format!(
-        "{}{} КиБ/с",
-        "\u{2007}".repeat(9usize.saturating_sub(number.len())),
-        number
+        "{number} {}{}{punctuation}",
+        unit.label(),
+        "\u{2007}".repeat(5usize.saturating_sub(digits))
     )
 }
-pub fn rates(down: u64, up: u64, seconds: f64) -> String {
-    format!("↓ {}   ↑ {}", rate(down, seconds), rate(up, seconds))
+pub fn rates(down: u64, up: u64, seconds: f64, unit: SpeedUnit) -> String {
+    format!(
+        "↓{} ↑{}",
+        rate(down, seconds, unit),
+        rate(up, seconds, unit)
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -294,11 +357,29 @@ mod tests {
             1_024_000_000,
             u64::MAX,
         ] {
-            let line = super::rates(bytes, 0, 1.0);
-            assert_eq!(line.chars().count(), super::RATE_GUIDE.chars().count());
+            for unit in super::SpeedUnit::ALL {
+                let line = super::rates(bytes, 0, 1.0, unit);
+                assert_eq!(line.chars().count(), unit.guide().chars().count());
+            }
         }
-        assert!(super::rate(307, 1.0).ends_with("0.30 КиБ/с"));
-        assert!(super::rate(u64::MAX, 0.001).contains("e19"));
+        assert!(super::rate(307, 1.0, super::SpeedUnit::Kibibytes).starts_with("0.30 КиБ/с"));
+        assert!(super::rate(u64::MAX, 0.001, super::SpeedUnit::Kibibytes).contains("e19"));
+    }
+    #[test]
+    fn speed_units_convert_bits_bytes_and_decimal_binary_prefixes() {
+        use super::{SpeedUnit::*, rate};
+        for (unit, bytes, seconds, expected) in [
+            (Bytes, 12, 2.0, "6.00 Б/с"),
+            (Bits, 12, 2.0, "48.00 бит/с"),
+            (Kilobytes, 1024, 1.0, "1.02 КБ/с"),
+            (Kibibytes, 1024, 1.0, "1.00 КиБ/с"),
+            (Megabytes, 1_000_000, 2.0, "0.50 МБ/с"),
+            (Mebibytes, 1_048_576, 2.0, "0.50 МиБ/с"),
+            (Kilobits, 125, 1.0, "1.00 Кбит/с"),
+            (Megabits, 125_000, 1.0, "1.00 Мбит/с"),
+        ] {
+            assert!(rate(bytes, seconds, unit).starts_with(expected));
+        }
     }
     #[test]
     fn events_use_recording_time_instead_of_connection_start() {

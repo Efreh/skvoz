@@ -747,7 +747,7 @@ impl Actor {
                 return self.respond(r.id, Err(ApiError::InvalidState), None);
             }
             self.hello = true;
-            return self.respond(r.id,Ok(json!({"api":1,"network":2,"role":self.config.role,"capabilities":{"profiles":if self.config.network.families.is_empty(){vec!["tcp"]}else{vec!["tcp","ip"]},"families":self.config.network.families,"max_mtu":self.config.network.max_mtu,"max_channels":self.config.network.channels}})),None);
+            return self.respond(r.id,Ok(json!({"api":1,"network":3,"role":self.config.role,"capabilities":{"profiles":if self.config.network.families.is_empty(){vec!["tcp"]}else{vec!["tcp","ip"]},"families":self.config.network.families,"max_mtu":self.config.network.max_mtu,"max_channels":self.config.network.channels}})),None);
         }
         if r.op == Operation::Hello {
             return self.respond(r.id, Err(ApiError::InvalidState), None);
@@ -831,11 +831,12 @@ impl Actor {
                         .iter()
                         .any(|f| !self.config.network.families.contains(f))
                     {
-                        Err(ApiError::UnsupportedVersion)
+                        Err(ApiError::UnsupportedFamily)
                     } else {
                         match self.engine.as_mut().unwrap().open_ip(
                             PeerId(0),
                             a.families,
+                            a.family_policy,
                             a.max_mtu,
                             a.channels,
                         ) {
@@ -1114,7 +1115,7 @@ impl Actor {
         if self.helper_id == 0 {
             self.helper_enqueue(
                 local_api::HelperOperation::Hello,
-                json!({"api":1,"network":2}),
+                json!({"api":1,"network":3}),
                 HelperKind::Hello,
             )?;
         }
@@ -1185,7 +1186,7 @@ impl Actor {
         }
         match pending.kind {
             HelperKind::Hello => {
-                if frame.fd.is_some() || result != json!({"api":1,"network":2,"role":"server"}) {
+                if frame.fd.is_some() || result != json!({"api":1,"network":3,"role":"server"}) {
                     return Err(RuntimeFailure::Internal);
                 }
                 self.helper_enqueue(
@@ -2190,7 +2191,7 @@ impl Actor {
                 && self
                     .helper_enqueue(
                         local_api::HelperOperation::Hello,
-                        json!({"api":1,"network":2}),
+                        json!({"api":1,"network":3}),
                         HelperKind::Hello,
                     )
                     .is_err()
@@ -2354,6 +2355,7 @@ fn setup_api_error(error: NetworkError) -> ApiError {
 
 fn api_label(error: ApiError) -> &'static str {
     match error {
+        ApiError::UnsupportedFamily => "unsupported_family",
         ApiError::Forbidden => "forbidden",
         ApiError::Overloaded => "overloaded",
         ApiError::Timeout => "timeout",
@@ -2512,7 +2514,7 @@ mod tests {
             .unwrap();
         let budget = Budget::new(65536, 4);
         let request = Request::parse_json(
-            br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":2},"fd_count":0}"#,
+            br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":3},"fd_count":0}"#,
         )
         .unwrap();
         sender
@@ -2577,7 +2579,7 @@ mod tests {
         drop(observer);
         assert_eq!(
             handle.request_json(
-                br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":2},"fd_count":0}"#,
+                br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":3},"fd_count":0}"#,
                 Some(duplicate)
             ),
             Err(RuntimeFailure::InvalidArgument)

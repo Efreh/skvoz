@@ -527,7 +527,7 @@ impl StartupConfig {
         }
         if c.tls_server_name.as_ref().is_some_and(|n| {
             crate::Metadata::Tcp {
-                v: 2,
+                v: crate::NETWORK_VERSION,
                 host: n.clone(),
                 port: 443,
             }

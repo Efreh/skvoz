@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
         fail("fixture read");
     if (skvoz_network_create(bytes, length, -1, &owner) || !owner)
         fail("create");
-    const char *hello = "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":2},\"fd_count\":0}";
+    const char *hello = "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":3},\"fd_count\":0}";
     uint32_t id = 0;
     if (skvoz_network_request(owner, (const uint8_t *)hello, strlen(hello), -1, &id)
             || id != 1)

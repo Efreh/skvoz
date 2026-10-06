@@ -24,6 +24,9 @@ pub fn message(code: &str) -> &'static str {
         "invalid_network_settings" => {
             "Проверьте семейства адресов и MTU (IPv6 требует MTU не менее 1280)."
         }
+        "unsupported_family" => {
+            "Сервер не предоставляет выбранные семейства адресов. Выберите «Автоматически» или проверьте настройки сервера."
+        }
         "network_unavailable" | "network_timeout" | "ipc_timeout" => {
             "Соединение с сетевым модулем потеряно."
         }
@@ -74,8 +77,11 @@ pub struct View {
     pub username: adw::EntryRow,
     pub password: adw::PasswordEntryRow,
     pub button: gtk::Button,
+    pub proxy_mode: gtk::ToggleButton,
+    pub vpn_mode: gtk::ToggleButton,
     pub status: gtk::Label,
     pub speed: gtk::Label,
+    speed_sample: Cell<(u64, u64, f64)>,
     pub status_icon: gtk::Image,
     pub tray_notice: gtk::Label,
     pub telemetry: Arc<crate::telemetry::Telemetry>,
@@ -193,7 +199,24 @@ impl View {
         icon.set_pixel_size(48);
         icon.add_css_class("accent");
         hero.append(&icon);
-        hero.append(&label("Соединение SKVOZ", "title-1"));
+        hero.append(&label("Соединение SKVOZ:", "title-1"));
+        let modes = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .homogeneous(true)
+            .halign(gtk::Align::Center)
+            .width_request(260)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        modes.add_css_class("linked");
+        let proxy_mode = gtk::ToggleButton::with_label("Прокси");
+        let vpn_mode = gtk::ToggleButton::with_label("ВПН");
+        vpn_mode.set_group(Some(&proxy_mode));
+        proxy_mode.set_active(value.mode == crate::settings::Mode::Proxy);
+        vpn_mode.set_active(value.mode == crate::settings::Mode::Vpn);
+        modes.append(&proxy_mode);
+        modes.append(&vpn_mode);
+        hero.append(&modes);
         hero.append(&label(
             &format!("Версия {}", env!("CARGO_PKG_VERSION")),
             "dim-label",
@@ -267,11 +290,16 @@ impl View {
         status_box.append(&status_icon);
         status_box.append(&status);
         body.append(&status_box);
-        let speed = label(&crate::telemetry::rates(0, 0, 1.0), "monospace");
+        let unit = settings
+            .lock()
+            .map_err(|_| Error("unsafe_settings"))?
+            .display
+            .speed_unit;
+        let speed = label(&crate::telemetry::rates(0, 0, 1.0, unit), "monospace");
         speed.set_wrap(false);
         speed.set_halign(gtk::Align::Center);
-        speed.set_width_chars(crate::telemetry::RATE_GUIDE.chars().count() as i32);
-        speed.set_max_width_chars(crate::telemetry::RATE_GUIDE.chars().count() as i32);
+        speed.set_width_chars(unit.guide().chars().count() as i32);
+        speed.set_max_width_chars(unit.guide().chars().count() as i32);
         speed.set_tooltip_text(Some("Получено и отправлено через SKVOZ за секунду"));
         body.append(&speed);
         let activity = adw::PreferencesGroup::builder()
@@ -351,8 +379,11 @@ impl View {
             username,
             password,
             button,
+            proxy_mode,
+            vpn_mode,
             status,
             speed,
+            speed_sample: Cell::new((0, 0, 1.0)),
             status_icon,
             tray_notice,
             telemetry,
@@ -369,6 +400,20 @@ impl View {
             commands,
             settings_window: Rc::new(RefCell::new(None)),
         });
+        view.sync_mode();
+        for (button, mode) in [
+            (&view.proxy_mode, crate::settings::Mode::Proxy),
+            (&view.vpn_mode, crate::settings::Mode::Vpn),
+        ] {
+            let weak = Rc::downgrade(&view);
+            button.connect_toggled(move |button| {
+                if button.is_active()
+                    && let Some(view) = weak.upgrade()
+                {
+                    view.choose_mode(mode);
+                }
+            });
+        }
         for (name, id) in [("show", 1), ("log", 5), ("settings", 6), ("quit", 7)] {
             let action = gio::SimpleAction::new(name, None);
             let weak = Rc::downgrade(&view);
@@ -432,6 +477,7 @@ impl View {
                             info: false,
                             uploaded: 0,
                             downloaded: 0,
+                            families: Vec::new(),
                             requests: Vec::new(),
                         });
                         if captured
@@ -458,6 +504,68 @@ impl View {
     }
     pub fn settings_value(&self) -> Option<crate::settings::Preferences> {
         self.settings.lock().ok().map(|s| s.value.clone())
+    }
+    pub fn speed_unit(&self) -> crate::telemetry::SpeedUnit {
+        self.settings
+            .lock()
+            .map(|s| s.display.speed_unit)
+            .unwrap_or_default()
+    }
+    pub fn update_rates(&self, down: u64, up: u64, seconds: f64) {
+        self.speed_sample.set((down, up, seconds));
+        self.refresh_rates();
+    }
+    fn refresh_rates(&self) {
+        let unit = self.speed_unit();
+        let (down, up, seconds) = self.speed_sample.get();
+        self.speed
+            .set_label(&crate::telemetry::rates(down, up, seconds, unit));
+        self.speed
+            .set_width_chars(unit.guide().chars().count() as i32);
+        self.speed
+            .set_max_width_chars(unit.guide().chars().count() as i32);
+    }
+    fn sync_mode(&self) {
+        let proxy = self
+            .settings_value()
+            .is_none_or(|s| s.mode == crate::settings::Mode::Proxy);
+        self.proxy_mode.set_active(proxy);
+        self.vpn_mode.set_active(!proxy);
+        for (button, selected) in [(&self.proxy_mode, proxy), (&self.vpn_mode, !proxy)] {
+            if selected {
+                button.add_css_class("suggested-action");
+            } else {
+                button.remove_css_class("suggested-action");
+            }
+            button.set_sensitive(!self.active());
+            button.set_tooltip_text(Some(if self.active() {
+                "Для смены режима отключитесь"
+            } else if selected {
+                "Выбранный режим"
+            } else {
+                "Выбрать режим"
+            }));
+        }
+        self.http.set_visible(proxy);
+        self.socks.set_visible(proxy);
+    }
+    fn choose_mode(&self, mode: crate::settings::Mode) {
+        let result = (|| {
+            let mut settings = self.settings.lock().map_err(|_| Error("unsafe_settings"))?;
+            if settings.value.mode == mode {
+                return Ok(());
+            }
+            if self.active() {
+                return Err(Error("already_connected"));
+            }
+            let mut value = settings.value.clone();
+            value.mode = mode;
+            settings.save(value)
+        })();
+        self.sync_mode();
+        if let Err(error) = result {
+            self.show_error(error.0);
+        }
     }
     pub fn quit(&self) {
         if self.commands.try_send(Control::Quit).is_err() {
@@ -586,12 +694,19 @@ impl View {
     }
     pub fn apply(&self, status: &Status) {
         self.state.set(status.state);
-        let proxy = self
-            .settings_value()
-            .is_some_and(|s| s.mode == crate::settings::Mode::Proxy);
-        self.http.set_visible(proxy);
-        self.socks.set_visible(proxy);
-        self.status.set_label(state_name(status.state));
+        self.sync_mode();
+        let families = if status.state == "connected" {
+            match status.families.as_slice() {
+                [4] => " · IPv4",
+                [6] => " · IPv6",
+                [4, 6] => " · IPv4 и IPv6",
+                _ => "",
+            }
+        } else {
+            ""
+        };
+        self.status
+            .set_label(&format!("{}{families}", state_name(status.state)));
         self.status_icon.set_icon_name(Some(match status.state {
             "connected" => "network-transmit-receive-symbolic",
             "connecting" | "reconnecting" => "network-idle-symbolic",
@@ -675,23 +790,21 @@ impl View {
 
         page.add(&group);
         let network = adw::PreferencesGroup::builder()
-            .title("Режим соединения")
-            .build();
-        let mode = adw::ComboRow::builder()
-            .title("Режим")
-            .model(&gtk::StringList::new(&["Прокси", "ВПН"]))
-            .selected(u32::from(value.mode == crate::settings::Mode::Vpn))
+            .title("Сетевые параметры")
             .build();
         let families = adw::ComboRow::builder()
             .title("Семейства адресов")
+            .subtitle("Трафик внутри ВПН; автоматически — доступные на сервере")
             .model(&gtk::StringList::new(&[
+                "Автоматически",
                 "IPv4 и IPv6",
                 "Только IPv4",
                 "Только IPv6",
             ]))
             .selected(match value.families.as_slice() {
-                [4] => 1,
-                [6] => 2,
+                [4, 6] => 1,
+                [4] => 2,
+                [6] => 3,
                 _ => 0,
             })
             .build();
@@ -699,7 +812,6 @@ impl View {
             .title("MTU")
             .text(value.max_mtu.to_string())
             .build();
-        network.add(&mode);
         network.add(&families);
         network.add(&mtu);
         network.add(
@@ -718,6 +830,56 @@ impl View {
             .build();
         advanced.add(&ca);
         page.add(&advanced);
+        let display = adw::PreferencesGroup::builder()
+            .title("Отображение")
+            .build();
+        let speed_unit = adw::ComboRow::builder()
+            .title("Единицы скорости")
+            .subtitle("Для окна и панели; применяется сразу")
+            .model(&gtk::StringList::new(
+                &crate::telemetry::SpeedUnit::ALL.map(|u| u.label()),
+            ))
+            .selected(
+                crate::telemetry::SpeedUnit::ALL
+                    .iter()
+                    .position(|u| *u == self.speed_unit())
+                    .unwrap() as u32,
+            )
+            .build();
+        display.add(&speed_unit);
+        page.add(&display);
+        let weak = Rc::downgrade(self);
+        speed_unit.connect_selected_notify(move |row| {
+            let Some(view) = weak.upgrade() else {
+                return;
+            };
+            let Some(unit) = crate::telemetry::SpeedUnit::ALL
+                .get(row.selected() as usize)
+                .copied()
+            else {
+                return;
+            };
+            let result = (|| {
+                let mut settings = view.settings.lock().map_err(|_| Error("unsafe_settings"))?;
+                if settings.display.speed_unit == unit {
+                    return Ok(());
+                }
+                settings.save_display(crate::settings::DisplayPreferences {
+                    v: 1,
+                    speed_unit: unit,
+                })
+            })();
+            if let Err(error) = result {
+                row.set_selected(
+                    crate::telemetry::SpeedUnit::ALL
+                        .iter()
+                        .position(|u| *u == view.speed_unit())
+                        .unwrap() as u32,
+                );
+                view.show_error(error.0);
+            }
+            view.refresh_rates();
+        });
         let background = adw::PreferencesGroup::builder()
             .title("Фоновая работа")
             .description(
@@ -765,15 +927,11 @@ impl View {
                 value.http_port = port(&http.text(), true)?;
                 value.socks_port = port(&socks.text(), true)?;
                 value.ca_file = ca.text().trim().to_owned();
-                value.mode = if mode.selected() == 1 {
-                    crate::settings::Mode::Vpn
-                } else {
-                    crate::settings::Mode::Proxy
-                };
                 value.families = match families.selected() {
-                    1 => vec![4],
-                    2 => vec![6],
-                    _ => vec![4, 6],
+                    1 => vec![4, 6],
+                    2 => vec![4],
+                    3 => vec![6],
+                    _ => Vec::new(),
                 };
                 value.max_mtu = mtu
                     .text()

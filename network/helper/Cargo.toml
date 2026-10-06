@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-network-helper"
-version = "0.2.0"
+version = "0.3.0"
 description = "Scoped Linux network setup for the shared SKVOZ runtime"
 edition.workspace = true
 rust-version.workspace = true

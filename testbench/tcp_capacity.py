@@ -46,7 +46,7 @@ class Owner:
         child.close()
         threading.Thread(target=self.reader, daemon=True).start()
         try:
-            self.call('HELLO', {'api': 1, 'network': 2})
+            self.call('HELLO', {'api': 1, 'network': 3})
             until = time.monotonic() + 30
             while time.monotonic() < until:
                 if self.events.get('RUNTIME_STATE', {}).get('state') == 'ready':

@@ -1,5 +1,5 @@
 [
-  {"name":"hello","valid":true,"json":"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":2},\"fd_count\":0}"},
+  {"name":"hello","valid":true,"json":"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":3},\"fd_count\":0}"},
   {"name":"status","valid":true,"json":"{\"v\":1,\"id\":2,\"op\":\"STATUS\",\"args\":{},\"fd_count\":0}"},
   {"name":"open-tcp","valid":true,"json":"{\"v\":1,\"id\":3,\"op\":\"OPEN_TCP\",\"args\":{\"host\":\"127.0.0.1\",\"port\":8080},\"fd_count\":0}"},
   {"name":"api-only-proxy","valid":true,"json":"{\"v\":1,\"id\":4,\"op\":\"START_PROXY\",\"args\":{\"http_bind\":null,\"socks_bind\":null},\"fd_count\":0}"},
@@ -13,5 +13,9 @@
   {"name":"extra-args-key","valid":false,"json":"{\"v\":1,\"id\":1,\"op\":\"STATUS\",\"args\":{\"extra\":true},\"fd_count\":0}"},
   {"name":"wrong-fd-count","valid":false,"json":"{\"v\":1,\"id\":1,\"op\":\"STATUS\",\"args\":{},\"fd_count\":1}"},
   {"name":"missing-fd-count","valid":false,"json":"{\"v\":1,\"id\":1,\"op\":\"STATUS\",\"args\":{}}"},
-  {"name":"trailing-json","valid":false,"json":"{\"v\":1,\"id\":1,\"op\":\"STATUS\",\"args\":{},\"fd_count\":0}{}"}
+  {"name":"trailing-json","valid":false,"json":"{\"v\":1,\"id\":1,\"op\":\"STATUS\",\"args\":{},\"fd_count\":0}{}"},
+  {"name":"auto-ip","valid":true,"json":"{\"v\":1,\"id\":5,\"op\":\"START_IP\",\"args\":{\"families\":[4,6],\"family_policy\":\"auto\",\"max_mtu\":1500,\"channels\":1},\"fd_count\":0}"},
+  {"name":"empty-ip-offer","valid":false,"json":"{\"v\":1,\"id\":5,\"op\":\"START_IP\",\"args\":{\"families\":[],\"family_policy\":\"auto\",\"max_mtu\":1500,\"channels\":1},\"fd_count\":0}"},
+  {"name":"missing-family-policy","valid":false,"json":"{\"v\":1,\"id\":5,\"op\":\"START_IP\",\"args\":{\"families\":[4,6],\"max_mtu\":1500,\"channels\":1},\"fd_count\":0}"},
+  {"name":"strict-ip","valid":true,"json":"{\"v\":1,\"id\":5,\"op\":\"START_IP\",\"args\":{\"families\":[4,6],\"family_policy\":\"require_all\",\"max_mtu\":1500,\"channels\":1},\"fd_count\":0}"}
 ]

@@ -2,10 +2,36 @@ use crate::{IpPrefix, NetworkError};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, net::IpAddr};
 
-pub const NETWORK_VERSION: u8 = 2;
+pub const NETWORK_VERSION: u8 = 3;
 pub const METADATA_MAX: usize = 512;
 pub const CONTROL_MAX: usize = 16384;
 pub const RECORD_HEADER: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FamilyPolicy {
+    Auto,
+    RequireAll,
+}
+impl FamilyPolicy {
+    pub fn negotiate(self, offered: &[u8], supported: &[u8]) -> Result<Vec<u8>, NetworkError> {
+        validate_families(offered)?;
+        let selected: Vec<_> = offered
+            .iter()
+            .copied()
+            .filter(|family| supported.contains(family))
+            .collect();
+        if selected.is_empty() || self == Self::RequireAll && selected != offered {
+            return Err(NetworkError::UnsupportedFamily);
+        }
+        Ok(selected)
+    }
+    pub fn accepts(self, offered: &[u8], selected: &[u8]) -> bool {
+        validate_families(selected).is_ok()
+            && selected.iter().all(|family| offered.contains(family))
+            && (self == Self::Auto || selected == offered)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SessionId(String);
@@ -46,6 +72,7 @@ pub enum Metadata {
     IpSession {
         v: u8,
         families: Vec<u8>,
+        family_policy: FamilyPolicy,
         max_mtu: u16,
         channels: u8,
     },
@@ -185,9 +212,9 @@ impl Accept {
         }
         let a: Self = serde_json::from_slice(bytes).map_err(|_| NetworkError::InvalidMetadata)?;
         match &a {
-            Self::Tcp { v, status } if *v == 2 && status == "connected" => {}
-            Self::IpSession { v, .. } if *v == 2 => {}
-            Self::IpData { v, channel, .. } if *v == 2 && *channel < 8 => {}
+            Self::Tcp { v, status } if *v == NETWORK_VERSION && status == "connected" => {}
+            Self::IpSession { v, .. } if *v == NETWORK_VERSION => {}
+            Self::IpData { v, channel, .. } if *v == NETWORK_VERSION && *channel < 8 => {}
             _ => return Err(NetworkError::InvalidMetadata),
         }
         Ok(a)
@@ -525,29 +552,30 @@ impl Rejection {
     pub fn decode(bytes: &[u8]) -> Result<Self, NetworkError> {
         let value = crate::local_api::parse_strict_json_bounded(bytes, METADATA_MAX)?;
         let r: Self = serde_json::from_value(value).map_err(|_| NetworkError::InvalidMetadata)?;
-        if r.v != 2
-            || !matches!(
-                r.kind.as_str(),
-                "tcp" | "ip-session" | "ip-data" | "unknown"
-            )
-            || !matches!(
-                r.error.as_str(),
-                "unsupported_version"
-                    | "unsupported_type"
-                    | "invalid_request"
-                    | "forbidden"
-                    | "overloaded"
-                    | "unsupported_family"
-                    | "network_unavailable"
-                    | "timeout"
-            )
-        {
+        if r.v != NETWORK_VERSION {
+            return Err(NetworkError::UnsupportedVersion);
+        }
+        if !matches!(
+            r.kind.as_str(),
+            "tcp" | "ip-session" | "ip-data" | "unknown"
+        ) || !matches!(
+            r.error.as_str(),
+            "unsupported_version"
+                | "unsupported_type"
+                | "invalid_request"
+                | "forbidden"
+                | "overloaded"
+                | "unsupported_family"
+                | "network_unavailable"
+                | "timeout"
+        ) {
             return Err(NetworkError::InvalidMetadata);
         }
         Ok(r)
     }
     pub fn network_error(&self) -> NetworkError {
         match self.error.as_str() {
+            "unsupported_family" => NetworkError::UnsupportedFamily,
             "unsupported_version" => NetworkError::UnsupportedVersion,
             "unsupported_type" => NetworkError::UnsupportedType,
             "forbidden" => NetworkError::Forbidden,

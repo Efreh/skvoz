@@ -77,7 +77,7 @@ impl Actor {
         let key = self.runtime.open(
             PeerId(0),
             &Metadata::IpData {
-                v: 2,
+                v: 3,
                 session: session.clone(),
                 channel,
             }
@@ -88,7 +88,7 @@ impl Actor {
                 match event {
                     Event::Rejected { reason } => {
                         let value: serde_json::Value = serde_json::from_slice(&reason)?;
-                        if value != serde_json::json!({"v":2,"type":"ip-data","error":"forbidden"})
+                        if value != serde_json::json!({"v":3,"type":"ip-data","error":"forbidden"})
                         {
                             return Err("Wrong forbidden OPEN response".into());
                         }
@@ -167,8 +167,9 @@ pub(super) async fn run(runtime: NatsRuntime, value: &serde_json::Value) -> Prob
     let control = actor.runtime.open(
         PeerId(0),
         &Metadata::IpSession {
-            v: 2,
+            v: 3,
             families: vec![4],
+            family_policy: skvoz_network::FamilyPolicy::RequireAll,
             max_mtu: 1500,
             channels: 1,
         }
@@ -201,7 +202,7 @@ pub(super) async fn run(runtime: NatsRuntime, value: &serde_json::Value) -> Prob
     let data = actor.runtime.open(
         PeerId(0),
         &Metadata::IpData {
-            v: 2,
+            v: 3,
             session: session.clone(),
             channel: 0,
         }
@@ -212,7 +213,7 @@ pub(super) async fn run(runtime: NatsRuntime, value: &serde_json::Value) -> Prob
         .insert(data, RecordParser::new(false, 1500, 65536)?);
     if actor.opened(data).await?
         != (Accept::IpData {
-            v: 2,
+            v: 3,
             session: session.clone(),
             channel: 0,
         })

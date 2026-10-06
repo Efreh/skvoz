@@ -92,11 +92,11 @@ pub fn run() -> glib::ExitCode {
                 .downloaded
                 .load(std::sync::atomic::Ordering::Relaxed);
             let seconds = previous.2.elapsed().as_secs_f64();
-            view.speed.set_label(&crate::telemetry::rates(
+            view.update_rates(
                 down.saturating_sub(previous.1),
                 up.saturating_sub(previous.0),
                 seconds,
-            ));
+            );
             previous = (up, down, std::time::Instant::now());
             view.refresh_log();
             if let Some(tray) = &tray_stats {

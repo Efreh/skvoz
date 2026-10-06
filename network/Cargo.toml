@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-network"
-version = "0.2.1"
+version = "0.3.0"
 description = "Shared bounded network adapter for the universal SKVOZ Core"
 edition.workspace = true
 rust-version.workspace = true

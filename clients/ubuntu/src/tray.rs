@@ -136,7 +136,12 @@ impl Tray {
                     )
                         .to_variant(),
                     "XAyatanaLabel" => property_label.borrow().to_variant(),
-                    "XAyatanaLabelGuide" => crate::telemetry::RATE_GUIDE.to_variant(),
+                    "XAyatanaLabelGuide" => property_view
+                        .upgrade()
+                        .map(|v| v.speed_unit())
+                        .unwrap_or_default()
+                        .guide()
+                        .to_variant(),
                     _ => "".to_variant(),
                 }
             })
@@ -358,7 +363,7 @@ impl Tray {
                 ITEM,
                 "org.kde.StatusNotifierItem",
                 "XAyatanaNewLabel",
-                (label, crate::telemetry::RATE_GUIDE).to_variant(),
+                (label, view.speed_unit().guide()).to_variant(),
             );
         }
     }

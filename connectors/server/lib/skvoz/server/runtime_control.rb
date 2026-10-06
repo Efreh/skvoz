@@ -30,8 +30,8 @@ module Skvoz
 
       def start(task)
         @reader = task.async { reader }
-        hello = request('HELLO', { 'api' => 1, 'network' => 2 })
-        raise Error, 'Incompatible runtime HELLO' unless hello.is_a?(Hash) && hello.keys.sort == %w[api capabilities network role] && hello['api'].is_a?(Integer) && hello['api'] == 1 && hello['network'].is_a?(Integer) && hello['network'] == 2 && hello['role'] == 'server' && capabilities?(hello['capabilities'])
+        hello = request('HELLO', { 'api' => 1, 'network' => 3 })
+        raise Error, 'Incompatible runtime HELLO' unless hello.is_a?(Hash) && hello.keys.sort == %w[api capabilities network role] && hello['api'].is_a?(Integer) && hello['api'] == 1 && hello['network'].is_a?(Integer) && hello['network'] == 3 && hello['role'] == 'server' && capabilities?(hello['capabilities'])
         self
       rescue StandardError
         close

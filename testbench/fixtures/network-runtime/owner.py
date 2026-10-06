@@ -74,12 +74,20 @@ class Channel:
                 raise RuntimeError(op + ': ' + result['error'])
             return result['result'], fds
 
-    def event(self, name):
+    def event(self, name, handle=None):
         until = time.monotonic() + 25
         while time.monotonic() < until:
-            for index, value in enumerate(self.events):
-                if value['event'] == name:
+            index = 0
+            while index < len(self.events):
+                value = self.events[index]
+                if value['event'] == name and (handle is None or value['data'].get('handle') == handle):
                     return self.events.pop(index)['data']
+                if value['event'] == 'CLOSED':
+                    self.events.pop(index)
+                    if handle is not None and value['data']['handle'] == handle:
+                        raise RuntimeError(value['data'].get('error') or 'closed')
+                    continue
+                index += 1
             value, fds = self.read()
             assert not fds and 'event' in value
             if value['event'] != 'STATS':
@@ -103,7 +111,7 @@ def spawn_runtime(helper=None):
     proc = child((DROP if os.getuid() == 0 else []) + argv, descriptors, 'runtime.log')
     right.close()
     channel = Channel(left)
-    channel.call('HELLO', {'api':1, 'network':2})
+    channel.call('HELLO', {'api':1, 'network':3})
     while channel.event('RUNTIME_STATE')['state'] != 'ready':
         if proc.poll() is not None:
             raise RuntimeError('runtime exited')
@@ -117,7 +125,7 @@ def client_helper():
     peer = socket.socket(socket.AF_UNIX)
     peer.connect('/run/skvoz-network-helper/10001/control.sock')
     channel = Channel(peer)
-    channel.call('HELLO', {'api':1, 'network':2})
+    channel.call('HELLO', {'api':1, 'network':3})
     recovered, _ = channel.call('RECOVER')
     return channel, recovered
 
@@ -150,9 +158,9 @@ def serve(role):
             try:
                 op = request['op']
                 if op == 'start':
-                    result, _ = runtime.call('START_IP', {'families':request.get('families', [4,6]), 'max_mtu':request.get('max_mtu',1500), 'channels':1})
+                    result, _ = runtime.call('START_IP', {'family_policy':request.get('family_policy', 'auto'), 'families':request.get('families', [4,6]), 'max_mtu':request.get('max_mtu',1500), 'channels':1})
                     handle = result['handle']
-                    configured = runtime.event('CONFIGURED')['config']
+                    configured = runtime.event('CONFIGURED', handle)['config']
                     transport = [{'ip':request['broker'], 'port':4222}]
                     prepared, fds = helper.call('PREPARE_CLIENT', {'handle':handle, 'config':configured, 'transport_endpoints':transport})
                     assert len(fds) == 1
@@ -162,7 +170,7 @@ def serve(role):
                         os.close(fds[0])
                     helper.call('ACTIVATE_CLIENT', {'handle':handle})
                     runtime.call('LOCAL_READY', {'handle':handle})
-                    assert runtime.event('ACTIVE')['handle'] == handle
+                    assert runtime.event('ACTIVE', handle)['handle'] == handle
                     result = {'handle':handle, 'config':configured}
                 elif op == 'stop':
                     runtime.call('STOP_IP', {'handle':handle, 'reason':'user_stop'})

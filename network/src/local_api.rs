@@ -104,6 +104,7 @@ pub struct Request {
 #[serde(rename_all = "snake_case")]
 pub enum ApiError {
     UnsupportedVersion,
+    UnsupportedFamily,
     InvalidRequest,
     InvalidState,
     UnknownHandle,
@@ -184,6 +185,7 @@ pub struct TcpArgs {
 #[serde(deny_unknown_fields)]
 pub struct IpArgs {
     pub families: Vec<u8>,
+    pub family_policy: crate::FamilyPolicy,
     pub max_mtu: u16,
     pub channels: u8,
 }
@@ -247,7 +249,7 @@ impl Request {
         match self.op {
             Operation::Hello => {
                 let a: HelloArgs = arguments(&self.args)?;
-                if a.api != 1 || a.network != 2 {
+                if a.api != 1 || a.network != 3 {
                     return Err(NetworkError::UnsupportedVersion);
                 }
             }
@@ -263,7 +265,7 @@ impl Request {
             Operation::OpenTcp => {
                 let a: TcpArgs = arguments(&self.args)?;
                 crate::Metadata::Tcp {
-                    v: 2,
+                    v: crate::NETWORK_VERSION,
                     host: a.host,
                     port: a.port,
                 }
@@ -272,8 +274,9 @@ impl Request {
             Operation::StartIp => {
                 let a: IpArgs = arguments(&self.args)?;
                 crate::Metadata::IpSession {
-                    v: 2,
+                    v: crate::NETWORK_VERSION,
                     families: a.families,
+                    family_policy: a.family_policy,
                     max_mtu: a.max_mtu,
                     channels: a.channels,
                 }
@@ -320,6 +323,7 @@ impl From<NetworkError> for ApiError {
     fn from(e: NetworkError) -> Self {
         match e {
             NetworkError::UnsupportedVersion => Self::UnsupportedVersion,
+            NetworkError::UnsupportedFamily => Self::UnsupportedFamily,
             NetworkError::Forbidden => Self::Forbidden,
             NetworkError::Overloaded => Self::Overloaded,
             NetworkError::Timeout => Self::Timeout,
@@ -441,7 +445,7 @@ impl HelperRequest {
         match self.op {
             HelperOperation::Hello => {
                 let a: HelloArgs = arguments(&self.args)?;
-                if a.api != 1 || a.network != 2 {
+                if a.api != 1 || a.network != 3 {
                     return Err(NetworkError::UnsupportedVersion);
                 }
             }
@@ -643,12 +647,13 @@ impl Event {
                             | "timeout"
                             | "local_setup_failed"
                             | "invalid_request"
+                            | "unsupported_family"
                     )
                 {
                     return Err(NetworkError::InvalidMetadata);
                 }
                 crate::Metadata::Tcp {
-                    v: 2,
+                    v: crate::NETWORK_VERSION,
                     host: data.host,
                     port: data.port,
                 }

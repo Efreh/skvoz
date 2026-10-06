@@ -30,6 +30,7 @@ pub struct Status {
     pub info: bool,
     pub uploaded: u64,
     pub downloaded: u64,
+    pub families: Vec<u8>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requests: Vec<crate::telemetry::Request>,
 }
@@ -41,6 +42,7 @@ pub struct Engine {
     control: Option<Session>,
     helper: Option<Session>,
     ip_handle: Option<SessionId>,
+    families: Vec<u8>,
     pub runtime: Option<PathBuf>,
     pub peer_id: Option<u64>,
     pub state: &'static str,
@@ -65,6 +67,7 @@ impl Engine {
             control: None,
             helper: None,
             ip_handle: None,
+            families: Vec::new(),
             runtime: None,
             peer_id: None,
             state: "disconnected",
@@ -86,6 +89,7 @@ impl Engine {
             info: false,
             uploaded: self.telemetry.uploaded.load(Ordering::Relaxed),
             downloaded: self.telemetry.downloaded.load(Ordering::Relaxed),
+            families: self.families.clone(),
             requests: Vec::new(),
         }
     }
@@ -199,7 +203,7 @@ impl Engine {
         .map_err(|_| Error("version_mismatch"))??;
         if !output.status.success()
             || String::from_utf8_lossy(&output.stdout).trim()
-                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=2 api=1 core=3.1.0")
+                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=3 api=1 core=3.1.0")
         {
             return Err(Error("version_mismatch"));
         }
@@ -230,7 +234,7 @@ impl Engine {
                 initiate: vec!["0".into()],
             },
             network: NetworkConfig {
-                families: preferences.families.clone(),
+                families: preferences.runtime_families(),
                 max_mtu: preferences.max_mtu,
                 channels: 1,
                 limits: Limits::canonical(Role::Client),
@@ -273,7 +277,7 @@ impl Engine {
         remember_child(&runtime, child_id)?;
         self.control = Some(Session::new(local.into(), false)?);
         let session = self.control.as_mut().ok_or(Error("ipc_failed"))?;
-        let hello = session.call("HELLO", json!({"api":1,"network":2})).await?;
+        let hello = session.call("HELLO", json!({"api":1,"network":3})).await?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Capabilities {
@@ -292,10 +296,10 @@ impl Engine {
         }
         let hello: Hello = serde_json::from_value(hello).map_err(|_| Error("version_mismatch"))?;
         if hello.api != 1
-            || hello.network != 2
+            || hello.network != 3
             || hello.role != Role::Client
             || hello.capabilities.profiles != ["tcp", "ip"]
-            || hello.capabilities.families != preferences.families
+            || hello.capabilities.families != preferences.runtime_families()
             || hello.capabilities.max_mtu != preferences.max_mtu
             || hello.capabilities.max_channels != 1
         {
@@ -331,7 +335,13 @@ impl Engine {
                 }
             }
             Mode::Vpn => {
-                let result=session.call("START_IP",json!({"families":preferences.families,"max_mtu":preferences.max_mtu,"channels":1})).await?;
+                let result = session
+                    .call(
+                        "START_IP",
+                        serde_json::to_value(preferences.ip_request())
+                            .map_err(|_| Error("invalid_network_settings"))?,
+                    )
+                    .await?;
                 let result: skvoz_network::local_api::HandleArgs =
                     skvoz_network::local_api::arguments(&result)
                         .map_err(|_| Error("ipc_failed"))?;
@@ -345,6 +355,7 @@ impl Engine {
                     return Err(Error("ipc_failed"));
                 }
                 let config = configured.config;
+                let families = config.families.clone();
                 let args = PrepareClientArgs {
                     handle: handle.clone(),
                     config,
@@ -399,6 +410,7 @@ impl Engine {
                 if active.data["handle"] != json!(handle) {
                     return Err(Error("ipc_failed"));
                 }
+                self.families = families;
             }
         }
         self.state = "connected";
@@ -444,7 +456,7 @@ impl Engine {
             let socket = socket.into_std()?;
             let helper = Session::new(socket.into(), true)?;
             helper
-                .helper_call("HELLO", json!({"api":1,"network":2}))
+                .helper_call("HELLO", json!({"api":1,"network":3}))
                 .await?;
             self.helper = Some(helper);
         }
@@ -541,6 +553,7 @@ impl Engine {
         self.cleanup_reason(None).await;
     }
     async fn cleanup_reason(&mut self, reason: Option<&str>) {
+        self.families.clear();
         let mut cleanup_failed = false;
         if reason.is_none()
             && let (Some(handle), Some(helper)) = (&self.ip_handle, &self.helper)

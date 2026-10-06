@@ -5,6 +5,159 @@ use skvoz_network::{Accept, EngineConfig, EngineRole, Metadata, NetworkEngine, N
 use skvoz_testbench::runtime_scenarios as r;
 use std::time::{Duration, Instant};
 
+fn family_grant(families: &[u8]) -> skvoz_network::SessionConfig {
+    serde_json::from_value(serde_json::json!({
+        "session":"0123456789abcdef0123456789abcdef", "families":families,
+        "source_grants": families.iter().map(|f| if *f==4 {"192.0.2.10/32"} else {"2001:db8::10/128"}).collect::<Vec<_>>(),
+        "routes": families.iter().map(|f| if *f==4 {"0.0.0.0/0"} else {"::/0"}).collect::<Vec<_>>(),
+        "dns_servers": families.iter().map(|f| if *f==4 {"192.0.2.53"} else {"2001:db8::53"}).collect::<Vec<_>>(),
+        "mtu":1500,"channels":1,"packet_queue_bytes":262144,"packet_queue_records":256,
+        "setup_timeout_ms":15000,"egress":{"ipv4":if families.contains(&4) {"nat44"} else {"none"},"ipv6":if families.contains(&6) {"routed"} else {"none"}}
+    })).unwrap()
+}
+
+#[tokio::test]
+async fn network_auto_selects_server_grants_and_strict_or_empty_intersection_rejects() {
+    use skvoz_network::FamilyPolicy::{Auto, RequireAll};
+    for (case, offered, supported, policy, accepted) in [
+        ("auto4", vec![4, 6], vec![4], Auto, true),
+        ("auto6", vec![4, 6], vec![6], Auto, true),
+        ("auto46", vec![4, 6], vec![4, 6], Auto, true),
+        ("required4", vec![4, 6], vec![4], RequireAll, false),
+        ("required6", vec![4, 6], vec![6], RequireAll, false),
+        ("empty_family", vec![6], vec![4], Auto, false),
+    ] {
+        let config = EngineConfig::default();
+        let mut remote =
+            NatsRuntime::connect(r::config(0, case).unwrap(), config.core_limits(true))
+                .await
+                .unwrap();
+        let mut local =
+            NatsRuntime::connect(r::config(1, case).unwrap(), config.core_limits(false))
+                .await
+                .unwrap();
+        r::joined(&mut local, &mut remote, 1).await.unwrap();
+        let mut server = NetworkEngine::new(
+            remote,
+            EngineRole::Server {
+                grants: [(PeerId(1), family_grant(&supported))]
+                    .into_iter()
+                    .collect(),
+            },
+            config,
+        )
+        .unwrap();
+        let mut client = NetworkEngine::new(local, EngineRole::Client, config).unwrap();
+        client.open_ip(PeerId(0), offered, policy, 1500, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "family negotiation deadline: {case}"
+            );
+            client.drive(Duration::ZERO).await.unwrap();
+            server.drive(Duration::from_millis(1)).await.unwrap();
+            if accepted {
+                if let Some(selected) = client.sessions().first().and_then(|s| s.config.as_ref()) {
+                    assert_eq!(selected.families, supported);
+                    assert!(
+                        selected
+                            .source_grants
+                            .iter()
+                            .all(|g| supported.contains(&g.family()))
+                    );
+                    assert!(
+                        selected
+                            .routes
+                            .iter()
+                            .all(|g| supported.contains(&g.family()))
+                    );
+                    assert!(
+                        selected
+                            .dns_servers
+                            .iter()
+                            .all(|ip| supported.contains(&if ip.is_ipv4() { 4 } else { 6 }))
+                    );
+                    break;
+                }
+            } else if let Some(error) = client.last_error() {
+                assert_eq!(error, NetworkError::UnsupportedFamily);
+                assert!(client.sessions().is_empty());
+                assert!(server.sessions().is_empty());
+                assert_eq!(client.resources().queued_packet_bytes, 0);
+                break;
+            }
+        }
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn network_initiator_rejects_unoffered_or_incomplete_required_config() {
+    use skvoz_network::{Control, FamilyPolicy};
+    for (case, offered, selected, policy) in [
+        ("unoffered_family", vec![4], vec![6], FamilyPolicy::Auto),
+        (
+            "incomplete_required",
+            vec![4, 6],
+            vec![4],
+            FamilyPolicy::RequireAll,
+        ),
+    ] {
+        let config = EngineConfig::default();
+        let mut server =
+            NatsRuntime::connect(r::config(0, case).unwrap(), config.core_limits(true))
+                .await
+                .unwrap();
+        let mut local =
+            NatsRuntime::connect(r::config(1, case).unwrap(), config.core_limits(false))
+                .await
+                .unwrap();
+        r::joined(&mut local, &mut server, 1).await.unwrap();
+        let mut client = NetworkEngine::new(local, EngineRole::Client, config).unwrap();
+        client.open_ip(PeerId(0), offered, policy, 1500, 1).unwrap();
+        let grant = family_grant(&selected);
+        let bytes = Control::Config(grant.clone()).encode().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "untrusted CONFIG deadline: {case}"
+            );
+            client.drive(Duration::ZERO).await.unwrap();
+            server.turn(Duration::from_millis(1)).await.unwrap();
+            for event in server.poll_events(256) {
+                if matches!(event.event, Event::IncomingOpen { .. }) {
+                    server
+                        .accept(
+                            event.key,
+                            &Accept::IpSession {
+                                v: 3,
+                                session: grant.session.clone(),
+                            }
+                            .encode()
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        server.send(event.key, &bytes).unwrap(),
+                        SendOutcome::Accepted(bytes.len())
+                    );
+                }
+            }
+            if let Some(error) = client.last_error() {
+                assert_eq!(error, NetworkError::InvalidConfiguration);
+                assert!(client.sessions().is_empty());
+                assert!(client.poll_packet().is_none());
+                break;
+            }
+        }
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+}
+
 async fn quiet(client: &mut NatsRuntime, server: &mut NatsRuntime) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -25,6 +178,57 @@ async fn quiet(client: &mut NatsRuntime, server: &mut NatsRuntime) {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn network_initiator_preserves_incompatible_rejection_version() {
+    let config = EngineConfig::default();
+    let mut server = NatsRuntime::connect(
+        r::config(0, "old_rejection").unwrap(),
+        config.core_limits(true),
+    )
+    .await
+    .unwrap();
+    let mut local = NatsRuntime::connect(
+        r::config(1, "old_rejection").unwrap(),
+        config.core_limits(false),
+    )
+    .await
+    .unwrap();
+    r::joined(&mut local, &mut server, 1).await.unwrap();
+    let mut client = NetworkEngine::new(local, EngineRole::Client, config).unwrap();
+    client
+        .open_ip(
+            PeerId(0),
+            vec![4, 6],
+            skvoz_network::FamilyPolicy::Auto,
+            1500,
+            1,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "incompatible rejection deadline");
+        client.drive(Duration::ZERO).await.unwrap();
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        for event in server.poll_events(256) {
+            if matches!(event.event, Event::IncomingOpen { .. }) {
+                server
+                    .reject(
+                        event.key,
+                        br#"{"v":2,"type":"ip-session","error":"unsupported_version"}"#,
+                    )
+                    .unwrap();
+            }
+        }
+        if let Some(error) = client.last_error() {
+            assert_eq!(error, NetworkError::UnsupportedVersion);
+            assert!(client.sessions().is_empty());
+            break;
+        }
+    }
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -248,8 +452,9 @@ async fn network_admission_rejects_incompatible_remote_window_and_frame() {
             .open(
                 PeerId(0),
                 &Metadata::IpSession {
-                    v: 2,
+                    v: 3,
                     families: vec![4],
+                    family_policy: skvoz_network::FamilyPolicy::RequireAll,
                     max_mtu: 1500,
                     channels: 1,
                 }
@@ -277,7 +482,7 @@ async fn network_admission_rejects_incompatible_remote_window_and_frame() {
         let reason: serde_json::Value = serde_json::from_slice(&rejection).unwrap();
         assert_eq!(
             reason,
-            serde_json::json!({"v":2,"type":"ip-session","error":"invalid_request"})
+            serde_json::json!({"v":3,"type":"ip-session","error":"invalid_request"})
         );
         assert!(engine.sessions().is_empty());
         assert_eq!(engine.resources().streams, 0);
@@ -304,7 +509,15 @@ async fn network_initiator_closes_incompatible_accept_before_readiness() {
     .unwrap();
     r::joined(&mut client, &mut server, 1).await.unwrap();
     let mut engine = NetworkEngine::new(client, EngineRole::Client, config).unwrap();
-    engine.open_ip(PeerId(0), vec![4], 1500, 1).unwrap();
+    engine
+        .open_ip(
+            PeerId(0),
+            vec![4],
+            skvoz_network::FamilyPolicy::RequireAll,
+            1500,
+            1,
+        )
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut accepted = false;
     while !accepted || !engine.sessions().is_empty() {
@@ -317,7 +530,7 @@ async fn network_initiator_closes_incompatible_accept_before_readiness() {
                     .accept(
                         event.key,
                         &Accept::IpSession {
-                            v: 2,
+                            v: 3,
                             session: "0123456789abcdef0123456789abcdef"
                                 .to_owned()
                                 .try_into()
@@ -387,8 +600,9 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
         .open(
             PeerId(0),
             &Metadata::IpSession {
-                v: 2,
+                v: 3,
                 families: vec![4],
+                family_policy: skvoz_network::FamilyPolicy::RequireAll,
                 max_mtu: 1500,
                 channels: 1,
             }
@@ -426,7 +640,7 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
                                         .open(
                                             PeerId(0),
                                             &Metadata::IpData {
-                                                v: 2,
+                                                v: 3,
                                                 session: config.session.clone(),
                                                 channel: 0,
                                             }

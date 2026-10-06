@@ -105,7 +105,7 @@ fn request(id: u32, op: HelperOperation, args: Value) -> HelperRequest {
 }
 fn hello<S: skvoz_network_helper::registry::Store, K: Kernel>(s: &mut Service<S, K>) {
     s.handle(
-        &request(1, HelperOperation::Hello, json!({"api":1,"network":2})),
+        &request(1, HelperOperation::Hello, json!({"api":1,"network":3})),
         None,
     )
     .unwrap();
@@ -412,7 +412,7 @@ fn malformed_order_and_role_mismatch_cannot_reach_kernel() {
     assert!(trace.borrow().is_empty());
     assert!(
         s.handle(
-            &request(1, HelperOperation::Hello, json!({"api":1,"network":2})),
+            &request(1, HelperOperation::Hello, json!({"api":1,"network":3})),
             None
         )
         .is_err()

@@ -5,6 +5,71 @@ fn session() -> SessionId {
         .try_into()
         .unwrap()
 }
+#[test]
+fn auto_negotiates_nonempty_intersection_while_explicit_requests_remain_strict() {
+    for supported in [vec![4], vec![6], vec![4, 6]] {
+        assert_eq!(
+            FamilyPolicy::Auto.negotiate(&[4, 6], &supported).unwrap(),
+            supported
+        );
+        assert_eq!(
+            FamilyPolicy::RequireAll
+                .negotiate(&supported, &[4, 6])
+                .unwrap(),
+            supported
+        );
+    }
+    for (offered, supported) in [
+        (vec![4, 6], vec![4]),
+        (vec![4, 6], vec![6]),
+        (vec![4], vec![6]),
+        (vec![6], vec![4]),
+        (vec![4], vec![]),
+    ] {
+        assert_eq!(
+            FamilyPolicy::RequireAll.negotiate(&offered, &supported),
+            Err(NetworkError::UnsupportedFamily)
+        );
+        if !offered.iter().any(|f| supported.contains(f)) {
+            assert_eq!(
+                FamilyPolicy::Auto.negotiate(&offered, &supported),
+                Err(NetworkError::UnsupportedFamily)
+            );
+        }
+    }
+    assert!(FamilyPolicy::Auto.accepts(&[4, 6], &[4]));
+    assert!(FamilyPolicy::Auto.accepts(&[4, 6], &[6]));
+    assert!(!FamilyPolicy::Auto.accepts(&[4], &[6]));
+    assert!(!FamilyPolicy::Auto.accepts(&[4, 6], &[]));
+    assert!(!FamilyPolicy::RequireAll.accepts(&[4, 6], &[4]));
+}
+#[test]
+fn family_policy_is_mandatory_and_rejection_keeps_the_precise_reason() {
+    for policy in ["auto", "require_all"] {
+        let input = format!(
+            r#"{{"v":3,"type":"ip-session","families":[4,6],"family_policy":"{policy}","max_mtu":1500,"channels":1}}"#
+        );
+        Metadata::decode(input.as_bytes()).unwrap();
+    }
+    for input in [
+        br#"{"v":3,"type":"ip-session","families":[4,6],"max_mtu":1500,"channels":1}"#.as_slice(),
+        br#"{"v":3,"type":"ip-session","families":[4,6],"family_policy":"fallback","max_mtu":1500,"channels":1}"#,
+        br#"{"v":3,"type":"ip-session","families":[4,6],"family_policy":"auto","family_policy":"require_all","max_mtu":1500,"channels":1}"#,
+    ] {
+        assert!(Metadata::decode(input).is_err());
+    }
+    let rejection =
+        Rejection::decode(br#"{"v":3,"type":"ip-session","error":"unsupported_family"}"#).unwrap();
+    assert_eq!(rejection.network_error(), NetworkError::UnsupportedFamily);
+    assert_eq!(
+        local_api::ApiError::from(rejection.network_error()),
+        local_api::ApiError::UnsupportedFamily
+    );
+    assert_eq!(
+        Metadata::decode(br#"{"v":2,"type":"tcp","host":"example.org","port":443}"#),
+        Err(NetworkError::UnsupportedVersion)
+    );
+}
 fn config() -> SessionConfig {
     SessionConfig {
         session: session(),
@@ -49,15 +114,15 @@ fn ipv4(options: bool) -> Vec<u8> {
 #[test]
 fn exact_metadata_and_accept_contract() {
     for input in [
-        r#"{"v":2,"type":"tcp","host":"example.org","port":443}"#,
-        r#"{"v":2,"type":"ip-session","families":[6,4],"max_mtu":1500,"channels":1}"#,
-        r#"{"v":2,"type":"ip-data","session":"0123456789abcdef0123456789abcdef","channel":0}"#,
+        r#"{"v":3,"type":"tcp","host":"example.org","port":443}"#,
+        r#"{"v":3,"type":"ip-session","family_policy":"require_all","families":[6,4],"max_mtu":1500,"channels":1}"#,
+        r#"{"v":3,"type":"ip-data","session":"0123456789abcdef0123456789abcdef","channel":0}"#,
     ] {
         let value = Metadata::decode(input.as_bytes()).unwrap();
         assert_eq!(Metadata::decode(&value.encode().unwrap()).unwrap(), value);
     }
     let accept = Accept::IpSession {
-        v: 2,
+        v: 3,
         session: session(),
     };
     assert_eq!(Accept::decode(&accept.encode().unwrap()).unwrap(), accept);
@@ -73,13 +138,13 @@ fn exact_metadata_and_accept_contract() {
 #[test]
 fn metadata_rejects_duplicates_unknown_version_and_types() {
     for input in [
-        r#"{"v":2,"v":2,"type":"tcp","host":"example.org","port":443}"#,
-        r#"{"v":2,"type":"tcp","type":"tcp","host":"example.org","port":443}"#,
-        r#"{"v":2,"type":"tcp","host":"example.org","port":443,"unknown":0}"#,
+        r#"{"v":3,"v":3,"type":"tcp","host":"example.org","port":443}"#,
+        r#"{"v":3,"type":"tcp","type":"tcp","host":"example.org","port":443}"#,
+        r#"{"v":3,"type":"tcp","host":"example.org","port":443,"unknown":0}"#,
         r#"{"v":1,"type":"tcp","host":"example.org","port":443}"#,
-        r#"{"v":2,"type":"ip-session","families":[4,4],"max_mtu":1500,"channels":1}"#,
-        r#"{"v":2,"type":"ip-session","families":[4,6],"max_mtu":1000,"channels":1}"#,
-        r#"{"v":2,"type":"ip-data","session":"0123456789ABCDEF0123456789abcdef","channel":0}"#,
+        r#"{"v":3,"type":"ip-session","family_policy":"require_all","families":[4,4],"max_mtu":1500,"channels":1}"#,
+        r#"{"v":3,"type":"ip-session","family_policy":"require_all","families":[4,6],"max_mtu":1000,"channels":1}"#,
+        r#"{"v":3,"type":"ip-data","session":"0123456789ABCDEF0123456789abcdef","channel":0}"#,
     ] {
         assert!(Metadata::decode(input.as_bytes()).is_err(), "{input}");
     }
@@ -99,7 +164,7 @@ fn destination_rejects_ambiguous_scoped_mapped_and_invalid_names() {
     ] {
         assert!(
             Metadata::Tcp {
-                v: 2,
+                v: 3,
                 host: host.into(),
                 port: 443
             }
@@ -110,7 +175,7 @@ fn destination_rejects_ambiguous_scoped_mapped_and_invalid_names() {
     }
     assert!(
         Metadata::Tcp {
-            v: 2,
+            v: 3,
             host: "::1".into(),
             port: 0
         }
@@ -256,7 +321,7 @@ fn explicit_unknown_protocol_version_and_type_errors() {
         Err(NetworkError::UnsupportedVersion)
     );
     assert_eq!(
-        Metadata::decode(br#"{"v":2,"type":"ethernet"}"#),
+        Metadata::decode(br#"{"v":3,"type":"ethernet"}"#),
         Err(NetworkError::UnsupportedType)
     );
     let record = Record {

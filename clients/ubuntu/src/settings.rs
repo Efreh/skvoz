@@ -42,7 +42,7 @@ impl Default for Preferences {
         Self {
             v: 2,
             mode: Mode::Proxy,
-            families: vec![4, 6],
+            families: Vec::new(),
             max_mtu: 1500,
             transport_snapshots: BTreeMap::new(),
             host: String::new(),
@@ -62,9 +62,32 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub fn runtime_families(&self) -> Vec<u8> {
+        if self.families.is_empty() {
+            if self.max_mtu >= 1280 {
+                vec![4, 6]
+            } else {
+                vec![4]
+            }
+        } else {
+            self.families.clone()
+        }
+    }
+    pub fn ip_request(&self) -> skvoz_network::local_api::IpArgs {
+        skvoz_network::local_api::IpArgs {
+            families: self.runtime_families(),
+            family_policy: if self.families.is_empty() {
+                skvoz_network::FamilyPolicy::Auto
+            } else {
+                skvoz_network::FamilyPolicy::RequireAll
+            },
+            max_mtu: self.max_mtu,
+            channels: 1,
+        }
+    }
     pub fn validate_network(&self) -> Result<()> {
         if self.v != 2
-            || !matches!(self.families.as_slice(), [4] | [6] | [4, 6])
+            || !matches!(self.families.as_slice(), [] | [4] | [6] | [4, 6])
             || !(576..=1500).contains(&self.max_mtu)
             || self.families.contains(&6) && self.max_mtu < 1280
         {
@@ -293,9 +316,24 @@ pub fn login(input: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplayPreferences {
+    pub v: u8,
+    pub speed_unit: crate::telemetry::SpeedUnit,
+}
+impl Default for DisplayPreferences {
+    fn default() -> Self {
+        Self {
+            v: 1,
+            speed_unit: crate::telemetry::SpeedUnit::default(),
+        }
+    }
+}
 pub struct Settings {
     pub directory: PathBuf,
     pub value: Preferences,
+    pub display: DisplayPreferences,
     _lock: File,
 }
 impl Settings {
@@ -334,9 +372,20 @@ impl Settings {
         }
         value.validate_network()?;
         ports(value.http_port, value.socks_port)?;
+        let display_path = directory.join("ui.json");
+        let display: DisplayPreferences = if display_path.exists() || display_path.is_symlink() {
+            serde_json::from_slice(&read_private(&display_path, 1024)?)
+                .map_err(|_| Error("unsafe_settings"))?
+        } else {
+            DisplayPreferences::default()
+        };
+        if display.v != 1 {
+            return Err(Error("unsafe_settings"));
+        }
         Ok(Self {
             directory,
             value,
+            display,
             _lock: lock,
         })
     }
@@ -359,6 +408,15 @@ impl Settings {
         }
         write_private(&self.directory.join("settings.json"), &bytes)?;
         self.value = candidate;
+        Ok(())
+    }
+    pub fn save_display(&mut self, candidate: DisplayPreferences) -> Result<()> {
+        if candidate.v != 1 {
+            return Err(Error("unsafe_settings"));
+        }
+        let bytes = serde_json::to_vec(&candidate).map_err(|_| Error("unsafe_settings"))?;
+        write_private(&self.directory.join("ui.json"), &bytes)?;
+        self.display = candidate;
         Ok(())
     }
     pub fn device(&mut self, host: &str, port: u16, user: &str) -> Result<String> {
@@ -396,8 +454,33 @@ pub fn valid_token(input: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn automatic_default_offers_only_mtu_compatible_families_and_preserves_manual_selection() {
+        let mut value = Preferences::default();
+        assert!(value.families.is_empty());
+        value.validate_network().unwrap();
+        let request = value.ip_request();
+        assert_eq!(request.family_policy, skvoz_network::FamilyPolicy::Auto);
+        assert_eq!(request.families, [4, 6]);
+        value.max_mtu = 1279;
+        value.validate_network().unwrap();
+        assert_eq!(value.ip_request().families, [4]);
+        for families in [vec![4], vec![6], vec![4, 6]] {
+            value.max_mtu = 1500;
+            value.families = families.clone();
+            let stored = serde_json::to_vec(&value).unwrap();
+            let restored: Preferences = serde_json::from_slice(&stored).unwrap();
+            restored.validate_network().unwrap();
+            assert_eq!(restored.ip_request().families, families);
+            assert_eq!(
+                restored.ip_request().family_policy,
+                skvoz_network::FamilyPolicy::RequireAll
+            );
+        }
+    }
+    #[test]
     fn network_settings_reject_unusable_families_and_unbound_transport_cache() {
         let mut value = Preferences {
+            families: vec![4, 6],
             max_mtu: 1279,
             ..Preferences::default()
         };
@@ -445,6 +528,48 @@ mod tests {
 mod persistence_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn display_units_persist_privately_without_changing_connection_settings() {
+        let directory = std::env::temp_dir().join(format!("skvoz-display-{}", token().unwrap()));
+        let mut settings = Settings::open(directory.clone()).unwrap();
+        settings.save(settings.value.clone()).unwrap();
+        let connection = fs::read(directory.join("settings.json")).unwrap();
+        assert_eq!(
+            settings.display.speed_unit,
+            crate::telemetry::SpeedUnit::Kibibytes
+        );
+        settings
+            .save_display(DisplayPreferences {
+                v: 1,
+                speed_unit: crate::telemetry::SpeedUnit::Megabits,
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read(directory.join("settings.json")).unwrap(),
+            connection
+        );
+        assert_eq!(
+            fs::metadata(directory.join("ui.json")).unwrap().mode() & 0o777,
+            0o600
+        );
+        drop(settings);
+        let settings = Settings::open(directory.clone()).unwrap();
+        assert_eq!(
+            settings.display.speed_unit,
+            crate::telemetry::SpeedUnit::Megabits
+        );
+        drop(settings);
+        for bytes in [
+            br#"{"v":1}"#.as_slice(),
+            br#"{"v":2,"speed_unit":"megabits"}"#,
+            br#"{"v":1,"speed_unit":"auto"}"#,
+            br#"{"v":1,"speed_unit":"megabits","extra":true}"#,
+        ] {
+            write_private(&directory.join("ui.json"), bytes).unwrap();
+            assert!(Settings::open(directory.clone()).is_err());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn current_settings_and_private_secret_validation() {
         let directory = std::env::temp_dir().join(format!("skvoz-settings-{}", token().unwrap()));

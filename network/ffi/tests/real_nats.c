@@ -89,7 +89,7 @@ static int response(uint64_t handle, uint32_t id) {
 }
 
 static void hello_ready(uint64_t handle) {
-    request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":2},\"fd_count\":0}", 1);
+    request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":3},\"fd_count\":0}", 1);
     int hello = 0, ready = 0;
     double deadline = now() + 30;
     while (now() < deadline && (!hello || !ready)) {

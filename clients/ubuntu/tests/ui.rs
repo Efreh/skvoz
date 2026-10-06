@@ -26,6 +26,39 @@ fn widgets(root: &gtk::Widget) -> Vec<gtk::Widget> {
     }
     output
 }
+fn capture(name: &str) {
+    if let Some(path) = std::env::var_os(name) {
+        tick(Duration::from_millis(200));
+        assert!(
+            std::process::Command::new("xwd")
+                .args(["-silent", "-root", "-out"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+fn capture_window(name: &str, window: &impl IsA<gtk::Window>) {
+    if let Some(path) = std::env::var_os(name) {
+        tick(Duration::from_millis(200));
+        let window = window.as_ref();
+        assert!(window.is_mapped());
+        let snapshot = gtk::Snapshot::new();
+        gtk::WidgetPaintable::new(Some(window)).snapshot(
+            &snapshot,
+            window.width() as f64,
+            window.height() as f64,
+        );
+        let node = snapshot.to_node().unwrap();
+        window
+            .renderer()
+            .unwrap()
+            .render_texture(&node, None)
+            .save_to_png(path)
+            .unwrap();
+    }
+}
 fn dbus_call(
     bus: &gtk::gio::DBusConnection,
     path: &str,
@@ -86,54 +119,118 @@ fn qualify_desktop(view: &std::rc::Rc<View>) {
     );
     // GNOME renders XAyatanaLabel as plain text and ignores its width guide.
     let panel = gtk::Label::new(None);
-    let mut panel_widths = std::collections::BTreeMap::new();
-    let mut window_width = None;
-    for (down, up) in [
-        (0, 0),
-        (307, 30),
-        (1024, 1023),
-        (1_000_000, 99_999_999),
-        (1_023_999_980, 1024),
-        (1_024_000_000, u64::MAX),
-    ] {
-        let text = skvoz_ubuntu_client::telemetry::rates(down, up, 1.0);
-        view.speed.set_text(&text);
-        tray.update();
-        let prop = dbus_call(
+    view.show_settings();
+    tick(Duration::from_millis(100));
+    let dialog = view.settings_window.borrow().clone().unwrap();
+    let unit_row = widgets(dialog.upcast_ref())
+        .into_iter()
+        .filter_map(|w| w.downcast::<adw::ComboRow>().ok())
+        .find(|row| row.title() == "Единицы скорости")
+        .unwrap();
+    for (index, unit) in skvoz_ubuntu_client::telemetry::SpeedUnit::ALL
+        .into_iter()
+        .enumerate()
+    {
+        unit_row.set_selected(index as u32);
+        assert_eq!(view.speed_unit(), unit);
+        let mut panel_widths = std::collections::BTreeMap::new();
+        let mut window_width = None;
+        for (down, up) in [
+            (0, 0),
+            (307, 30),
+            (1024, 1023),
+            (1_000_000, 99_999_999),
+            (1_023_999_980, 1024),
+            (1_024_000_000, u64::MAX),
+        ] {
+            view.update_rates(down, up, 1.0);
+            let text = view.speed.text().to_string();
+            tray.update();
+            let prop = dbus_call(
+                &bus,
+                "/StatusNotifierItem",
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                &("org.kde.StatusNotifierItem", "XAyatanaLabel").to_variant(),
+            );
+            assert_eq!(
+                prop.child_value(0)
+                    .as_variant()
+                    .unwrap()
+                    .get::<String>()
+                    .unwrap(),
+                text
+            );
+            tick(Duration::from_millis(50));
+            for font in ["Sans 11", "Ubuntu Sans 11", "Ubuntu 11"] {
+                let layout = panel.create_pango_layout(Some(&text));
+                layout.set_font_description(Some(&gtk::pango::FontDescription::from_string(font)));
+                let width = layout.pixel_size().0;
+                assert_eq!(
+                    *panel_widths.entry(font).or_insert(width),
+                    width,
+                    "panel {font}: {text:?}"
+                );
+            }
+            let width = view.speed.width();
+            assert_eq!(
+                *window_width.get_or_insert(width),
+                width,
+                "window: {text:?}"
+            );
+        }
+        let guide = dbus_call(
             &bus,
             "/StatusNotifierItem",
             "org.freedesktop.DBus.Properties",
             "Get",
-            &("org.kde.StatusNotifierItem", "XAyatanaLabel").to_variant(),
-        );
-        assert_eq!(
-            prop.child_value(0)
-                .as_variant()
-                .unwrap()
+            &("org.kde.StatusNotifierItem", "XAyatanaLabelGuide").to_variant(),
+        )
+        .child_value(0)
+        .as_variant()
+        .unwrap()
+        .get::<String>()
+        .unwrap();
+        assert_eq!(guide, unit.guide());
+        let tooltip = dbus_call(
+            &bus,
+            "/StatusNotifierItem",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &("org.kde.StatusNotifierItem", "ToolTip").to_variant(),
+        )
+        .child_value(0)
+        .as_variant()
+        .unwrap();
+        assert!(
+            tooltip
+                .child_value(3)
                 .get::<String>()
-                .unwrap(),
-            text
+                .unwrap()
+                .ends_with(view.speed.text().as_str())
         );
-        tick(Duration::from_millis(50));
-        for font in ["Sans 11", "Ubuntu Sans 11", "Ubuntu 11"] {
-            let layout = panel.create_pango_layout(Some(&text));
-            layout.set_font_description(Some(&gtk::pango::FontDescription::from_string(font)));
-            let width = layout.pixel_size().0;
-            assert_eq!(
-                *panel_widths.entry(font).or_insert(width),
-                width,
-                "panel {font}: {text:?}"
-            );
-        }
-        let width = view.speed.width();
-        assert_eq!(
-            *window_width.get_or_insert(width),
-            width,
-            "window: {text:?}"
+        let menu = dbus_call(
+            &bus,
+            "/Menu",
+            "com.canonical.dbusmenu",
+            "GetLayout",
+            &(4i32, 0i32, vec!["label".to_string()]).to_variant(),
+        )
+        .child_value(1)
+        .get::<(i32, BTreeMap<String, glib::Variant>, Vec<glib::Variant>)>()
+        .unwrap();
+        assert!(
+            menu.1["label"]
+                .get::<String>()
+                .unwrap()
+                .ends_with(view.speed.text().as_str())
         );
     }
-    view.speed
-        .set_text(&skvoz_ubuntu_client::telemetry::rates(0, 0, 1.0));
+    unit_row.set_selected(3);
+    dialog.close();
+    tick(Duration::from_millis(100));
+    assert!(view.settings_window.borrow().is_none());
+    view.update_rates(0, 0, 1.0);
     let reply = dbus_call(
         &bus,
         "/Menu",
@@ -359,6 +456,9 @@ fn native_window_settings_and_backend_error() {
     }
     gtk::init().expect("GTK display initialization failed");
     adw::init().expect("Adwaita initialization failed");
+    if std::env::var_os("SKVOZ_UI_DARK").is_some() {
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+    }
     let directory = std::env::temp_dir().join(format!("skvoz-ui-{}", token().unwrap()));
     let settings = Arc::new(Mutex::new(Settings::open(directory.clone()).unwrap()));
     {
@@ -396,23 +496,47 @@ fn native_window_settings_and_backend_error() {
     view.window.present();
     tick(Duration::from_millis(400));
     assert_eq!(view.status.text(), "Отключено");
-    assert!(widgets(view.window.upcast_ref()).into_iter().any(|widget| {
-        widget.downcast::<gtk::Label>().is_ok_and(|label| {
-            label.text() == format!("Версия {}", env!("CARGO_PKG_VERSION")) && label.is_visible()
-        })
-    }));
+    assert!(view.proxy_mode.is_active());
+    assert!(!view.vpn_mode.is_active());
+    assert!(view.proxy_mode.has_css_class("suggested-action"));
+    view.proxy_mode.emit_clicked();
+    assert!(view.proxy_mode.is_active());
+    assert!(view.vpn_mode.grab_focus());
+    assert!(gtk::prelude::WidgetExt::activate(&view.vpn_mode));
+    tick(Duration::from_millis(300));
+    assert!(view.vpn_mode.is_active() && !view.proxy_mode.is_active());
+    assert!(settings.lock().unwrap().value.mode == skvoz_ubuntu_client::settings::Mode::Vpn);
+    assert!(!view.http.is_visible() && !view.socks.is_visible());
+    capture("SKVOZ_VPN_XWD");
+    view.proxy_mode.emit_clicked();
+    assert!(view.proxy_mode.is_active() && !view.vpn_mode.is_active());
+    assert!(view.http.is_visible() && view.socks.is_visible());
+    let labels = widgets(view.window.upcast_ref())
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Label>().ok())
+        .collect::<Vec<_>>();
+    let version = labels
+        .iter()
+        .find(|label| label.text() == format!("Версия {}", env!("CARGO_PKG_VERSION")))
+        .unwrap();
+    let title = labels
+        .iter()
+        .find(|label| label.text() == "Соединение SKVOZ:")
+        .unwrap();
+    let title_bounds = title.compute_bounds(&view.window).unwrap();
+    let selector_bounds = view.proxy_mode.compute_bounds(&view.window).unwrap();
+    let version_bounds = version.compute_bounds(&view.window).unwrap();
+    assert!(title_bounds.y() + title_bounds.height() <= selector_bounds.y());
+    assert!(selector_bounds.y() + selector_bounds.height() <= version_bounds.y());
     qualify_desktop(&view);
-    if let Some(path) = std::env::var_os("SKVOZ_MAIN_XWD") {
-        tick(Duration::from_millis(200));
-        assert!(
-            std::process::Command::new("xwd")
-                .args(["-silent", "-root", "-out"])
-                .arg(path)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
+    capture("SKVOZ_MAIN_XWD");
+    view.window.set_default_size(390, 700);
+    tick(Duration::from_millis(200));
+    let selector_bounds = view.vpn_mode.compute_bounds(&view.window).unwrap();
+    assert!(selector_bounds.x() >= 0.0);
+    assert!(selector_bounds.x() + selector_bounds.width() <= view.window.width() as f32);
+    capture("SKVOZ_NARROW_XWD");
+    view.window.set_default_size(560, 840);
     assert_eq!(view.http.subtitle().unwrap(), "http://127.0.0.1:8080");
     for row in [&view.http, &view.socks] {
         let button = widgets(row.upcast_ref())
@@ -435,15 +559,47 @@ fn native_window_settings_and_backend_error() {
     tick(Duration::from_millis(200));
     let dialog = view.settings_window.borrow().clone().unwrap();
     let all = widgets(dialog.upcast_ref());
-    let mode = all
+    assert!(
+        !all.iter()
+            .filter_map(|w| w.clone().downcast::<adw::ComboRow>().ok())
+            .any(|row| row.title() == "Режим")
+    );
+    let speed_unit = all
+        .iter()
+        .filter_map(|w| w.clone().downcast::<adw::ComboRow>().ok())
+        .find(|row| row.title() == "Единицы скорости")
+        .unwrap();
+    let choices = speed_unit
+        .model()
+        .unwrap()
+        .downcast::<gtk::StringList>()
+        .unwrap();
+    assert_eq!(choices.n_items(), 8);
+    view.update_rates(125_000, 250_000, 1.0);
+    speed_unit.set_selected(7);
+    assert_eq!(
+        view.speed_unit(),
+        skvoz_ubuntu_client::telemetry::SpeedUnit::Megabits
+    );
+    assert!(view.speed.text().starts_with("↓1.00 Мбит/с"));
+    assert!(view.speed.text().contains("↑2.00 Мбит/с"));
+    speed_unit.grab_focus();
+    capture("SKVOZ_UNITS_XWD");
+    capture_window("SKVOZ_UNITS_PNG", &dialog);
+    speed_unit.set_selected(3);
+    let families = all
         .iter()
         .filter_map(|widget| widget.clone().downcast::<adw::ComboRow>().ok())
-        .find(|row| row.title() == "Режим")
+        .find(|row| row.title() == "Семейства адресов")
         .unwrap();
-    let choices = mode.model().unwrap().downcast::<gtk::StringList>().unwrap();
-    assert_eq!(choices.n_items(), 2);
-    assert_eq!(choices.string(0).unwrap(), "Прокси");
-    assert_eq!(choices.string(1).unwrap(), "ВПН");
+    let choices = families
+        .model()
+        .unwrap()
+        .downcast::<gtk::StringList>()
+        .unwrap();
+    assert_eq!(choices.n_items(), 4);
+    assert_eq!(choices.string(0).unwrap(), "Автоматически");
+    assert_eq!(families.selected(), 0);
     let rows: Vec<adw::EntryRow> = all
         .iter()
         .filter_map(|widget| widget.clone().downcast::<adw::EntryRow>().ok())
@@ -469,6 +625,23 @@ fn native_window_settings_and_backend_error() {
     save.emit_by_name::<()>("clicked", &[]);
     tick(Duration::from_millis(100));
     assert_eq!(settings.lock().unwrap().value.http_port, 8181);
+    assert!(settings.lock().unwrap().value.families.is_empty());
+    let mut status = Engine::new(settings.clone(), "/does-not-exist".into()).status(None);
+    status.state = "connected";
+    status.families = vec![4];
+    view.apply(&status);
+    assert_eq!(view.status.text(), "Подключено · IPv4");
+    assert!(!view.proxy_mode.is_sensitive() && !view.vpn_mode.is_sensitive());
+    view.vpn_mode.set_active(true);
+    assert!(view.proxy_mode.is_active() && !view.vpn_mode.is_active());
+    assert!(settings.lock().unwrap().value.mode == skvoz_ubuntu_client::settings::Mode::Proxy);
+    status.families = vec![4, 6];
+    view.apply(&status);
+    assert_eq!(view.status.text(), "Подключено · IPv4 и IPv6");
+    status.state = "disconnected";
+    view.apply(&status);
+    assert_eq!(view.status.text(), "Отключено");
+    assert!(view.proxy_mode.is_sensitive() && view.vpn_mode.is_sensitive());
     tick(Duration::from_millis(1600));
     let copy = widgets(view.http.upcast_ref())
         .into_iter()

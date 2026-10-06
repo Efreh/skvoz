@@ -181,7 +181,13 @@ async fn main() -> ProbeResult<()> {
                         .collect()
                 })
                 .unwrap_or_else(|| vec![4, 6]);
-            engine.open_ip(PeerId(0), families, mtu, 1)?;
+            engine.open_ip(
+                PeerId(0),
+                families,
+                skvoz_network::FamilyPolicy::RequireAll,
+                mtu,
+                1,
+            )?;
             opening = true;
         }
         let sessions = engine.sessions();

@@ -323,6 +323,47 @@ def qualify(root, settings, certificate_factory):
         assert 'skvoz0' not in exec_('server','ip','-j','address','show')
         assert 'skvoz_network' not in exec_('server','nft','list','tables')
         results.append({'group':'server-shutdown-kernel-cleanup','status':'passed'})
+        # Reconfigure only disposable gateways; underlay remains dual stack.
+        for supported in [[4], [6], [4,6]]:
+            config=runtime(0)
+            config['network']['families']=supported
+            for family in [4,6]:
+                if family not in supported:
+                    config['server']['ipv'+str(family)]=None
+            config['server']['dns_servers']=[E+'.30' if family==4 else V+'::30' for family in supported]
+            state_dir='/var/lib/skvoz-network/family-'+''.join(map(str,supported))
+            config['server']['lease_store']=state_dir+'/leases.json'
+            master={'runtime':config,'helper':{'v':1,'role':'server','state_dir':state_dir,'policy':{'network':config['network'],'server':config['server']}}}
+            private(OUT/'server-master.json',master)
+            copy('server',OUT/'server-master.json','/fixture/master.json')
+            for role in ['server','client']:
+                run('docker','exec','-d',roles[role],'sh','-c',f'exec python3 /fixture/owner.py bootstrap {role} >/fixture/owner.log 2>&1')
+                wait(lambda role=role:owner_ready(role))
+            if supported != [4,6]:
+                for policy, offered in [('require_all',[4,6]), ('auto',[6] if supported==[4] else [4])]:
+                    request=json.dumps({'op':'start','broker':U+'.2','family_policy':policy,'families':offered})
+                    rejected=json.loads(run('docker','exec','--user','10001:10001',roles['client'],'python3','/fixture/owner.py','command',request,check=False))
+                    assert rejected=={'ok':False,'error':'unsupported_family'}, rejected
+                    assert 'skvoz0' not in exec_('client','ip','-j','address','show')
+                    assert 'skvoz_network' not in exec_('client','nft','list','tables')
+                    assert api('client','status')['mode']=='idle'
+                results.append({'group':f'family-rejection-before-local-setup-{supported[0]}','status':'passed'})
+            configured=api('client','start',broker=U+'.2',family_policy='auto')
+            selected=configured['config']
+            assert selected['families']==supported, selected
+            assert all((6 if ':' in address else 4) in supported for key in ['source_grants','routes','dns_servers'] for address in selected[key])
+            for address in [E+'.30',V+'::30']:
+                physical('client',address,False)
+            for family in supported:
+                address=E+'.30' if family==4 else V+'::30'
+                output=exec_('client','python3','/fixture/traffic.py','tcp',address,'--bytes','65536')
+                assert json.loads(output)['bytes']==65536, output
+            results.append({'group':'auto-family-config-traffic-guard-'+','.join(map(str,supported)),'status':'passed'})
+            api('client','stop')
+            for address in [E+'.30',V+'::30']:
+                physical('client',address,True)
+            api('client','shutdown')
+            api('server','shutdown')
     except Exception as error:
         results.append({'group':'failure','error':str(error)})
         raise

@@ -16,6 +16,7 @@ pub enum NetworkError {
     InvalidMetadata,
     UnsupportedVersion,
     UnsupportedType,
+    UnsupportedFamily,
     InvalidRecord,
     InvalidPacket,
     InvalidConfiguration,

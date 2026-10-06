@@ -425,7 +425,10 @@ pub(crate) fn reject_error(bytes: &[u8]) -> crate::local_api::ApiError {
     let Ok(rejection) = serde_json::from_value::<Rejection>(value) else {
         return ApiError::InvalidRequest;
     };
-    if rejection.v != 2 || rejection.kind != "tcp" {
+    if rejection.v != crate::NETWORK_VERSION {
+        return ApiError::UnsupportedVersion;
+    }
+    if rejection.kind != "tcp" {
         return ApiError::InvalidRequest;
     }
     match rejection.error.as_str() {
@@ -592,7 +595,7 @@ mod tests {
         assert!(
             connection
                 .event(Event::Rejected {
-                    reason: br#"{"v":2,"type":"tcp","error":"forbidden"}"#
+                    reason: br#"{"v":3,"type":"tcp","error":"forbidden"}"#
                         .to_vec()
                         .into_boxed_slice(),
                 })

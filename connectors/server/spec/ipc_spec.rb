@@ -14,7 +14,7 @@ RSpec.describe Skvoz::Server::RuntimeControl do
   end
 
   def hello_result
-    { api: 1, network: 2, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }
+    { api: 1, network: 3, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }
   end
 
   it 'keeps one entire command in flight while concurrent status and shutdown retain ordered IDs' do
@@ -107,9 +107,9 @@ RSpec.describe Skvoz::Server::RuntimeControl do
     Async do |task|
       server = task.async do
         serve(child) do |request|
-          expect(request).to include('op' => 'HELLO', 'args' => { 'api' => 1, 'network' => 2 })
+          expect(request).to include('op' => 'HELLO', 'args' => { 'api' => 1, 'network' => 3 })
           reply(child, v: 1, seq: 1, event: 'RUNTIME_STATE', data: { state: 'ready', error: nil }, fd_count: 0)
-          reply(child, v: 1, id: request['id'], result: { api: 1, network: 2, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }, error: nil, fd_count: 0)
+          reply(child, v: 1, id: request['id'], result: { api: 1, network: 3, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }, error: nil, fd_count: 0)
         end
         serve(child) { |request| reply(child, v: 1, id: request['id'], result: { lifecycle: 'ready', mode: 'server', session: nil, counters: described_class::COUNTERS.to_h { |name| [name, name == 'tcp_open' ? 3 : 0] } }, error: nil, fd_count: 0) }
       end

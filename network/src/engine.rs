@@ -220,7 +220,7 @@ struct Session {
     id: SessionId,
     control: RuntimeKey,
     config: Option<SessionConfig>,
-    requested: Option<(Vec<u8>, u16, u8)>,
+    requested: Option<(Vec<u8>, FamilyPolicy, u16, u8)>,
     state: SessionState,
     channels: BTreeMap<u8, (RuntimeKey, bool)>,
     local_ready: bool,
@@ -429,9 +429,15 @@ impl NetworkEngine {
         if !self.tcp_enabled || !matches!(self.role, EngineRole::Client) {
             return Err(NetworkError::InvalidState);
         }
-        let key = self
-            .runtime
-            .open(peer, &Metadata::Tcp { v: 2, host, port }.encode()?)?;
+        let key = self.runtime.open(
+            peer,
+            &Metadata::Tcp {
+                v: crate::NETWORK_VERSION,
+                host,
+                port,
+            }
+            .encode()?,
+        )?;
         self.tcp.insert(key);
         Ok(key)
     }
@@ -442,7 +448,7 @@ impl NetworkEngine {
         self.runtime.accept(
             key,
             &Accept::Tcp {
-                v: 2,
+                v: crate::NETWORK_VERSION,
                 status: "connected".into(),
             }
             .encode()?,
@@ -542,8 +548,9 @@ impl NetworkEngine {
         config.channels = p.channels;
         config.validate()?;
         let metadata = Metadata::IpSession {
-            v: 2,
+            v: crate::NETWORK_VERSION,
             families: p.families,
+            family_policy: FamilyPolicy::RequireAll,
             max_mtu: p.mtu,
             channels: p.channels,
         }
@@ -663,6 +670,7 @@ impl NetworkEngine {
         &mut self,
         peer: PeerId,
         families: Vec<u8>,
+        family_policy: FamilyPolicy,
         max_mtu: u16,
         channels: u8,
     ) -> Result<RuntimeKey, NetworkError> {
@@ -674,8 +682,9 @@ impl NetworkEngine {
             return Err(NetworkError::InvalidState);
         }
         let m = Metadata::IpSession {
-            v: 2,
+            v: crate::NETWORK_VERSION,
             families: families.clone(),
+            family_policy,
             max_mtu,
             channels,
         };
@@ -697,7 +706,7 @@ impl NetworkEngine {
                 id,
                 control: key,
                 config: None,
-                requested: Some((families, max_mtu, channels)),
+                requested: Some((families, family_policy, max_mtu, channels)),
                 state: SessionState::Negotiating,
                 channels: BTreeMap::new(),
                 local_ready: false,
@@ -714,7 +723,7 @@ impl NetworkEngine {
     }
     fn reject(&mut self, key: RuntimeKey, kind: &str, error: &str) -> Result<(), NetworkError> {
         self.counters.rejected_opens = self.counters.rejected_opens.saturating_add(1);
-        let bytes = serde_json::to_vec(&serde_json::json!({"v":2,"type":kind,"error":error}))
+        let bytes = serde_json::to_vec(&serde_json::json!({"v":3,"type":kind,"error":error}))
             .map_err(|_| NetworkError::InvalidMetadata)?;
         self.runtime.reject(key, &bytes)?;
         Ok(())
@@ -742,6 +751,7 @@ impl NetworkEngine {
         match m {
             Metadata::IpSession {
                 families,
+                family_policy,
                 max_mtu,
                 channels,
                 ..
@@ -749,9 +759,10 @@ impl NetworkEngine {
                 if let Some((supported, mtu, k)) = &self.dynamic
                     && self.reserved_config.is_none()
                 {
-                    if families.iter().any(|f| !supported.contains(f)) {
-                        return self.reject(key, "ip-session", "unsupported_family");
-                    }
+                    let families = match family_policy.negotiate(&families, supported) {
+                        Ok(selected) => selected,
+                        Err(_) => return self.reject(key, "ip-session", "unsupported_family"),
+                    };
                     if self.sessions.contains_key(&key.stream.peer)
                         || self
                             .reservations
@@ -800,10 +811,10 @@ impl NetworkEngine {
                 {
                     return self.reject(key, "ip-session", "overloaded");
                 }
-                if families.iter().any(|f| !config.families.contains(f)) {
-                    return self.reject(key, "ip-session", "unsupported_family");
-                }
-                config.families = families;
+                config.families = match family_policy.negotiate(&families, &config.families) {
+                    Ok(selected) => selected,
+                    Err(_) => return self.reject(key, "ip-session", "unsupported_family"),
+                };
                 config.mtu = config.mtu.min(max_mtu);
                 config.channels = config.channels.min(channels);
                 config
@@ -838,7 +849,7 @@ impl NetworkEngine {
                 self.runtime.accept(
                     key,
                     &Accept::IpSession {
-                        v: 2,
+                        v: crate::NETWORK_VERSION,
                         session: id.clone(),
                     }
                     .encode()?,
@@ -890,7 +901,7 @@ impl NetworkEngine {
                 self.runtime.accept(
                     key,
                     &Accept::IpData {
-                        v: 2,
+                        v: crate::NETWORK_VERSION,
                         session: session.clone(),
                         channel,
                     }
@@ -1020,11 +1031,11 @@ impl NetworkEngine {
                     && s.state == SessionState::Preparing
                     && s.config.is_none() =>
             {
-                let (mut families, mtu, k) =
+                let (mut families, family_policy, mtu, k) =
                     s.requested.clone().ok_or(NetworkError::InvalidState)?;
                 families.sort_unstable();
                 if c.session != s.id
-                    || c.families != families
+                    || !family_policy.accepts(&families, &c.families)
                     || c.mtu > mtu
                     || c.channels > k
                     || c.packet_queue_bytes > self.config.packet_queue_bytes
@@ -1040,7 +1051,7 @@ impl NetworkEngine {
                     .min(Instant::now() + Duration::from_millis(c.setup_timeout_ms));
                 for channel in 0..c.channels {
                     let m = Metadata::IpData {
-                        v: 2,
+                        v: crate::NETWORK_VERSION,
                         session: c.session.clone(),
                         channel,
                     }
@@ -1584,7 +1595,7 @@ impl NetworkEngine {
                     self.last_error = Some(
                         Rejection::decode(&reason)
                             .map(|r| r.network_error())
-                            .unwrap_or(NetworkError::InvalidMetadata),
+                            .unwrap_or_else(|error| error),
                     );
                     if self.streams.contains_key(&key) {
                         self.close_peer(key.stream.peer);
@@ -1902,7 +1913,7 @@ mod dispatcher_tests {
             &id(),
             &channels,
             &Accept::IpSession {
-                v: 2,
+                v: crate::NETWORK_VERSION,
                 session: id()
             }
         ));
@@ -1912,7 +1923,7 @@ mod dispatcher_tests {
             &id(),
             &channels,
             &Accept::IpData {
-                v: 2,
+                v: crate::NETWORK_VERSION,
                 session: id(),
                 channel: 0
             }
@@ -1923,7 +1934,7 @@ mod dispatcher_tests {
             &id(),
             &channels,
             &Accept::IpData {
-                v: 2,
+                v: crate::NETWORK_VERSION,
                 session: id(),
                 channel: 0
             }
@@ -1934,7 +1945,7 @@ mod dispatcher_tests {
             &id(),
             &channels,
             &Accept::IpData {
-                v: 2,
+                v: crate::NETWORK_VERSION,
                 session: id(),
                 channel: 1
             }

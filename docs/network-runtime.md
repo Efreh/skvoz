@@ -1,8 +1,8 @@
 # Общий сетевой runtime
 
-`skvoz-network` 0.2.1 связывает TCP-сокеты и полные IPv4/IPv6-пакеты с одной
+`skvoz-network` 0.3.0 связывает TCP-сокеты и полные IPv4/IPv6-пакеты с одной
 реализацией [Core 3.1.0 / NatsRuntime](nats-runtime.md). Формат метаданных —
-network 2, локальный API — 1. Это текущий контракт исходников; установка,
+network 3, локальный API — 1. Это текущий контракт исходников; установка,
 маршрутизация, изоляция в реальном окружении и производительность требуют
 отдельной процессной и сетевой квалификации.
 
@@ -58,8 +58,8 @@ CLI runtime: `--config <private-json-file> --control-fd <fd>`; для IP-сер�
 `network` содержит `families`, `max_mtu`, `channels`, `limits`:
 IPv4/IPv6 задаются `[4]`, `[6]`, `[4,6]`, MTU — 576–1500
 (с IPv6 не менее 1280), каналов данных — 1–8. Только сервер без IP backend
-может задать пустые семейства. Запрошенное недоступное семейство отклоняется
-целиком, автоматического перехода на IPv4 нет.
+может задать пустые семейства. Это возможности runtime; политика выбора
+семейств конкретной IP-сессии задаётся отдельно в START_IP.
 Полный ресурсный профиль создаёт host; библиотечные типы и валидатор находятся
 в `network/src/config.rs`. Настройки прежнего демона этим runtime не читаются.
 Параметры gateway описаны в [руководстве сервера](server-connector.md#конфигурация-и-мосты-к-внутренним-сервисам).
@@ -69,7 +69,7 @@ IPv4/IPv6 задаются `[4]`, `[6]`, `[4,6]`, MTU — 576–1500
 Сообщение — длина JSON в `u32be`, затем UTF-8 JSON до 32 768 байт:
 
 ```json
-{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":2},"fd_count":0}
+{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":3},"fd_count":0}
 ```
 
 Ответ содержит ровно `{v,id,result,error,fd_count}`, событие —
@@ -92,12 +92,12 @@ HELLO должен прийти за 5 секунд и отвечает неза
 
 | Команда | Аргументы | Результат |
 | --- | --- | --- |
-| HELLO | `{api:1,network:2}` | Роль и capabilities. |
+| HELLO | `{api:1,network:3}` | Роль и capabilities. |
 | STATUS | `{}` | `{lifecycle,mode,session,counters}`. |
 | START_PROXY | `{http_bind,socks_bind}`; nullable numeric endpoints | `{http,socks}`; оба listener открываются атомарно. |
 | STOP_PROXY | `{}` | `{}` после остановки связанных потоков. |
 | OPEN_TCP | `{host,port}` | `{handle}` и один FD после удалённого ACCEPT. |
-| START_IP | `{families,max_mtu,channels}` | `{handle}` новой согласуемой сессии. |
+| START_IP | `{families,family_policy,max_mtu,channels}` | `{handle}` новой согласуемой сессии. |
 | ATTACH_IP | `{handle,interface,mtu}` и один TUN FD | `{handle}` после проверки FD. |
 | LOCAL_READY | `{handle}` | `{handle}`; ACTIVE приходит отдельно. |
 | STOP_IP | `{handle,reason}` | `{handle}` после ограниченной очистки; reason `user_stop`, `mode_change`, `shutdown`. |
@@ -105,6 +105,17 @@ HELLO должен прийти за 5 секунд и отвечает неза
 
 Клиент начинает в `idle`, выбирает `proxy` или `ip`; смена выполняется через
 stop → cleanup → start. OPEN_TCP доступен только в `proxy`.
+В START_IP и метаданных `ip-session` поле `families` — непустой набор
+предлагаемых клиентом семейств, `family_policy` обязательно:
+`auto` выбирает пересечение с настроенными серверными backend,
+`require_all` требует все предложенные семейства. Пустое пересечение или
+недоступное обязательное семейство отклоняется с `unsupported_family`
+до настройки клиентского TUN. CONFIG содержит фактически выбранные семейства,
+только их source grants, маршруты, DNS и egress. Клиент проверяет непустой
+поднабор предложения в `auto` и точное совпадение в `require_all` до CONFIGURED.
+Семейства IP внутри туннеля независимы от адреса подключения к NATS.
+Ошибки версии, TLS, identity, ACL или объявленного backend не запускают
+повторное подключение с меньшим набором семейств.
 Server обслуживает входящие TCP/IP автоматически и отвергает клиентские команды
 START/STOP/ATTACH/LOCAL_READY/OPEN_TCP. HELLO/STATUS/PREPARE_SHUTDOWN доступны обеим ролям.
 Listener принимает только явно заданный loopback/private numeric адрес;
@@ -120,7 +131,7 @@ STATS содержит один `counters`, выдаётся не чаще ра�
 `{id,protocol,host,port,result,uploaded,downloaded}`: идентификатор локален runtime,
 protocol — HTTP/CONNECT/SOCKS5/TCP, без path/query, заголовков и содержимого.
 Весь выход ограничен 128 сообщениями / 128 КиБ; terminal events не отбрасываются,
-переполнение закрывает owner. Ошибки API: `unsupported_version`, `invalid_request`,
+переполнение закрывает owner. Ошибки API: `unsupported_version`, `unsupported_family`, `invalid_request`,
 `invalid_state`, `unknown_handle`, `forbidden`, `overloaded`, `local_setup_failed`,
 `network_unavailable`, `timeout`, `closed`.
 
