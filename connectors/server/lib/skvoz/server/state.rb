@@ -212,7 +212,7 @@ module Skvoz
       def export(login, id, password)
         { 'v' => 2, 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login,
           'password' => password, 'namespace' => @config['namespace'], 'peer_id' => id,
-          'network_runtime' => { 'network' => 4, 'api' => 1, 'version' => '0.4.0', 'core' => '4.0.0' },
+          'network_runtime' => { 'network' => 4, 'api' => 1, 'version' => '0.4.1', 'core' => '4.0.1' },
           'allowed_peers' => [0], 'initiate' => [0], 'shards' => 8,
           'trust' => @value.fetch('tls')['ca'] ? 'managed_ca' : 'system' }
       end

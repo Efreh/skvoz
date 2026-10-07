@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-core"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-network"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-ubuntu-client"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "async-nats",
  "futures-util",

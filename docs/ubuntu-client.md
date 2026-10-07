@@ -1,9 +1,9 @@
 # Клиент Ubuntu
 
-`skvoz-client` 4.0.0 — приложение Rust с GTK4/libadwaita для Ubuntu 24.04+
+`skvoz-client` 4.0.1 — приложение Rust с GTK4/libadwaita для Ubuntu 24.04+
 на amd64. Поддерживает локальные интерфейсы HTTP/CONNECT/SOCKS5 CONNECT
 и передачу IPv4/IPv6-пакетов через TUN.
-Оба используют комплектный `skvoz-network-runtime` 0.4.0 с тем же Core 4.0.0.
+Оба используют комплектный `skvoz-network-runtime` 0.4.1 с тем же Core 4.0.1.
 GTK управляет соединением; TCP и packet I/O находятся в
 [общем сетевом модуле](network-runtime.md). Установленному приложению не нужны
 Rust или Python.
@@ -19,8 +19,8 @@ Rust или Python.
 уже опубликована. В каталоге загрузки:
 
 ```sh
-sha256sum -c skvoz-client_4.0.0_amd64.deb.sha256
-sudo apt install ./skvoz-client_4.0.0_amd64.deb
+sha256sum -c skvoz-client_4.0.1_amd64.deb.sha256
+sudo apt install ./skvoz-client_4.0.1_amd64.deb
 ```
 
 Откройте **SKVOZ**, введите IP/DNS сервера, внешний порт NATS, логин и пароль.
@@ -30,7 +30,7 @@ IPv6 допускает `::1` или `[::1]`; порт вводится отде
 отключения. По умолчанию выбран
 режим «Прокси». Устройство выделяется автоматически; ручной peer_id не нужен.
 Сервер должен поддерживать [enrollment 2](#протокол-выделения-устройства-v2),
-network 4, API 1, runtime 0.4.0 и Core 4.0.0.
+network 4, API 1, runtime 0.4.1 и Core 4.0.1.
 
 TLS проверяет системные корни и исходное имя/IP сервера.
 Для private CA укажите PEM-файл, полученный от администратора по доверенному
@@ -188,7 +188,7 @@ broker-authorized reply subject. Request строго ограничен, пов
 поля и произвольный reply отклоняются. Ответ успешного сервера:
 
 ```json
-{"v":2,"namespace":"skvoz.application","peer_id":2,"network_runtime":{"network":4,"api":1,"version":"0.4.0","core":"4.0.0"}}
+{"v":2,"namespace":"skvoz.application","peer_id":2,"network_runtime":{"network":4,"api":1,"version":"0.4.1","core":"4.0.1"}}
 ```
 
 Повтор token идемпотентен, в том числе после потерянного ответа/перезапуска.

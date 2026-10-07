@@ -161,7 +161,7 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             || result.network_runtime.version != RUNTIME_VERSION
             || result.network_runtime.api != 1
             || result.network_runtime.network != 4
-            || result.network_runtime.core != "4.0.0"
+            || result.network_runtime.core != "4.0.1"
         {
             return Err(Error("version_mismatch"));
         }

@@ -203,7 +203,7 @@ impl Engine {
         .map_err(|_| Error("version_mismatch"))??;
         if !output.status.success()
             || String::from_utf8_lossy(&output.stdout).trim()
-                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=4 api=1 core=4.0.0")
+                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=4 api=1 core=4.0.1")
         {
             return Err(Error("version_mismatch"));
         }

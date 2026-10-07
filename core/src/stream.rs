@@ -21,6 +21,7 @@ pub struct Stream {
     now_ms: u64,
     deadline_ms: Option<u64>,
     peer_window: u32,
+    peer_granted_window: u32,
     peer_limit: u64,
     peer_record_window: usize,
     sent_ends: LinkedList<u64>,
@@ -59,6 +60,7 @@ impl Stream {
             now_ms: 0,
             deadline_ms: None,
             peer_window: 0,
+            peer_granted_window: 0,
             peer_limit: 0,
             peer_record_window: 0,
             sent_ends: LinkedList::new(),
@@ -309,6 +311,9 @@ impl Stream {
             self.receive_limit = self
                 .receive_limit
                 .max(offset.saturating_add(self.local_window as u64));
+            if let Some((limit, _)) = &mut self.grant_frame {
+                *limit = self.receive_limit;
+            }
             self.credit_frame = Some(offset);
             self.maybe_complete();
         }
@@ -537,9 +542,9 @@ impl Stream {
                     return Err(ProtocolError::InvalidCredit);
                 }
                 self.acknowledge_peer(*consumed);
-                self.peer_limit = self
-                    .peer_limit
-                    .max(consumed.saturating_add(self.peer_window as u64));
+                self.peer_limit = self.peer_limit.max(
+                    consumed.saturating_add(self.peer_window.max(self.peer_granted_window) as u64),
+                );
                 self.notify_writable();
             }
             Frame::WindowGrant {
@@ -555,6 +560,8 @@ impl Stream {
                 }
                 self.acknowledge_peer(*consumed);
                 self.peer_limit = self.peer_limit.max(*limit);
+                // Consumption-only updates must also slide the grown window.
+                self.peer_granted_window = self.peer_granted_window.max((limit - consumed) as u32);
                 self.peer_record_window = self.peer_record_window.max(Self::record_window(
                     (limit - consumed) as u32,
                     self.peer_max_frame,
@@ -763,6 +770,98 @@ impl Stream {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    fn adaptive_pair() -> (Stream, Stream) {
+        let config = Config {
+            receive_window: 1 << 20,
+            max_frame: 16384,
+            ..Config::default()
+        };
+        let mut sender = Stream::new(config).unwrap();
+        let mut receiver = Stream::new(config).unwrap();
+        sender.initial_receive_window(65536);
+        receiver.initial_receive_window(65536);
+        sender.open(b"", 0).unwrap();
+        receiver
+            .receive(&sender.poll_frames(1).pop().unwrap(), 0)
+            .unwrap();
+        receiver.accept(b"").unwrap();
+        sender
+            .receive(&receiver.poll_frames(1).pop().unwrap(), 0)
+            .unwrap();
+        sender.poll_events(8);
+        receiver.poll_events(8);
+        (sender, receiver)
+    }
+
+    #[test]
+    fn window_updates_preserve_a_grown_window_across_repeated_transfers() {
+        let (mut sender, mut receiver) = adaptive_pair();
+        let grown_window = 262144;
+        receiver.grant_receive_window(grown_window, 1).unwrap();
+        sender
+            .receive(&receiver.poll_frames(1).pop().unwrap(), 1)
+            .unwrap();
+        let mut consumed = 0;
+        for round in 0..12 {
+            let mut accepted = 0;
+            while let SendOutcome::Accepted(count) = sender.send(&[7; 16384]).unwrap() {
+                accepted += count;
+                if accepted == grown_window as usize {
+                    break;
+                }
+            }
+            assert_eq!(
+                accepted, grown_window as usize,
+                "window fell back in round {round}"
+            );
+            assert_eq!(sender.send(b"x"), Ok(SendOutcome::WouldBlock));
+            for frame in sender.poll_frames(256) {
+                receiver.receive(&frame, round + 2).unwrap();
+            }
+            for event in receiver.poll_events(256) {
+                if let Event::Data { offset, bytes } = event {
+                    assert_eq!(offset, consumed);
+                    assert!(bytes.iter().all(|byte| *byte == 7));
+                    consumed += bytes.len() as u64;
+                }
+            }
+            receiver.consume_through(consumed).unwrap();
+            let updates = receiver.poll_frames(256);
+            assert!(matches!(updates.as_slice(), [Frame::WindowUpdate { .. }]));
+            for frame in updates {
+                sender.receive(&frame, round + 2).unwrap();
+            }
+            assert_eq!(sender.snapshot().send_unacknowledged_bytes, 0);
+        }
+        assert_eq!(consumed, 12 * grown_window as u64);
+    }
+
+    #[test]
+    fn queued_window_grant_tracks_consumption_before_dispatch() {
+        let (mut sender, mut receiver) = adaptive_pair();
+        for _ in 0..2 {
+            assert_eq!(sender.send(&[7; 16384]), Ok(SendOutcome::Accepted(16384)));
+        }
+        for frame in sender.poll_frames(8) {
+            receiver.receive(&frame, 1).unwrap();
+        }
+        assert_eq!(receiver.poll_events(8).len(), 2);
+        receiver.consume_through(16384).unwrap();
+        receiver.grant_receive_window(262144, 7).unwrap();
+        receiver.consume_through(32768).unwrap();
+        let frames = receiver.poll_frames(8);
+        assert_eq!(
+            frames,
+            [Frame::WindowGrant {
+                consumed: 32768,
+                limit: 32768 + 262144,
+                probe: 7,
+            }]
+        );
+        sender.receive(&frames[0], 2).unwrap();
+        assert_eq!(sender.peer_limits().unwrap().receive_window, 65536);
+    }
 
     #[test]
     fn standalone_tiny_data_records_remain_bounded_after_event_transfer() {

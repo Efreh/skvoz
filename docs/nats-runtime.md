@@ -1,7 +1,7 @@
 # Динамический NATS runtime
 
 `skvoz_core::runtime::NatsRuntime` — опциональный runtime одной универсальной
-Core library 4.0.0. Он добавляет authenticated join, смену peer session, проверку
+Core library 4.0.1. Он добавляет authenticated join, смену peer session, проверку
 живости и восстановление транспорта для новых byte streams. Включается feature
 `nats`; HTTP/SOCKS parsing, DNS, сокеты, GUI и выдача credentials принадлежат host.
 Статический [NatsNode](../core/src/nats.rs) используется простым TCP relay

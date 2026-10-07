@@ -5,6 +5,90 @@ use skvoz_core::{
 use skvoz_testbench::runtime_scenarios as r;
 use std::time::{Duration, Instant};
 #[tokio::test]
+async fn grown_stream_window_survives_repeated_consumption_over_real_nats() {
+    const WINDOW: usize = 256 << 10;
+    const WARMUP: usize = 4 << 20;
+    let profile = ManagerConfig {
+        stream: skvoz_core::Config {
+            receive_window: WINDOW as u32,
+            max_frame: 16384,
+            max_pending_frames: 32,
+            ..ManagerConfig::default().stream
+        },
+        receive_budget: 2 << 20,
+        receive_budget_per_peer: 2 << 20,
+        max_peers: 1,
+        ..ManagerConfig::default()
+    };
+    let mut server = NatsRuntime::connect(r::config(0, "persistent-window").unwrap(), profile)
+        .await
+        .unwrap();
+    let mut client = NatsRuntime::connect(r::config(1, "persistent-window").unwrap(), profile)
+        .await
+        .unwrap();
+    r::joined(&mut client, &mut server, 1).await.unwrap();
+    let (local, remote) = r::handshake(&mut client, &mut server).await.unwrap();
+    let payload = [0x73; 16384];
+    let mut sent = 0;
+    let mut received = 0;
+    let start = Instant::now();
+    for round in 0..13 {
+        while server.snapshot(remote).unwrap().send_unacknowledged_bytes != 0 {
+            assert!(start.elapsed() < Duration::from_secs(15));
+            client.turn(Duration::ZERO).await.unwrap();
+            server.turn(Duration::from_millis(1)).await.unwrap();
+            server.poll_events(256);
+        }
+        let target = if round == 0 { WARMUP } else { sent + WINDOW };
+        while received < target {
+            assert!(start.elapsed() < Duration::from_secs(15));
+            while sent < target {
+                match server
+                    .send(remote, &payload[..payload.len().min(target - sent)])
+                    .unwrap()
+                {
+                    skvoz_core::SendOutcome::Accepted(count) => sent += count,
+                    skvoz_core::SendOutcome::WouldBlock => break,
+                }
+            }
+            if round != 0 {
+                assert_eq!(
+                    server.snapshot(remote).unwrap().send_unacknowledged_bytes,
+                    WINDOW as u64,
+                    "grown window lost after warmup in round {round}"
+                );
+            }
+            server.turn(Duration::ZERO).await.unwrap();
+            client.turn(Duration::from_millis(1)).await.unwrap();
+            server.poll_events(256);
+            for event in client.poll_events(256) {
+                match event.event {
+                    Event::Data { offset, bytes } => {
+                        assert_eq!(event.key, local);
+                        assert_eq!(offset, received as u64);
+                        assert!(bytes.iter().all(|byte| *byte == 0x73));
+                        received += bytes.len();
+                        if round == 0 {
+                            client.consume_through(local, received as u64).unwrap();
+                        }
+                    }
+                    Event::Closed { reason } => panic!("unexpected terminal event: {reason:?}"),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(sent, target);
+        client.consume_through(local, received as u64).unwrap();
+    }
+    assert_eq!(received, WARMUP + 12 * WINDOW);
+    assert_eq!(server.peer_limits(remote).unwrap().receive_window, 65536);
+    assert_eq!(server.status().counters.shard_overflows, 0);
+    assert_eq!(client.status().counters.shard_overflows, 0);
+    println!("persistent-window received={received} rounds=12 window={WINDOW}");
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+#[tokio::test]
 async fn growing_duplex_credit_keeps_subscription_64_drained_during_output() {
     let profile = ManagerConfig {
         stream: skvoz_core::Config {

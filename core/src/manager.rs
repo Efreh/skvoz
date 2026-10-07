@@ -890,10 +890,13 @@ mod credit_integration_tests {
         let mut received = 0;
         for now in 1..1000 {
             for _ in 0..32 {
-                if sent == 8 << 20 {
+                if sent >= 8 << 20 {
                     break;
                 }
-                match a.send(key, &block).unwrap() {
+                match a
+                    .send(key, &block[..block.len().min((8 << 20) - sent)])
+                    .unwrap()
+                {
                     SendOutcome::Accepted(n) => sent += n,
                     SendOutcome::WouldBlock => break,
                 }

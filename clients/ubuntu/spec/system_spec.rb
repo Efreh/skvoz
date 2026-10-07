@@ -307,7 +307,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
       listener.close
     end
     fake = @directory.join('delayed-core')
-    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-network-runtime 0.4.0 network=4 api=1 core=4.0.0'; else exec sleep 60; fi\n")
+    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-network-runtime 0.4.1 network=4 api=1 core=4.0.1'; else exec sleep 60; fi\n")
     fake.chmod(0o700)
     parent = UbuntuSystem::Application.new(@directory.join('crash'), @server, runtime: fake.to_s, wait_ready: false)
     @applications << parent
