@@ -99,7 +99,9 @@ async fn config_checks_types_ranges_unknown_fields_and_redaction() {
     for (window, frame, accepted) in [
         (65537, 32768, true),
         (1_048_576, 32768, true),
-        (1_048_577, 32768, false),
+        (1_048_577, 32768, true),
+        (33_554_432, 32768, true),
+        (33_554_433, 32768, false),
         (1_048_576, 32769, false),
     ] {
         profile["limits"] = serde_json::json!({"receive_window":window,"max_frame":frame});
@@ -108,5 +110,5 @@ async fn config_checks_types_ranges_unknown_fields_and_redaction() {
     }
     profile["limits"] = serde_json::json!({"receive_window":1_048_576,"max_frame":32768,"receive_bytes_per_peer":65536});
     fs::write(&p, serde_json::to_vec(&profile).unwrap()).unwrap();
-    assert!(Profile::load(&p, uid).is_err());
+    assert!(Profile::load(&p, uid).is_ok());
 }

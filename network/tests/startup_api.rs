@@ -47,6 +47,26 @@ fn wire(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
 #[test]
+fn canonical_runtime_backs_cancelled_backend_payload_shadow_and_native_pool() {
+    for role in [Role::Client, Role::Server] {
+        let limits = Limits::canonical(role);
+        let minimum = limits
+            .minimum_runtime_bytes(role, role == Role::Server)
+            .unwrap();
+        assert!(
+            minimum <= limits.runtime_buffer_bytes,
+            "{role:?}: {minimum}"
+        );
+        // Both independently retained owners plus the cancelled backend shadow.
+        let payload = 2 * limits.core_receive_bytes + 512 * limits.max_frame as usize;
+        assert!(limits.fixed_backing(role, false).unwrap() + limits.core_receive_bytes >= payload);
+        println!(
+            "{role:?} minimum_runtime_bytes={minimum} limit={}",
+            limits.runtime_buffer_bytes
+        );
+    }
+}
+#[test]
 fn tuned_profiles_reject_unbacked_fixed_reservations_before_startup() {
     for role in [Role::Client, Role::Server] {
         let mut limits = Limits::canonical(role);
@@ -96,11 +116,11 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     let config = StartupConfig::parse_json(CLIENT).unwrap();
     assert_eq!(
         config.network.limits.transport_reservation(Role::Client),
-        12592896
+        13322464
     );
     assert_eq!(
         Limits::canonical(Role::Server).transport_reservation(Role::Server),
-        78705600
+        82340624
     );
     let value: Value = serde_json::from_slice(CLIENT).unwrap();
     for (parent, key) in [

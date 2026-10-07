@@ -203,7 +203,7 @@ impl Engine {
         .map_err(|_| Error("version_mismatch"))??;
         if !output.status.success()
             || String::from_utf8_lossy(&output.stdout).trim()
-                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=3 api=1 core=3.1.0")
+                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=4 api=1 core=4.0.0")
         {
             return Err(Error("version_mismatch"));
         }
@@ -277,7 +277,7 @@ impl Engine {
         remember_child(&runtime, child_id)?;
         self.control = Some(Session::new(local.into(), false)?);
         let session = self.control.as_mut().ok_or(Error("ipc_failed"))?;
-        let hello = session.call("HELLO", json!({"api":1,"network":3})).await?;
+        let hello = session.call("HELLO", json!({"api":1,"network":4})).await?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Capabilities {
@@ -296,7 +296,7 @@ impl Engine {
         }
         let hello: Hello = serde_json::from_value(hello).map_err(|_| Error("version_mismatch"))?;
         if hello.api != 1
-            || hello.network != 3
+            || hello.network != 4
             || hello.role != Role::Client
             || hello.capabilities.profiles != ["tcp", "ip"]
             || hello.capabilities.families != preferences.runtime_families()
@@ -456,7 +456,7 @@ impl Engine {
             let socket = socket.into_std()?;
             let helper = Session::new(socket.into(), true)?;
             helper
-                .helper_call("HELLO", json!({"api":1,"network":3}))
+                .helper_call("HELLO", json!({"api":1,"network":4}))
                 .await?;
             self.helper = Some(helper);
         }

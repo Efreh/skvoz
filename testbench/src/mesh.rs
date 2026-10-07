@@ -247,6 +247,7 @@ pub async fn run(case: &str, o: LoadOptions) -> Result<(), BenchError> {
     );
     let start = Instant::now();
     let (mut server, mut clients) = nodes(case, o).await?;
+    let initial_receive_backing = server.resources().reserved_receive_bytes;
     let connect_ms = start.elapsed().as_millis();
     let mut keys = Vec::new();
     for node in &mut clients {
@@ -288,7 +289,7 @@ pub async fn run(case: &str, o: LoadOptions) -> Result<(), BenchError> {
     let idle = server.resources();
     assert_eq!(idle.streams, o.clients * o.streams_per_client);
     assert_eq!(idle.receive_capacity_bytes, 0);
-    assert_eq!(idle.reserved_receive_bytes, idle.streams * 8192);
+    assert_eq!(idle.reserved_receive_bytes, initial_receive_backing);
     // Every client has the same initial IDs: owner context, not numeric ID, routes data.
     for k in &keys {
         assert_eq!(k[0].stream_id, 3);
@@ -430,15 +431,29 @@ pub async fn run(case: &str, o: LoadOptions) -> Result<(), BenchError> {
         }
         tokio::task::yield_now().await;
     }
-    assert_eq!(server.resources().reserved_receive_bytes, 0);
-    assert_eq!(server.resources().pending_send_bytes, 0);
+    let remaining = server.resources();
+    assert_eq!(remaining.streams, 0);
+    assert_eq!(remaining.pending_send_bytes, 0);
+    assert_eq!(remaining.buffered_receive_bytes, 0);
+    assert_eq!(remaining.receive_unconsumed_bytes, 0);
+    assert_eq!(remaining.receive_capacity_bytes, 0);
+    assert!(
+        remaining.reserved_receive_bytes
+            <= limits(
+                o.clients,
+                o.clients * o.streams_per_client,
+                o.streams_per_client
+            )
+            .receive_budget
+    );
     println!(
-        "LOAD complete payload_bytes={} traffic_ms={} bytes_per_second={:.0} rounds={} app_rss_kib={:?} remaining_streams=0 reserved_receive_bytes=0 slow_reader_other_peer_progress={}",
+        "LOAD complete payload_bytes={} traffic_ms={} bytes_per_second={:.0} rounds={} app_rss_kib={:?} remaining_streams=0 reserved_receive_bytes={} slow_reader_other_peer_progress={}",
         total_bytes,
         traffic_duration.as_millis(),
         total_bytes as f64 / traffic_secs,
         rounds,
         rss_kib(),
+        remaining.reserved_receive_bytes,
         small_peer_progress
     );
     println!(

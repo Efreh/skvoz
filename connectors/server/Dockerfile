@@ -4,6 +4,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY clients/ubuntu/Cargo.toml clients/ubuntu/Cargo.toml
 RUN mkdir -p clients/ubuntu/src/bin && printf "fn main() {}\n" > clients/ubuntu/src/main.rs && printf "// Metadata-only workspace stub.\n" > clients/ubuntu/src/lib.rs && printf "fn main() {}\n" > clients/ubuntu/src/bin/test_driver.rs
+COPY vendor/async-nats vendor/async-nats
 COPY core core
 COPY daemon daemon
 COPY network network

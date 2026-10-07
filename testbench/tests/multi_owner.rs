@@ -50,6 +50,7 @@ async fn live_slots_reused_many_times_without_reusing_ids() {
     };
     let (mut server, mut clients) = mesh::nodes("churn", o).await.unwrap();
     let client = &mut clients[0];
+    let initial_receive_backing = server.resources().reserved_receive_bytes;
     let mut previous = 0;
     for _ in 0..40 {
         let key = handshake(client, &mut server).await;
@@ -72,7 +73,12 @@ async fn live_slots_reused_many_times_without_reusing_ids() {
                 }
             }
         }
-        assert_eq!(server.resources().reserved_receive_bytes, 0);
+        assert_eq!(
+            server.resources().reserved_receive_bytes,
+            initial_receive_backing
+        );
+        assert_eq!(server.resources().receive_unconsumed_bytes, 0);
+        assert_eq!(server.resources().buffered_receive_bytes, 0);
     }
     for n in clients {
         n.shutdown().await.unwrap();
@@ -128,8 +134,14 @@ async fn session_generations_and_authenticated_sender_subjects() {
         .inject_subject(format!("{namespace}.0.g1.1.g1"), packet.clone())
         .await
         .unwrap();
-    assert_eq!(server.turn(Duration::from_millis(20)).await.unwrap(), 0);
+    let before = server.resources();
+    server.turn(Duration::from_millis(20)).await.unwrap();
     assert_eq!(server.resources().streams, 0);
+    assert_eq!(
+        server.resources().reserved_receive_bytes,
+        before.reserved_receive_bytes
+    );
+    assert_eq!(server.resources().receive_unconsumed_bytes, 0);
     client
         .inject_subject(format!("{namespace}.0.g2.1.old"), packet.clone())
         .await

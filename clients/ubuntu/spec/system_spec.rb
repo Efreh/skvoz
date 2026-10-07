@@ -160,7 +160,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
     end
     [bulk, healthy].each { |app| wait_until { app.info['connections'].zero? } }
     limits = JSON.parse(@server.state.join('network-profile.json').read).fetch('network').fetch('limits')
-    expect(limits.fetch('receive_window')).to eq(65_536)
+    expect(limits.fetch('receive_window')).to eq(33_554_432)
     expect(limits.fetch('max_frame')).to eq(16_384)
   ensure
     transfers&.kill if transfers&.alive?
@@ -307,7 +307,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
       listener.close
     end
     fake = @directory.join('delayed-core')
-    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-network-runtime 0.3.0 network=3 api=1 core=3.1.0'; else exec sleep 60; fi\n")
+    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-network-runtime 0.4.0 network=4 api=1 core=4.0.0'; else exec sleep 60; fi\n")
     fake.chmod(0o700)
     parent = UbuntuSystem::Application.new(@directory.join('crash'), @server, runtime: fake.to_s, wait_ready: false)
     @applications << parent

@@ -33,7 +33,7 @@ RSpec.describe 'Server network and durable identity contract' do
       'dns_servers' => ['1.1.1.1', '2606:4700:4700::1111'] }
     policy = Skvoz::Server::NetworkConfiguration.new(Skvoz::Server::Configuration.new(value.merge('network' => network)))
     expect(policy.network).to include('families' => [4, 6])
-    expect(policy.network.fetch('limits')).to include('core_streams' => 2048, 'runtime_buffer_bytes' => 536870912, 'receive_window' => 65536)
+    expect(policy.network.fetch('limits')).to include('core_streams' => 2048, 'runtime_buffer_bytes' => 536870912, 'receive_window' => 33554432)
     expect { Skvoz::Server::Configuration.new(value.merge('network' => network.merge('ipv6' => network['ipv6'].merge('egress' => 'nat66')))) }.to raise_error(Skvoz::Server::Error)
     expect { Skvoz::Server::Configuration.new(value.merge('network' => network.merge('dns_servers' => ['::ffff:1.1.1.1']))) }.to raise_error(Skvoz::Server::Error)
   end
@@ -99,7 +99,7 @@ RSpec.describe 'Server network and durable identity contract' do
       expect(profile.fetch('core')).to include('peer_id' => '0', 'membership' => 'broker_authorized', 'ca_file' => nil, 'tls_server_name' => 'example.org')
       expect(state.nats_config).to include('skvoz.enroll.v2.')
       expect(state.export('new', next_id, 'long enough password')).to include('v' => 2,
-        'network_runtime' => { 'network' => 3, 'api' => 1, 'version' => '0.3.0', 'core' => '3.1.0' })
+        'network_runtime' => { 'network' => 4, 'api' => 1, 'version' => '0.4.0', 'core' => '4.0.0' })
       state.close
       reopened = Skvoz::Server::State.new(config)
       expect(reopened.value['next_id']).to eq(5)

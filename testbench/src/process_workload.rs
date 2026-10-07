@@ -313,7 +313,8 @@ pub async fn worker(args: &[String]) -> Result<(), BenchError> {
         return Err(std::io::Error::other("client incomplete echo").into());
     }
     let status = node.status();
-    let json = serde_json::json!({"id":id,"elapsed_ms":start.elapsed().as_millis(),"payload_bytes_per_direction":if id==0{0}else{active*bytes},"remaining_streams":status.resources.streams,"reserved_receive_bytes":status.resources.reserved_receive_bytes,"peak_streams":peak_streams,"peak_host_echo_bytes":peak_host_buffers,"completion_us":completion,"completed_streams":completed,"shard_failures":status.counters.shard_failures,"peer_timeouts":status.counters.peer_timeouts,"build_profile":if cfg!(debug_assertions){"debug"}else{"release"},"subscription_capacity":required});
+    let resources = node.resources();
+    let json = serde_json::json!({"id":id,"elapsed_ms":start.elapsed().as_millis(),"payload_bytes_per_direction":if id==0{0}else{active*bytes},"remaining_streams":status.resources.streams,"reserved_receive_bytes":status.resources.reserved_receive_bytes,"receive_budget":node.limits().receive_budget,"pending_send_bytes":status.resources.pending_send_bytes,"buffered_receive_bytes":resources.buffered_receive_bytes,"receive_unconsumed_bytes":resources.receive_unconsumed_bytes,"receive_capacity_bytes":resources.receive_capacity_bytes,"peak_streams":peak_streams,"peak_host_echo_bytes":peak_host_buffers,"completion_us":completion,"completed_streams":completed,"shard_failures":status.counters.shard_failures,"peer_timeouts":status.counters.peer_timeouts,"build_profile":if cfg!(debug_assertions){"debug"}else{"release"},"subscription_capacity":required});
     std::fs::write(
         directory.join(format!("result.{id}.json")),
         json.to_string(),

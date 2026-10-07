@@ -1,4 +1,4 @@
-//! Experimental v1 NATS-message encoding. All integers use network byte order.
+//! Experimental v2 NATS-message encoding. All integers use network byte order.
 
 use std::fmt;
 
@@ -40,7 +40,7 @@ pub fn encode(stream_id: u64, frame: &Frame) -> Result<Vec<u8>, WireError> {
 
 // Validate all fields before a caller-visible buffer can be appended to.
 pub(crate) fn encoded_size(stream_id: u64, frame: &Frame) -> Result<usize, WireError> {
-    if stream_id == 0 {
+    if (stream_id == 0) != frame.is_peer_control() {
         return Err(WireError::InvalidValue);
     }
     let body = match frame {
@@ -64,7 +64,26 @@ pub(crate) fn encoded_size(stream_id: u64, frame: &Frame) -> Result<usize, WireE
             }
             blob_size(bytes, MAX_FRAME_BYTES as usize)? + 8
         }
-        Frame::WindowUpdate { .. } | Frame::Fin { .. } => 8,
+        Frame::WindowUpdate { .. } | Frame::Fin { .. } | Frame::PeerFreeze { .. } => 8,
+        Frame::WindowGrant { .. } | Frame::PeerFrozen { .. } => 24,
+        Frame::PeerGrant { .. } => 48,
+        Frame::PeerRequest {
+            bytes,
+            records,
+            requester_stream_id,
+            blocked,
+            ..
+        } => {
+            if *bytes == 0
+                || *bytes > MAX_RECEIVE_WINDOW
+                || *records == 0
+                || *requester_stream_id < 2
+                || *blocked > 3
+            {
+                return Err(WireError::InvalidValue);
+            }
+            25
+        }
         Frame::Close { reason } => {
             if !reason.is_abort() {
                 return Err(WireError::InvalidValue);
@@ -98,9 +117,14 @@ pub(crate) fn encode_into(
         Frame::WindowUpdate { .. } => 5,
         Frame::Fin { .. } => 6,
         Frame::Close { .. } => 7,
+        Frame::WindowGrant { .. } => 8,
+        Frame::PeerGrant { .. } => 9,
+        Frame::PeerRequest { .. } => 10,
+        Frame::PeerFreeze { .. } => 11,
+        Frame::PeerFrozen { .. } => 12,
     };
     result.extend_from_slice(b"SKVZ");
-    result.extend_from_slice(&[1, kind, 0, 0]);
+    result.extend_from_slice(&[2, kind, 0, 0]);
     result.extend_from_slice(&stream_id.to_be_bytes());
     match frame {
         Frame::Open {
@@ -123,6 +147,57 @@ pub(crate) fn encode_into(
             put_bytes(result, bytes);
         }
         Frame::WindowUpdate { consumed } => result.extend_from_slice(&consumed.to_be_bytes()),
+        Frame::WindowGrant {
+            consumed,
+            limit,
+            probe,
+        } => {
+            for value in [consumed, limit, probe] {
+                result.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        Frame::PeerGrant {
+            epoch,
+            consumed_bytes,
+            limit_bytes,
+            consumed_records,
+            limit_records,
+            probe,
+        } => {
+            for value in [
+                epoch,
+                consumed_bytes,
+                limit_bytes,
+                consumed_records,
+                limit_records,
+                probe,
+            ] {
+                result.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        Frame::PeerRequest {
+            bytes,
+            records,
+            probe,
+            requester_stream_id,
+            blocked,
+        } => {
+            result.extend_from_slice(&bytes.to_be_bytes());
+            result.extend_from_slice(&records.to_be_bytes());
+            result.extend_from_slice(&probe.to_be_bytes());
+            result.extend_from_slice(&requester_stream_id.to_be_bytes());
+            result.push(*blocked);
+        }
+        Frame::PeerFreeze { epoch } => result.extend_from_slice(&epoch.to_be_bytes()),
+        Frame::PeerFrozen {
+            epoch,
+            bytes,
+            records,
+        } => {
+            for value in [epoch, bytes, records] {
+                result.extend_from_slice(&value.to_be_bytes());
+            }
+        }
         Frame::Fin { final_offset } => result.extend_from_slice(&final_offset.to_be_bytes()),
         Frame::Close { reason } => result.push(match reason {
             CloseReason::Cancelled => 1,
@@ -143,7 +218,7 @@ pub fn decode(bytes: &[u8]) -> Result<Packet, WireError> {
     if reader.take(4)? != b"SKVZ" {
         return Err(WireError::InvalidHeader);
     }
-    if reader.take(1)?[0] != 1 {
+    if reader.take(1)?[0] != 2 {
         return Err(WireError::UnsupportedVersion);
     }
     let kind = reader.take(1)?[0];
@@ -151,9 +226,6 @@ pub fn decode(bytes: &[u8]) -> Result<Packet, WireError> {
         return Err(WireError::InvalidHeader);
     }
     let stream_id = reader.u64()?;
-    if stream_id == 0 {
-        return Err(WireError::InvalidValue);
-    }
     let frame = match kind {
         1 | 2 => {
             let receive_window = reader.u32()?;
@@ -200,11 +272,40 @@ pub fn decode(bytes: &[u8]) -> Result<Packet, WireError> {
                 _ => return Err(WireError::InvalidValue),
             },
         },
+        8 => Frame::WindowGrant {
+            consumed: reader.u64()?,
+            limit: reader.u64()?,
+            probe: reader.u64()?,
+        },
+        9 => Frame::PeerGrant {
+            epoch: reader.u64()?,
+            consumed_bytes: reader.u64()?,
+            limit_bytes: reader.u64()?,
+            consumed_records: reader.u64()?,
+            limit_records: reader.u64()?,
+            probe: reader.u64()?,
+        },
+        10 => Frame::PeerRequest {
+            bytes: reader.u32()?,
+            records: reader.u32()?,
+            probe: reader.u64()?,
+            requester_stream_id: reader.u64()?,
+            blocked: reader.take(1)?[0],
+        },
+        11 => Frame::PeerFreeze {
+            epoch: reader.u64()?,
+        },
+        12 => Frame::PeerFrozen {
+            epoch: reader.u64()?,
+            bytes: reader.u64()?,
+            records: reader.u64()?,
+        },
         _ => return Err(WireError::UnknownKind),
     };
     if reader.cursor != bytes.len() {
         return Err(WireError::InvalidLength);
     }
+    encoded_size(stream_id, &frame)?;
     Ok(Packet { stream_id, frame })
 }
 

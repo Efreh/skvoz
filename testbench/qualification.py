@@ -170,7 +170,7 @@ def qualify(root, directory, env, args):
             while server.poll() is None:
                 sample()
             server_result = json.loads((directory / "result.0.json").read_text())
-            if any(result["remaining_streams"] or result["reserved_receive_bytes"] or result["shard_failures"] for result in [server_result, *results]):
+            if any(result["remaining_streams"] or result["pending_send_bytes"] or result["buffered_receive_bytes"] or result["receive_unconsumed_bytes"] or result["receive_capacity_bytes"] or result["reserved_receive_bytes"] > result["receive_budget"] or result["shard_failures"] for result in [server_result, *results]):
                 raise RuntimeError("qualification cleanup/failure counters violated")
             latency = sorted(value for result in results for value in result["completion_us"])
             percentile = lambda q: latency[(len(latency)-1)*q//100] if latency else None
@@ -192,7 +192,7 @@ def qualify(root, directory, env, args):
                 "cpu_clock_ticks_per_second": os.sysconf("SC_CLK_TCK"),
                 "broker_only_limits": {"cpu": 1, "memory_mib": 128}, "broker_observed_peak": broker_peak,
                 "completion_us": {"p50": percentile(50), "p95": percentile(95), "p99": percentile(99)},
-                "remaining_streams": 0, "reserved_receive_bytes": 0,
+                "remaining_streams": 0, "server_retained_peer_credit_bytes": server_result["reserved_receive_bytes"],
                 "sample_interval_ms": 25, "measurement_scope": "process samples, not total host usage or Core-only RSS; sum of peaks is not simultaneous RSS", "server_result": server_result}
             print("QUALIFY " + json.dumps(report, sort_keys=True), flush=True)
             (directory / "qualification.json").write_text(json.dumps(report, indent=2))

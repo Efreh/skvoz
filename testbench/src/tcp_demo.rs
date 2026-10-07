@@ -106,6 +106,10 @@ pub async fn failure(write_error: bool) -> Result<(), BenchError> {
     };
     let (mut server, mut clients) = mesh::nodes(case, options).await?;
     let mut client = clients.pop().unwrap();
+    let initial_receive_backing = [
+        client.resources().reserved_receive_bytes,
+        server.resources().reserved_receive_bytes,
+    ];
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let _requester = TcpStream::connect(listener.local_addr()?).await?;
     let (mut socket, _) = listener.accept().await?;
@@ -178,14 +182,17 @@ pub async fn failure(write_error: bool) -> Result<(), BenchError> {
         );
         assert!(started.elapsed() < Duration::from_secs(1));
     }
-    for node in [&client, &server] {
+    for (node, initial) in [&client, &server].into_iter().zip(initial_receive_backing) {
         let resources = node.resources();
         assert_eq!(resources.streams, 0);
-        assert_eq!(resources.reserved_receive_bytes, 0);
+        assert_eq!(resources.reserved_receive_bytes, initial);
+        assert_eq!(resources.buffered_receive_bytes, 0);
+        assert_eq!(resources.receive_unconsumed_bytes, 0);
+        assert_eq!(resources.receive_capacity_bytes, 0);
         assert_eq!(resources.pending_send_bytes, 0);
     }
     println!(
-        "PASS real TCP failure: case={case}, original error preserved, remote CANCEL received, actual live resources=0"
+        "PASS real TCP failure: case={case}, original error preserved, remote CANCEL received, stream payload resources released, idle peer credit retained"
     );
     client.shutdown().await?;
     server.shutdown().await?;

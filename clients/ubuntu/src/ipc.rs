@@ -216,7 +216,7 @@ impl Session {
         if r.fd_count != u8::from(op == "PREPARE_CLIENT") {
             return Err(Error("helper_failed"));
         }
-        if op == "HELLO" && r.result != Some(json!({"api":1,"network":3,"role":"client"})) {
+        if op == "HELLO" && r.result != Some(json!({"api":1,"network":4,"role":"client"})) {
             return Err(Error("version_mismatch"));
         }
         if matches!(op, "ACTIVATE_CLIENT" | "ABORT_CLIENT" | "RESTORE_CLIENT")
@@ -299,7 +299,7 @@ mod tests {
             assert_eq!(request["op"], "HELLO");
             channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":3,"event":"RUNTIME_STATE","data":{"state":"ready","error":null},"fd_count":0})).unwrap(),None).unwrap();
             channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":5,"event":"STATS","data":{"counters":skvoz_network::local_api::Counters::default()},"fd_count":0})).unwrap(),None).unwrap();
-            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"id":request["id"],"result":{"api":1,"network":3},"error":null,"fd_count":0})).unwrap(),None).unwrap();
+            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"id":request["id"],"result":{"api":1,"network":4},"error":null,"fd_count":0})).unwrap(),None).unwrap();
             channel
                 .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
                 .unwrap();
@@ -316,7 +316,7 @@ mod tests {
         let mut session = Session::new(local.into(), false).unwrap();
         assert_eq!(
             session
-                .call("HELLO", json!({"api":1,"network":3}))
+                .call("HELLO", json!({"api":1,"network":4}))
                 .await
                 .unwrap()["api"],
             1
@@ -344,7 +344,7 @@ mod tests {
         let session = Session::new(local.into(), false).unwrap();
         assert!(
             session
-                .call("HELLO", json!({"api":1,"network":3}))
+                .call("HELLO", json!({"api":1,"network":4}))
                 .await
                 .is_err()
         );
@@ -374,7 +374,7 @@ mod tests {
         let session = Session::new(local.into(), false).unwrap();
         assert!(
             session
-                .call("HELLO", json!({"api":1,"network":3}))
+                .call("HELLO", json!({"api":1,"network":4}))
                 .await
                 .is_err()
         );
@@ -406,7 +406,7 @@ mod tests {
         let session = Session::new(local.into(), false).unwrap();
         assert!(
             session
-                .call("HELLO", json!({"api":1,"network":3}))
+                .call("HELLO", json!({"api":1,"network":4}))
                 .await
                 .is_err()
         );

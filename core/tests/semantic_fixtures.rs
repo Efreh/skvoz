@@ -39,6 +39,7 @@ fn frame_text(frame: &Frame) -> String {
         Frame::WindowUpdate { consumed } => format!("window({consumed})"),
         Frame::Fin { final_offset } => format!("fin({final_offset})"),
         Frame::Close { reason } => format!("close({reason:?})"),
+        other => format!("{other:?}"),
     }
 }
 

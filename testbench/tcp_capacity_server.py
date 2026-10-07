@@ -21,6 +21,11 @@ def run(args):
     stop = threading.Event()
     target = subprocess.Popen(['python3',str(Path(__file__).with_name('tcp_capacity.py')),'--target'])
     failures = []
+    operation = {}
+    def short(peer, phase):
+        operation.clear()
+        operation.update(peer=peer, operation='short_http', phase=phase, received_bytes=0)
+        short_http(owners[peer], endpoints[peer], operation)
     def save(phase):
         runtimes = [resource(owner) for owner in owners]
         assert all(value['rss_peak_kib'] <= 128*1024 for value in runtimes), 'client runtime RSS limit'
@@ -32,7 +37,7 @@ def run(args):
         until = time.monotonic()+15
         while time.monotonic() < until:
             for peer,owner in enumerate(owners):
-                short_http(owner,endpoints[peer])
+                short(peer, 'stable')
             assert all(owner.status()['lifecycle'] == 'ready' for owner in owners)
             time.sleep(.2)
         deadline = time.monotonic()+30
@@ -75,12 +80,13 @@ def run(args):
         stalled_since = time.monotonic()
         stalled_attempts = 1
         def transfer(sock,index):
+            progress = {'worker':index, 'peer':index//2, 'operation':'active_exchange'}
             try:
                 while not stop.is_set():
-                    exchange(sock,index)
+                    exchange(sock,index,progress)
                     time.sleep(.05)
             except Exception as error:
-                failures.append(repr(error))
+                failures.append({**progress, 'error':repr(error)})
         workers = [threading.Thread(target=transfer,args=(sock,i)) for i,sock in enumerate(active)]
         for worker in workers:
             worker.start()
@@ -97,10 +103,12 @@ def run(args):
                 stalled_attempts += 1
                 report['stalled_attempts'] = stalled_attempts
             for peer,owner in enumerate(owners):
-                short_http(owner,endpoints[peer])
+                short(peer, 'active-stalled')
                 for kind in ('connect','socks','http','api'):
+                    operation.clear()
+                    operation.update(peer=peer, operation='exchange', kind=kind, phase='active-stalled', received_bytes=0)
                     with connect(owner,kind,endpoints[peer]) as sock:
-                        exchange(sock,iteration)
+                        exchange(sock,iteration,operation)
                         sock.shutdown(socket.SHUT_WR)
                         assert sock.recv(1) == b''
             assert not failures,failures
@@ -127,8 +135,10 @@ def run(args):
         save('after-hold')
         for cycle in range(args.cycles):
             peer = cycle%len(owners)
+            operation.clear()
+            operation.update(peer=peer, operation='exchange', phase='churn', cycle=cycle, received_bytes=0)
             with connect(owners[peer],('connect','socks','http','api')[cycle%4],endpoints[peer]) as sock:
-                exchange(sock,cycle)
+                exchange(sock,cycle,operation)
                 sock.shutdown(socket.SHUT_WR)
                 assert sock.recv(1) == b''
             if cycle%1000 == 0:
@@ -148,7 +158,13 @@ def run(args):
         save('after')
         report.update(status='passed',idle=1024,active=32,stalled=1,cycles=args.cycles)
     except Exception as error:
-        report.update(status='failed',error=repr(error))
+        statuses = []
+        for peer, owner in enumerate(owners):
+            try:
+                statuses.append({'peer':peer, 'status':owner.call('STATUS',timeout=5)[0], 'events':owner.events, 'exit_code':owner.process.poll()})
+            except Exception as status_error:
+                statuses.append({'peer':peer, 'error':repr(status_error), 'events':owner.events, 'exit_code':owner.process.poll()})
+        report.update(status='failed',error=repr(error), operation=dict(operation), failures=list(failures), owner_status=statuses)
         raise
     finally:
         stop.set()
@@ -156,6 +172,13 @@ def run(args):
             sock.close()
         for worker in workers:
             worker.join(timeout=25)
+        report['final_transfer_failures'] = list(failures)
+        for peer, owner in enumerate(owners):
+            owner.log.flush()
+            path = directory/f'runtime-{peer}.log'
+            with path.open('rb') as source:
+                source.seek(max(0,path.stat().st_size-262144))
+                (shared/f'consumer-runtime-{peer}.log').write_bytes(source.read(262144))
         temporary = shared/'consumer-report.tmp'
         temporary.write_text(json.dumps(report,indent=2))
         temporary.replace(shared/'consumer-report.json')

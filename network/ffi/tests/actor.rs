@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 const CONFIG: &[u8] = include_bytes!("../../tests/fixtures/client-startup.json");
 const HELLO: &[u8] =
-    b"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":3},\"fd_count\":0}";
+    b"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}";
 
 struct Owner(u64);
 impl Owner {

@@ -14,8 +14,6 @@ dependencies = [
 [[package]]
 name = "async-nats"
 version = "0.50.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d83a251fa1a4c9d0fe6e816b7acd60549e473e08d14f27a1d992c2675abff05f"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1152,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-core"
-version = "3.1.0"
+version = "4.0.0"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -1163,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-daemon"
-version = "1.4.0"
+version = "2.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "serde_json",
@@ -1173,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-network"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -1185,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-network-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "skvoz-network",
  "skvoz-network-native",
@@ -1193,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-network-helper"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -1234,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-ubuntu-client"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "async-nats",
  "futures-util",

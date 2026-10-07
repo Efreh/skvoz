@@ -1,5 +1,6 @@
 //! Real-broker scenarios are executed by testbench/run.py with real-nats enabled.
 
+use futures_util::StreamExt;
 use skvoz_core::{CloseReason, Event, Frame, SendOutcome, State, wire};
 use skvoz_testbench::{BenchConfig, ConnectionConfig, FailureKind, Node, Role, scenarios};
 use std::{
@@ -56,21 +57,46 @@ async fn slow_consumer_poll_does_not_return_credit() {
     );
     assert_eq!(
         user.send(id, b"5678").await.unwrap(),
-        SendOutcome::Accepted(4)
+        SendOutcome::Accepted(3)
     );
     consumer.turn(Duration::from_secs(1)).await.unwrap();
     consumer.turn(Duration::from_secs(1)).await.unwrap();
     let held = consumer.poll_events();
     assert_eq!(held.len(), 2);
-    assert_eq!(consumer.snapshot(id).unwrap().receive_unconsumed_bytes, 8);
+    let exact = held
+        .iter()
+        .flat_map(|event| match &event.event {
+            Event::Data { bytes, .. } => bytes.to_vec(),
+            _ => panic!("Expected held DATA"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exact, b"1234567");
+    assert_eq!(consumer.snapshot(id).unwrap().receive_unconsumed_bytes, 7);
     assert_eq!(user.send(id, b"x").await.unwrap(), SendOutcome::WouldBlock);
     // A real flush/turn with no WINDOW_UPDATE still cannot unblock the sender.
     user.turn(Duration::from_millis(20)).await.unwrap();
     assert_eq!(user.send(id, b"x").await.unwrap(), SendOutcome::WouldBlock);
     drop(held);
     consumer.consume_through(id, 4).await.unwrap();
-    user.turn(Duration::from_secs(1)).await.unwrap();
-    assert_eq!(user.poll_events()[0].event, Event::Writable);
+    let started = Instant::now();
+    let mut observed = Vec::new();
+    let events = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Actual-consumption Writable timed out"
+        );
+        consumer.turn(Duration::ZERO).await.unwrap();
+        user.turn(Duration::from_millis(10)).await.unwrap();
+        observed.extend(user.poll_events());
+        if !observed.is_empty() && user.snapshot(id).unwrap().send_unacknowledged_bytes == 3 {
+            break observed;
+        }
+    };
+    assert!(
+        events
+            .iter()
+            .all(|event| event.stream_id == id && event.event == Event::Writable)
+    );
     assert_eq!(
         user.send(id, b"abcdx").await.unwrap(),
         SendOutcome::Accepted(4)
@@ -78,6 +104,12 @@ async fn slow_consumer_poll_does_not_return_credit() {
     assert_eq!(user.send(id, b"x").await.unwrap(), SendOutcome::WouldBlock);
     user.close(id).await.unwrap();
     drive_until_closed(&mut consumer, id).await;
+    for node in [&mut user, &mut consumer] {
+        let snapshot = node.snapshot(id).unwrap();
+        assert_eq!(snapshot.receive_unconsumed_bytes, 0);
+        assert_eq!(snapshot.pending_send_bytes, 0);
+        assert_eq!(snapshot.buffered_receive_bytes, 0);
+    }
     user.shutdown().await.unwrap();
     consumer.shutdown().await.unwrap();
 }
@@ -146,14 +178,28 @@ async fn reject_and_cancel_have_real_peer_observations() {
     let (mut user, mut consumer) = scenarios::pair("rejectcancel", small()).await.unwrap();
     let rejected = user.open(b"request").await.unwrap();
     let started = Instant::now();
-    let progress = consumer.turn(Duration::from_secs(1)).await.unwrap();
-    let events = consumer.poll_events();
+    let mut progress = 0;
+    let events = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Reject IncomingOpen observation timed out"
+        );
+        user.turn(Duration::ZERO).await.unwrap();
+        progress += consumer.turn(Duration::from_millis(10)).await.unwrap();
+        let events = consumer.poll_events();
+        if !events.is_empty() {
+            break events;
+        }
+    };
+    assert!(
+        matches!(events.as_slice(), [event] if event.stream_id == rejected && matches!(&event.event, Event::IncomingOpen { metadata } if &**metadata == b"request"))
+    );
     let elapsed = started.elapsed();
     let before_reject = consumer.snapshot(rejected);
     consumer.reject(rejected, b"denied").await.unwrap_or_else(|error| panic!(
         "Reject observation: error={error} elapsed={elapsed:?} progress={progress} events={events:?} user_failure={:?} consumer_failure={:?} user_snapshot={:?} consumer_snapshot_before={before_reject:?} consumer_snapshot_after={:?}",
         user.failure_kind(),consumer.failure_kind(),user.snapshot(rejected),consumer.snapshot(rejected)));
-    user.turn(Duration::from_secs(1)).await.unwrap();
+    drive_until_closed(&mut user, rejected).await;
     let events = user.poll_events();
     assert_eq!(
         events[0].event,
@@ -341,6 +387,21 @@ async fn out_of_order_data_and_bad_version_travel_through_real_broker() {
     let id = scenarios::establish(&mut user, &mut consumer)
         .await
         .unwrap();
+    assert_eq!(user.snapshot(id).unwrap().send_unacknowledged_bytes, 0);
+    let config = ConnectionConfig::from_env(Role::User).unwrap();
+    let observer =
+        async_nats::ConnectOptions::with_user_and_password("user".into(), config.password)
+            .require_tls(true)
+            .add_root_certificates(config.ca)
+            .subscription_capacity(8)
+            .connect(config.url)
+            .await
+            .unwrap();
+    let mut observed = observer
+        .subscribe(format!("skvoz.bench.{}.invalid.0.s.1.s", config.run_token))
+        .await
+        .unwrap();
+    observer.flush().await.unwrap();
     user.inject_packet(
         wire::encode(
             id,
@@ -355,8 +416,36 @@ async fn out_of_order_data_and_bad_version_travel_through_real_broker() {
     .unwrap();
     assert!(consumer.turn(Duration::from_secs(1)).await.is_err());
     assert_clean_terminal(&mut consumer, id, CloseReason::ProtocolError);
+    let grant = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let message = observed.next().await.unwrap();
+            if let Frame::PeerGrant {
+                consumed_bytes,
+                consumed_records,
+                ..
+            } = wire::decode(&message.payload).unwrap().frame
+            {
+                break (consumed_bytes, consumed_records);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(grant, (1, 1));
+    let error = user.turn(Duration::from_secs(1)).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<skvoz_core::ManagerError>(),
+        Some(&skvoz_core::ManagerError::Stream(
+            skvoz_core::Error::Protocol(skvoz_core::ProtocolError::InvalidCredit)
+        ))
+    );
     drive_until_closed(&mut user, id).await;
     assert_clean_terminal(&mut user, id, CloseReason::ProtocolError);
+    observed.unsubscribe().await.unwrap();
+    observer.drain().await.unwrap();
+    user.shutdown().await.unwrap();
+    consumer.shutdown().await.unwrap();
+    let (mut user, mut consumer) = scenarios::pair("invalid_version", small()).await.unwrap();
     let next = scenarios::establish(&mut user, &mut consumer)
         .await
         .unwrap();

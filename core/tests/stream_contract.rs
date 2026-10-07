@@ -142,7 +142,7 @@ fn peer_receive_limits_control_partial_send() {
 }
 
 #[test]
-fn binary_data_survives_aggregation_and_batching() {
+fn binary_data_chunks_survive_bounded_ownership_transfer() {
     let (mut a, mut b) = pair(small(), small());
     for bytes in [[0, 0xff], [0x80, b'\n']] {
         assert_eq!(a.send(&bytes), Ok(SendOutcome::Accepted(2)));
@@ -153,9 +153,18 @@ fn binary_data_survives_aggregation_and_batching() {
         b.poll_events(1),
         [Event::Data {
             offset: 0,
-            bytes: Box::new([0, 0xff, 0x80, b'\n']),
+            bytes: Box::new([0, 0xff]),
         }]
     );
+    assert_eq!(
+        b.poll_events(1),
+        [Event::Data {
+            offset: 2,
+            bytes: Box::new([0x80, b'\n'])
+        }]
+    );
+    assert_eq!(b.snapshot().buffered_receive_bytes, 0);
+    assert_eq!(b.snapshot().receive_capacity_bytes, 0);
     assert_eq!(b.snapshot().receive_unconsumed_bytes, 4);
 }
 
@@ -284,14 +293,15 @@ fn output_frame_limit_blocks_tiny_sends_and_wakes_after_drain() {
 }
 
 #[test]
-fn tiny_received_frames_aggregate_within_the_byte_window() {
+fn tiny_received_frames_obey_the_implicit_record_allowance() {
     let config = Config {
         receive_window: 1024,
         max_frame: 32,
         ..small()
     };
     let (_, mut b) = pair(config, config);
-    for offset in 0..1024 {
+    let records = 1024 / 32 + 64;
+    for offset in 0..records {
         b.receive(&data(offset, &[offset as u8]), 0).unwrap();
         let snapshot = b.snapshot();
         assert_eq!(snapshot.buffered_receive_bytes, offset as usize + 1);
@@ -300,9 +310,9 @@ fn tiny_received_frames_aggregate_within_the_byte_window() {
         assert!(snapshot.receive_capacity_bytes >= snapshot.buffered_receive_bytes);
     }
     assert_eq!(b.poll_events(4).len(), 4);
-    assert_eq!(b.snapshot().receive_unconsumed_bytes, 1024);
+    assert_eq!(b.snapshot().receive_unconsumed_bytes, records);
     assert_eq!(
-        b.receive(&data(1024, b"x"), 0),
+        b.receive(&data(records, b"x"), 0),
         Err(Error::Protocol(ProtocolError::ReceiveWindowExceeded))
     );
 }

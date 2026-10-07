@@ -5,6 +5,7 @@ on:
     tags: ['v*']
     paths:
       - 'core/**'
+      - 'vendor/async-nats/**'
       - 'daemon/**'
       - 'network/**'
       - 'connectors/server/**'
@@ -19,6 +20,7 @@ on:
   pull_request:
     paths:
       - 'core/**'
+      - 'vendor/async-nats/**'
       - 'daemon/**'
       - 'network/**'
       - 'connectors/server/**'

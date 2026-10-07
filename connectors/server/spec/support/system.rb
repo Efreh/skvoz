@@ -332,7 +332,7 @@ module ServerSystem
       @process = Process.spawn(RUNTIME, '--config', @profile.to_s, '--control-fd', '3', 3 => child, out: @output, err: @output)
       child.close
       @path = RuntimeClient.new(owner)
-      hello, = @path.request('HELLO', { api: 1, network: 3 })
+      hello, = @path.request('HELLO', { api: 1, network: 4 })
       raise IOError, 'Runtime HELLO rejected' if hello['error']
       ServerSystem.wait_until do
         raise IOError, "Device startup failed: #{@log.read}" if ServerSystem.process_dead(@process)

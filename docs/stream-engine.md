@@ -1,7 +1,7 @@
 # Движок байтового потока
 
 Документ описывает экспериментальный внутренний API `skvoz-core`.
-Стабильные wire/FFI/IPC интерфейсы пока не определены.
+Текущий контракт — Core 4.0.0 / wire 2; отдельные API/ABI описаны в страницах компонентов.
 
 ## Модель и операции
 
@@ -64,6 +64,7 @@ DATA-очередь пуста и все полученные байты пот�
 | REJECT | Ограниченная непрозрачная причина. |
 | DATA | offset (u64), непустые байты; offset первого DATA = 0. |
 | WINDOW_UPDATE | consumed (u64), абсолютное число потреблённых байтов от начала направления. |
+| WINDOW_GRANT | consumed, limit, probe (u64): actual ACK и отдельная абсолютная граница кредита. |
 | FIN | final_offset (u64), точное число байтов направления до EOF. |
 | CLOSE | Структурированная конечная причина. |
 
@@ -75,7 +76,7 @@ OPEN/ACCEPT валидируют положительное окно, `0 < max_f
 
 - DATA принимается только при `offset == received`; любой gap/duplicate — ProtocolError, никакой неограниченной reorder-очереди.
 - FIN принимается только при `final_offset == received`. Повтор того же FIN идемпотентен; DATA после FIN недопустим.
-- Кредит отправителя = объявленное peer окно минус (принятые к отправке − подтверждённые peer потреблённые). Резервирование происходит при send, не при poll_frames.
+- Кредит отправителя = абсолютная объявленная граница минус принятые к отправке байты. WINDOW_UPDATE сдвигает границу на фактически потреблённый префикс, WINDOW_GRANT отдельно увеличивает окно. Резервирование происходит при send, не при poll_frames.
 - WINDOW_UPDATE не может подтверждать больше байтов, чем уже выдано транспорту. Монотонный максимум подтверждения защищает от двойного/устаревшего кредитования.
 - Получатель принимает не более `receive_window` непотреблённых байтов, включая уже выданные коннектору. `poll_events` не равен потреблению.
 - `consume_through` не может превышать границу выданных Data. Коннектор обязан реально освободить соответствующие буферы; его копии и собственные очереди не являются памятью движка.
@@ -86,23 +87,38 @@ OPEN/ACCEPT валидируют положительное окно, `0 < max_f
 
 | Параметр | Значение по умолчанию | Допустимый диапазон |
 | --- | --- | --- |
-| receive_window | 65 536 байт | 1…16 777 216 байт |
+| receive_window | 65 536 байт | 1…33 554 432 байт |
 | max_frame | 16 384 байт | 1…65 536 байт, не больше окна |
 | max_pending_frames | 64 DATA | 1…1 024 DATA |
 | max_metadata | 4 096 байт | 0…65 536 байт |
 | open_timeout_ms | 5 000 мс | положительный u64; сложение deadline проверяется |
 
-При дефолтах внутренние полезные данные ≤ 65 536 + 64 × 16 384 + 3 × 4 096 = 1 126 400 байт на движок, плюс ограниченные структуры/allocator overhead. Три metadata-области — handshake frame и максимум два lifecycle event (IncomingOpen и Opened). Receive buffer начинается с нулевого capacity и растёт геометрически по фактически
-пришедшим байтам, с reported capacity не больше receive_window. Реализация может
-удерживать выделенный capacity после нормального drain; при закрытии освобождает byte queues. Эти числа **не являются пределом RSS процесса**, не включают кадры/события, уже переданные вызывающему, и не определяют глобальный бюджет множества потоков.
+Payload входящих и исходящих DATA хранится в отдельных chunks точной длины.
+Пустой поток не выделяет receive payload; частично опустошенный chunk не
+удерживает историческую ёмкость большого массива. `poll_events` передаёт
+владение chunk без дополнительной копии. Буферы, уже переданные host, остаются
+его ответственностью, включая буферы отменённого потока.
 
-Метод проверки: snapshots occupancy/counters после каждого шага и тесты на наполненной очереди, все байты окна, множество однобайтовых DATA и Data, удерживаемые коннектором. Payload копируется только после проверки размера/кредита. Outgoing DATA имеет также предел количества, чтобы мелкие send не создавали неограниченные заголовки. Входящие DATA агрегируются в одном bounded byte buffer, а поллинг выдаёт chunks не больше max_frame.
+Record allowance направления — `min(receive_window / max_frame + 64, 65536)`.
+Он ограничивает даже однобайтовые DATA. Конечные offsets отправленных DATA
+сохраняются до actual ACK, полученных — до actual consumption, включая chunks,
+переданные host. Отдельный предел `max_pending_frames` ограничивает непереданные
+DATA. Один `send` принимает не более одного max_frame, поэтому host повторяет
+вызов для оставшегося суффикса. Увеличение окна увеличивает allowance только
+в пределах конечного backing; byte credit не позволяет обходить record credit.
+
+При дефолтах полезные данные Stream ограничены receive_window плюс
+`max_pending_frames × max_frame` и тремя metadata-областями; дополнительно
+конечны chunk/end nodes и служебные события. Это предел внутренних ресурсов,
+не RSS и не бюджет allocations, уже переданных вызывающему. Проверки включают
+однобайтовые DATA, удержанные host chunks, byte/record exhaustion, u64 boundary
+и actual ACK после извлечения frames/events.
 
 Управляющее состояние конечно: один OPEN/ACCEPT, один накопительный WINDOW_UPDATE, один FIN, один аварийный terminal frame, flags lifecycle/Writable/RemoteFinished и один Closed. FIN выдаётся после всех ранее принятых DATA. CLOSE/REJECT заменяет непереданные DATA при аварийном прекращении.
 
 ## Закрытие, события и ошибки
 
-FIN закрывает только отправляющее направление, противоположное может продолжать работу. RemoteFinished выдаётся после всех предыдущих Data в направлении, даже если они ещё не потреблены. Когда оба EOF известны, локальный FIN выдан транспорту и все входящие байты потреблены, движок переходит в Closed(Finished). Его событийный порядок — lifecycle, Writable, Data, RemoteFinished, Closed; соседние DATA могут агрегироваться.
+FIN закрывает только отправляющее направление, противоположное может продолжать работу. RemoteFinished выдаётся после всех предыдущих Data в направлении, даже если они ещё не потреблены. Когда оба EOF известны, локальный FIN выдан транспорту и все входящие байты потреблены, движок переходит в Closed(Finished). Его событийный порядок — lifecycle, Writable, Data, RemoteFinished, Closed; DATA сохраняют границы исходных chunks.
 
 Cancel, transport loss, protocol error и opening timeout отменяют непереданные/невыданные DATA и управляющие уведомления, очищают внутренние ресурсы и создают ровно один Closed. Abort может отбросить ещё не выданный IncomingOpen/Opened/RemoteFinished. Полученный REJECT создаёт Rejected и Closed(Rejected). Извлечённые ранее буферы остаются у вызывающего, но после abort consume недопустим. Late frames в Closed игнорируются, движок не переоткрывается; для новой сессии нужен новый экземпляр.
 
@@ -142,53 +158,75 @@ now_ms)`, tick и batch poll. `RoutedFrame`/`ManagedEvent` возвращают 
 | max_peers | 128 | Registered peers |
 | max_streams | 8192 | Все live и closing entries |
 | max_streams_per_peer | 128 | Entries одного peer |
-| receive_budget | 67 108 864 | Байты обещанных receive windows |
+| receive_budget | 67 108 864 | Байты обеспеченного aggregate peer credit |
 | receive_budget_per_peer | 2 097 152 | Обещанные receive bytes одного peer |
 | send_budget | 8 388 608 | Байты невыданных outgoing DATA |
 | send_budget_per_peer | 262 144 | Невыданные outgoing DATA одного peer |
 | stream | окно 8192, frame 1024, pending 8, metadata 256, timeout 5000 | Общая Config всех admitted streams |
 
-Counts/send budgets должны быть положительны; receive budgets должны вмещать
-хотя бы одно окно. Произведения slot count × window проверяются на overflow.
-Config Stream валидируется до создания Manager. Эти defaults — настройки
-экспериментального API, не capacity/throughput гарантии.
+Count admission отделён от byte credit: создание Stream проверяет peer/global
+slots и metadata, без резервирования `slot count × maximum window`.
+Config валидируется до создания Manager. Пустые streams не выделяют DATA.
+Каждому зарегистрированному peer сначала выдаются до 64 KiB и 64 records,
+обеспеченные суммарным pool, даже если DATA ещё не пришёл. В малом общем
+pool начальное byte-разрешение автоматически уменьшается до
+`max(receive_budget / max_peers / 8, 1)` с учётом stream/per-peer пределов,
+сохраняя свободный backing для реальной активной потребности.
 
-Admission проверяет независимо peer/global slots и полную статическую receive
-reservation **до создания Stream или копирования metadata**. Reservation
-сохраняется для closing entry до полной выдачи terminal events/frames; уменьшение
-payload occupancy не позволяет переобещать кредит. Receive capacity zero на idle
-не отменяет кредит, который peer уже вправе использовать. Local overload возвращает
-Admission; remote OPEN получает не более одного pending REJECT на peer без
-metadata. Остальные запросы при overload могут истечь по opening timeout.
+Manager использует два независимых ограничения DATA: per-stream permission и
+aggregate peer permission. Сумма объявленных peer-разрешений не превышает
+receive_budget, один peer ограничен receive_budget_per_peer. Record pool
+вычисляется как `receive_budget / max_frame + max_peers × 64`; minima будущих
+peers защищены отдельно. Сохранённые send-end nodes (pending и dispatched до
+actual ACK) ограничены global/per-peer record budget независимо от send bytes.
 
-`send` ограничен stream credit/frame queue и свободным peer/global send budget
-до копирования payload. Может принять часть bytes. `poll_frames` освобождает
-Manager send bytes, передавая allocation transport caller; они больше не входят
-в этот counter. После освобождения бюджета блокированные streams получают
-coalesced Writable. Wake обработка ограничена 32 waiters за poll/освобождение
-бюджета, с cursor, поэтому host должен продолжать poll при большой очереди.
+При реальной потребности окна растут автоматически: начальные пробы, RTT и
+фактический темп потребления определяют следующий запрос. Темп потока измеряется
+с первого фактического потребления в текущей пробе: ожидание первого обслуживания
+в общей очереди не считается медленной обработкой. Паузы между собственными
+потреблениями при накопленной очереди продолжают сдерживать рост окна.
+Полное освобождение полученных данных также разрешает рост: задержка обслуживания
+нескольких соединений общим host не создаёт потолок окна при низком RTT.
+Единственный активный поток использует доступный backing. Мало требующие peers не задают постоянный
+потолок окна bulk-потока; несколько unmet consuming requests получают вращаемые
+кванты свободного pool. Это прогресс и ограничение памяти, а не QoS или равные
+скоростные квоты. Уже выданный неиспользованный кредит перераспределяется только
+через упорядоченный FREEZE/FROZEN barrier из [wire](wire.md).
 
-Ready peers и streams планируются вложенным round-robin: один frame на peer за
-цикл, разные ready streams этого peer по очереди. Pending overload REJECT
-чередуется с его stream work. Poll выдаёт не больше 256 элементов. Это frame
-fairness; размер frames может различаться. Opening deadlines индексированы,
-полного сканирования idle table на send/turn нет. `resources()` — явная
-O(stream count) инспекция, не hot path driver.
+`send` резервирует bytes/records до копирования. `poll_frames` передаёт allocation
+transport caller и освобождает pending send bytes; dispatched record metadata
+сохраняется до actual ACK. Входящий DATA, даже для неизвестного/закрытого stream,
+сначала проверяется aggregate ledger. Отбросить можно пришедшие bytes; отмена
+потока не освобождает неиспользованное разрешение peer.
 
-Terminal entry удаляется после всех событий/фреймов. Closed IDs не открываются
-повторно: per-peer local/remote monotonic high-water counters дают bounded replay
-state. Unknown non-OPEN frame игнорируется. `peer_lost(peer)` запрещает новый
-work этого peer и освобождает его внутренние queues; host должен выдать terminal
-события. `remove_peer` допустим только для failed peer без entries/rejection.
-Повторная registration означает новую authenticated session; нельзя сбрасывать
-high-water для прежней сессии. `transport_lost` навсегда закрывает Manager.
+Ready peers и streams планируются вложенным round-robin, один frame на peer за
+цикл. Control имеет отдельные coalesced slots, не требует DATA-кредита;
+FROZEN не обгоняет ранее извлечённые DATA. Poll выдаёт максимум 256 элементов.
+`Manager::poll_events_with_data_budget(max, admit)` проверяет целый следующий
+DATA chunk до передачи владения. Callback учитывает суммарные admissions в
+текущем batch; отказ оставляет DATA в Core и не блокирует обход других готовых
+потоков. Число попыток ограничено `min(max, 256) + live_streams`; простаивающие
+потоки не обходятся. Обычный `poll_events` разрешает все DATA.
+Wake обработка ограничена 32 waiters. Opening deadlines индексированы;
+полного сканирования idle streams на send/turn нет. `resources()` — явная
+O(stream count) диагностика.
 
-`Resources` различает reservations, pending send, buffered receive, reported
-receive capacity и unconsumed receive (включая уже выданные Data), ready peers и
-pending rejections. Данные в событии принадлежат caller; caller обязан освободить
-полностью или соответствующий потреблённый prefix **до** consume_through.
-Abort не может отобрать ранее переданные allocations. Логические бюджеты не
-включают allocator metadata, transport/runtime buffers, соединения и broker.
+Terminal entry удаляется после выдачи всех событий/фреймов. High-water IDs
+предотвращают повтор OPEN. `peer_lost` освобождает backing прежней authenticated
+session и создаёт terminal events; host обязан их дренировать. `remove_peer`
+допустим для failed peer без entries/rejection. Новая registration требует
+новой session; old bytes не возобновляются. Переполнение счётчиков и deadline
+barrier завершают только затронутую peer.
+
+`metadata_backing()` консервативно учитывает receive/send records по 160 байт
+(члены chunk/frame и двух end-node списков с allocator/alignment), каждый
+`Entry` плюс 512 байт индексов/lifecycle и три max_metadata области, каждый
+`Peer` плюс 512 байт control/index nodes, а также
+`384 × (max_streams + max_peers)` байт для индексов unconsumed streams и
+pressure deadlines. Transport и allocations, переданные
+host, должны иметь независимые конечные бюджеты. Native network runtime
+сохраняет резерв полного DATA chunk до полной записи или drop: отмена Core
+не позволяет переиспользовать память ещё удерживаемого host буфера.
 
 ## Статический NatsNode
 

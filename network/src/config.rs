@@ -112,7 +112,7 @@ impl Limits {
             core_streams: if server { 2048 } else { 512 },
             streams_per_peer: 512,
             lease_identities: if server { 4096 } else { 1 },
-            receive_window: 65536,
+            receive_window: skvoz_core::MAX_RECEIVE_WINDOW,
             max_frame: 16384,
             core_receive_bytes: if server { 134217728 } else { 33554432 },
             core_receive_peer_bytes: 33554432,
@@ -173,20 +173,27 @@ impl Limits {
         }
         Ok(())
     }
+    pub(crate) fn backend_payload_backing(&self) -> Result<usize, NetworkError> {
+        // Core cancellation can recycle credit before queued host events drain.
+        crate::engine::BACKEND_QUEUE_CAPACITY
+            .checked_mul(self.max_frame as usize)
+            .ok_or(NetworkError::InvalidConfiguration)
+    }
     pub fn fixed_backing(&self, role: Role, helper: bool) -> Result<usize, NetworkError> {
-        let receive = self
-            .core_streams
-            .checked_mul(self.receive_window as usize)
-            .map(|n| n.min(self.core_receive_bytes))
+        let receive = self.core_receive_bytes;
+        let metadata = self
+            .manager(role)
+            .metadata_backing()
             .ok_or(NetworkError::InvalidConfiguration)?;
         self.transport_reservation(role)
             .checked_add(
                 receive
-                    .checked_mul(2)
+                    .checked_add(metadata)
                     .ok_or(NetworkError::InvalidConfiguration)?,
             )
             .and_then(|n| n.checked_add(self.core_send_bytes))
             .and_then(|n| n.checked_add(524288))
+            .and_then(|n| n.checked_add(self.backend_payload_backing().ok()?))
             .and_then(|n| {
                 n.checked_add(if helper {
                     crate::local_api::BODY_MAX * 40
@@ -199,7 +206,10 @@ impl Limits {
     /// Fixed backing plus one maximum command and a fully populated API queue.
     pub fn minimum_runtime_bytes(&self, role: Role, helper: bool) -> Result<usize, NetworkError> {
         self.fixed_backing(role, helper)?
-            .checked_add(crate::local_api::BODY_MAX * 32 + 32768)
+            .checked_add(self.core_receive_bytes)
+            .and_then(|n| {
+                n.checked_add(crate::local_api::BODY_MAX * 32 + 32768 + self.max_frame as usize)
+            })
             .and_then(|n| n.checked_add(self.api_queue_bytes))
             .and_then(|n| n.checked_add(self.api_queue_records.checked_mul(256)?))
             .ok_or(NetworkError::InvalidConfiguration)
@@ -233,8 +243,12 @@ impl Limits {
     }
     pub fn transport_reservation(&self, role: Role) -> usize {
         let lanes = if role == Role::Server { 8 } else { 1 };
-        (2 * self.subscription_frames * lanes + self.join_frames + self.client_frames * (lanes + 1))
-            * 65588
+        (2 * self.subscription_frames * lanes
+            + self.join_frames
+            + self.client_frames * (lanes + 1)
+            + 4 * (lanes + 1))
+            * (65588 + 1024)
+            + self.manager(role).max_peers * skvoz_core::TRANSPORT_DELIVERY_STATE_BYTES
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,23 +1,22 @@
-# Stream fixtures
+# Fixtures потока
 
-UTF-8 text; each nonempty non-comment line is `COMMAND [arguments] => expected`.
-Payloads/metadata are lowercase hex; `-` is empty. A/B are independent streams
-with window 8 bytes, frame size 4 bytes, 2 pending DATA frames, metadata limit
-8 bytes and opening timeout 10 ms. Time starts at 0. TRANSFER drains frames in
-order and immediately delivers them at time 0; TICK explicitly advances time.
-EVENTS takes a batch count. Expected lists are comma-separated; `-` is empty.
+UTF-8: каждая непустая строка без комментария имеет вид
+`COMMAND [arguments] => expected`. Payload и metadata — lowercase hex,
+`-` означает пустое значение. A/B — независимые потоки с окном 8 байт,
+max_frame 4 байта, двумя pending DATA, metadata limit 8 байт и timeout 10 мс.
+Время начинается с 0. TRANSFER извлекает фреймы по порядку и немедленно
+передаёт другой стороне; TICK явно меняет время. EVENTS принимает размер batch.
+Списки разделены запятыми, offsets/windows записаны десятичными числами.
 
-Commands: OPEN, ACCEPT, REJECT, SEND, CONSUME (absolute byte offset), FINISH,
-TRANSFER (from/to), EVENTS, STATE, TICK. Frames/events use the names below in
-the checked files; numeric offsets/windows are decimal. SEND may return a
-partial `accepted(n)` or `would_block`. Result `ok` means no local API error.
+Команды: OPEN, ACCEPT, REJECT, SEND, CONSUME (абсолютный offset), FINISH,
+TRANSFER (from/to), EVENTS, STATE, TICK. SEND принимает не более одного DATA
+frame за вызов и может вернуть `accepted(n)` или `would_block`.
+`ok` означает отсутствие ошибки локального API.
 
-These scenarios are language-neutral behavioral fixtures. They do not encode
-a network frame. Rust's [semantic_fixtures.rs](../semantic_fixtures.rs) executes every scenario;
-another implementation can run the same commands and compare the same trace.
+[semantic_fixtures.rs](../semantic_fixtures.rs) исполняет эти независимые от
+языка сценарии; другая реализация может сравнить тот же trace.
 
-`wire-v1.tsv` contains seven language-neutral binary packet vectors. Each
-non-comment line is `name<TAB>hex`; packets use stream ID 2 and payload/metadata
-`00ff` where applicable. [wire_contract.rs](../wire_contract.rs) checks encoding
-and decoding against these bytes. The experimental packet format is described
-in [docs/wire.md](../../../docs/wire.md).
+`wire-v2.tsv` содержит двенадцать бинарных векторов: `name<TAB>hex`.
+Stream frames используют ID 2, peer-control — ID 0; payload/metadata — `00ff`.
+[wire_contract.rs](../wire_contract.rs) сравнивает encoding/decoding с этими
+байтами. Контракт формата — [wire](../../../docs/wire.md).

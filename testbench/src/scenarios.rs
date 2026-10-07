@@ -14,10 +14,35 @@ pub async fn pair(case: &str, config: BenchConfig) -> Result<(Node, Node), Bench
 }
 
 pub async fn establish(user: &mut Node, consumer: &mut Node) -> Result<u64, BenchError> {
+    // Flush and receive the initial peer controls before the deliberate
+    // one-record subscription fixture admits its OPEN.
+    let controls_started = Instant::now();
+    loop {
+        assert!(
+            controls_started.elapsed() < Duration::from_secs(3),
+            "Initial peer controls timed out"
+        );
+        let user_progress = user.turn(Duration::from_millis(10)).await?;
+        let consumer_progress = consumer.turn(Duration::from_millis(10)).await?;
+        if user_progress == 0 && consumer_progress == 0 {
+            break;
+        }
+    }
     let id = user.open(&[0, 255]).await?;
     let started = Instant::now();
-    let progress = consumer.turn(Duration::from_secs(1)).await?;
-    let events = consumer.poll_events();
+    let mut progress = 0;
+    let events = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "IncomingOpen observation timed out"
+        );
+        user.turn(Duration::ZERO).await?;
+        progress += consumer.turn(Duration::from_millis(10)).await?;
+        let events = consumer.poll_events();
+        if !events.is_empty() {
+            break events;
+        }
+    };
     assert_eq!(
         events.len(),
         1,
@@ -36,7 +61,18 @@ pub async fn establish(user: &mut Node, consumer: &mut Node) -> Result<u64, Benc
         }
     );
     consumer.accept(id, &[128, 0]).await?;
-    user.turn(Duration::from_secs(1)).await?;
+    let started = Instant::now();
+    while user
+        .snapshot(id)
+        .is_none_or(|snapshot| matches!(snapshot.state, skvoz_core::State::Opening(_)))
+    {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "Opened observation timed out"
+        );
+        consumer.turn(Duration::ZERO).await?;
+        user.turn(Duration::from_millis(10)).await?;
+    }
     for node in [user, consumer] {
         let events = node.poll_events();
         assert_eq!(events.len(), 1);
@@ -55,6 +91,31 @@ fn payload(id: u64, side: usize, length: usize) -> Vec<u8> {
     (0..length)
         .map(|i| (i as u64 * 37 + id * 13 + side as u64 * 127) as u8)
         .collect()
+}
+
+fn exchange_error(node: &Node, side: usize, phase: &str, stream: u64) -> BenchError {
+    std::io::Error::other(format!(
+        "Static exchange failed: role={} phase={phase} stream={stream} failure_kind={:?}",
+        if side == 0 { "user" } else { "consumer" },
+        node.failure_kind()
+    ))
+    .into()
+}
+
+async fn exchange_receive(node: &mut Node, side: usize) -> Result<(), BenchError> {
+    // This cooperative fixture admits one inbound record per turn. Drain a
+    // bounded ready batch between publications instead of accumulating ACKs
+    // and growth controls behind the next complete round of stream sends.
+    for _ in 0..256 {
+        let progress = node
+            .turn(Duration::ZERO)
+            .await
+            .map_err(|_| exchange_error(node, side, "receive", 0))?;
+        if progress == 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Both roles initiate streams and simultaneously send/consume binary payloads.
@@ -123,26 +184,36 @@ pub async fn exchange(case: &str, stream_count: usize, length: usize) -> Result<
             start.elapsed() < Duration::from_secs(20),
             "real duplex transfer stalled"
         );
-        for (side, node) in [&mut user, &mut consumer].into_iter().enumerate() {
+        for side in 0..2 {
+            let (node, remote) = if side == 0 {
+                (&mut user, &mut consumer)
+            } else {
+                (&mut consumer, &mut user)
+            };
             for &id in &ids {
                 if !finished[side].contains(&id) {
                     let offset = sent[side][&id];
-                    if let SendOutcome::Accepted(count) =
-                        node.send(id, &expected[side][&id][offset..]).await?
+                    if let SendOutcome::Accepted(count) = node
+                        .send(id, &expected[side][&id][offset..])
+                        .await
+                        .map_err(|_| exchange_error(node, side, "send", id))?
                     {
                         *sent[side].get_mut(&id).unwrap() += count;
                     }
                     if sent[side][&id] == length {
-                        node.finish(id).await?;
+                        node.finish(id)
+                            .await
+                            .map_err(|_| exchange_error(node, side, "finish", id))?;
                         finished[side].insert(id);
                     }
+                    exchange_receive(remote, 1 - side).await?;
                 }
                 let snapshot = node.snapshot(id).unwrap();
                 assert!(snapshot.receive_unconsumed_bytes <= config.stream.receive_window as u64);
                 assert!(snapshot.pending_data_frames <= config.stream.max_pending_frames);
                 assert!(snapshot.send_unacknowledged_bytes <= config.stream.receive_window as u64);
             }
-            node.turn(Duration::from_millis(1)).await?;
+            exchange_receive(node, side).await?;
             for event in node.poll_events() {
                 match event.event {
                     Event::Data { offset, bytes } => {
@@ -151,7 +222,10 @@ pub async fn exchange(case: &str, stream_count: usize, length: usize) -> Result<
                         buffer.extend_from_slice(&bytes);
                         let consumed = buffer.len() as u64;
                         drop(bytes);
-                        node.consume_through(event.stream_id, consumed).await?;
+                        node.consume_through(event.stream_id, consumed)
+                            .await
+                            .map_err(|_| exchange_error(node, side, "consume", event.stream_id))?;
+                        exchange_receive(remote, 1 - side).await?;
                     }
                     Event::RemoteFinished => assert_eq!(
                         received[side][&event.stream_id],

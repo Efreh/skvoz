@@ -31,10 +31,15 @@ def qualify(root, settings):
         if result.stdout.strip() != '0':
             raise RuntimeError('server resource RSpec failed: '+result.stdout.strip())
     finally:
+        # Let RSpec observe consumer completion and export its bounded log tail.
+        try:
+            subprocess.run(['docker','wait',server],check=False,capture_output=True,timeout=20)
+        except subprocess.TimeoutExpired:
+            print('Server diagnostic export wait expired after 20 seconds',flush=True)
         subprocess.run(['docker','logs',server],check=False)
         if settings.report_directory:
             settings.report_directory.mkdir(parents=True,exist_ok=True)
-            for name in ('server-report.json','consumer-report.json'):
+            for name in ('server-report.json','consumer-report.json','server.log',*(f'consumer-runtime-{peer}.log' for peer in range(16))):
                 subprocess.run(['docker','cp',server+':/work/'+name,str(settings.report_directory/name)],check=False)
         subprocess.run(['docker','rm','--force',consumer,server],capture_output=True)
         subprocess.run(['docker','volume','rm',volume],capture_output=True)

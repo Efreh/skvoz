@@ -5,6 +5,225 @@ use skvoz_core::{
 use skvoz_testbench::runtime_scenarios as r;
 use std::time::{Duration, Instant};
 #[tokio::test]
+async fn growing_duplex_credit_keeps_subscription_64_drained_during_output() {
+    let profile = ManagerConfig {
+        stream: skvoz_core::Config {
+            receive_window: 32 << 20,
+            max_frame: 16384,
+            max_pending_frames: 32,
+            ..ManagerConfig::default().stream
+        },
+        receive_budget: 32 << 20,
+        receive_budget_per_peer: 32 << 20,
+        max_peers: 1,
+        ..ManagerConfig::default()
+    };
+    let mut server_config = r::config(0, "duplex-credit").unwrap();
+    server_config.subscription_capacity = 64;
+    server_config.max_incoming_per_turn = 32;
+    let mut client_config = r::config(1, "duplex-credit").unwrap();
+    client_config.subscription_capacity = 64;
+    client_config.max_incoming_per_turn = 32;
+    let mut server = NatsRuntime::connect(server_config, profile).await.unwrap();
+    let mut client = NatsRuntime::connect(client_config, profile).await.unwrap();
+    r::joined(&mut client, &mut server, 1).await.unwrap();
+    let (local, remote) = r::handshake(&mut client, &mut server).await.unwrap();
+    async fn transfer(
+        mut node: NatsRuntime,
+        key: skvoz_core::runtime::RuntimeKey,
+        byte: u8,
+    ) -> NatsRuntime {
+        const SIZE: usize = 4 << 20;
+        let payload = vec![byte; SIZE];
+        let mut sent = 0;
+        let mut received = 0;
+        let initial_window = node.peer_limits(key).unwrap().receive_window as u64;
+        let mut largest_flight = 0;
+        let started = Instant::now();
+        while sent < SIZE || received < SIZE {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "{:?}",
+                node.status()
+            );
+            if sent < SIZE
+                && let skvoz_core::SendOutcome::Accepted(count) =
+                    node.send(key, &payload[sent..]).unwrap()
+            {
+                sent += count;
+            }
+            largest_flight =
+                largest_flight.max(node.snapshot(key).unwrap().send_unacknowledged_bytes);
+            node.turn(Duration::from_millis(1)).await.unwrap();
+            for event in node.poll_events(256) {
+                match event.event {
+                    Event::Data { offset, bytes } => {
+                        assert_eq!(offset, received as u64);
+                        assert!(bytes.iter().all(|value| *value == (byte ^ 1)));
+                        received += bytes.len();
+                        node.consume_through(event.key, received as u64).unwrap();
+                    }
+                    Event::Closed { reason } => panic!("unexpected terminal event: {reason:?}"),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(received, SIZE);
+        assert!(
+            largest_flight > initial_window,
+            "active stream flight did not grow"
+        );
+        assert_eq!(node.status().counters.shard_overflows, 0);
+        assert!(node.peer_ready(key.stream.peer));
+        println!(
+            "duplex byte={byte:#x} sent={sent} received={received} initial_window={initial_window} largest_flight={largest_flight} elapsed={:?}",
+            started.elapsed()
+        );
+        node
+    }
+    let (mut client, mut server) = tokio::join!(
+        transfer(client, local, 0x40),
+        transfer(server, remote, 0x41)
+    );
+    // Warm bidirectional credit also measures the peer RTT before a fresh flow
+    // waits in its owner's queue. No acknowledgement precedes actual consumption.
+    let (local, remote) = r::handshake(&mut client, &mut server).await.unwrap();
+    let initial_window = client.peer_limits(local).unwrap().receive_window as usize;
+    assert_eq!(initial_window, 65536);
+    let payload = vec![0x72; 256 << 10];
+    let mut sent = 0;
+    let mut received = 0;
+    let collect = |node: &mut NatsRuntime, received: &mut usize| {
+        for event in node.poll_events(256) {
+            match event.event {
+                Event::Data { offset, bytes } => {
+                    assert_eq!(event.key, remote);
+                    assert_eq!(offset, *received as u64);
+                    assert!(bytes.iter().all(|byte| *byte == 0x72));
+                    *received += bytes.len();
+                }
+                Event::Closed { reason } => panic!("unexpected terminal event: {reason:?}"),
+                _ => {}
+            }
+        }
+    };
+    let queued = Instant::now();
+    while queued.elapsed() < Duration::from_millis(250) || received < initial_window {
+        assert!(
+            queued.elapsed() < Duration::from_secs(3),
+            "initial flight did not arrive"
+        );
+        if let skvoz_core::SendOutcome::Accepted(count) =
+            client.send(local, &payload[sent..]).unwrap()
+        {
+            sent += count;
+        }
+        client.turn(Duration::from_millis(1)).await.unwrap();
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        client.poll_events(256);
+        collect(&mut server, &mut received);
+    }
+    assert_eq!(received, initial_window);
+    assert_eq!(
+        server.snapshot(remote).unwrap().receive_unconsumed_bytes,
+        received as u64
+    );
+    server
+        .consume_through(remote, (initial_window / 2) as u64)
+        .unwrap();
+    let growth = Instant::now();
+    let largest_flight = loop {
+        assert!(
+            growth.elapsed() < Duration::from_secs(2),
+            "first consumption did not grow queued flow flight"
+        );
+        client.turn(Duration::from_millis(1)).await.unwrap();
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        client.poll_events(256);
+        collect(&mut server, &mut received);
+        if let skvoz_core::SendOutcome::Accepted(count) =
+            client.send(local, &payload[sent..]).unwrap()
+        {
+            sent += count;
+        }
+        let flight = client.snapshot(local).unwrap().send_unacknowledged_bytes;
+        if flight > initial_window as u64 {
+            break flight;
+        }
+    };
+    println!(
+        "queued wait_ms={} consumed={} initial_window={initial_window} largest_flight={largest_flight}",
+        queued.elapsed().as_millis(),
+        initial_window / 2
+    );
+    server.consume_through(remote, received as u64).unwrap();
+    let drain = Instant::now();
+    while received < sent {
+        assert!(drain.elapsed() < Duration::from_secs(3));
+        client.turn(Duration::from_millis(1)).await.unwrap();
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        client.poll_events(256);
+        collect(&mut server, &mut received);
+        server.consume_through(remote, received as u64).unwrap();
+    }
+    assert_eq!(received, sent);
+    assert_eq!(client.status().counters.shard_overflows, 0);
+    assert_eq!(server.status().counters.shard_overflows, 0);
+    assert!(client.peer_ready(PeerId(0)));
+    assert!(server.peer_ready(PeerId(1)));
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn expired_core_credit_freeze_retires_ready_session_without_late_data() {
+    let mut server = r::node(0, "freeze-expiry").await.unwrap();
+    let mut client = r::node(1, "freeze-expiry").await.unwrap();
+    r::joined(&mut client, &mut server, 1).await.unwrap();
+    let (_local, old) = r::handshake(&mut client, &mut server).await.unwrap();
+    server.inject_expired_credit_freeze(PeerId(1));
+    server.turn(Duration::ZERO).await.unwrap();
+    assert!(!server.peer_ready(PeerId(1)));
+    assert!(!server.peer_status(PeerId(1)).unwrap().ready);
+    assert_eq!(server.status().active_peers, 0);
+    assert_eq!(
+        server.open(PeerId(1), b"too early"),
+        Err(RuntimeError::PeerUnavailable)
+    );
+    let events = server.poll_events(64);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.event,
+                Event::Closed {
+                    reason: CloseReason::TransportLost
+                }
+            ))
+            .count(),
+        1
+    );
+    let start = Instant::now();
+    while !client.peer_ready(PeerId(0)) || !server.peer_ready(PeerId(1)) {
+        assert!(start.elapsed() < Duration::from_secs(8));
+        client.turn(Duration::ZERO).await.unwrap();
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        client.poll_events(64);
+        server.poll_events(64);
+    }
+    let (local, fresh) = r::handshake(&mut client, &mut server).await.unwrap();
+    assert_ne!(old.incarnation, fresh.incarnation);
+    r::bytes(
+        &mut client,
+        &mut server,
+        local,
+        b"new flow after credit deadline",
+    )
+    .await
+    .unwrap();
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+#[tokio::test]
 async fn dynamic_join_restart_stale_connector_key_and_unrelated_peer() {
     let mut server = r::node(0, "restart").await.unwrap();
     let mut client = r::node(1, "restart").await.unwrap();
@@ -288,6 +507,9 @@ async fn real_runtime_overflow_fails_affected_shard_and_preserves_other_shard() 
             .await
             .unwrap();
     }
+    // A queue burst is backpressured. An owner that remains stalled beyond
+    // its existing I/O deadline terminates this shard without dropping DATA.
+    tokio::time::sleep(Duration::from_millis(800)).await;
     let start = Instant::now();
     let mut lost = 0;
     while lost == 0 {
@@ -326,6 +548,53 @@ async fn real_runtime_overflow_fails_affected_shard_and_preserves_other_shard() 
     server.poll_events(256);
     assert_eq!(server.resources().streams, 0);
     assert_eq!(server.resources().reserved_receive_bytes, 0);
+}
+#[tokio::test]
+async fn tiny_runtime_subscription_pauses_then_resumes_exact_ordered_bytes() {
+    let mut config = r::config(0, "tiny-pause").unwrap();
+    config.subscription_capacity = 2;
+    let mut server = NatsRuntime::connect(config, ManagerConfig::default())
+        .await
+        .unwrap();
+    let mut client = r::node(1, "tiny-pause").await.unwrap();
+    r::joined(&mut client, &mut server, 1).await.unwrap();
+    let (key, _) = r::handshake(&mut client, &mut server).await.unwrap();
+    let payload: Vec<u8> = (0..6144).map(|index| (index % 251) as u8).collect();
+    let mut sent = 0;
+    while sent < payload.len() {
+        let skvoz_core::SendOutcome::Accepted(count) = client.send(key, &payload[sent..]).unwrap()
+        else {
+            panic!("initial peer credit must hold six records");
+        };
+        sent += count;
+    }
+    client.turn(Duration::ZERO).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut received = Vec::new();
+    let started = Instant::now();
+    while received.len() < payload.len() {
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        client.turn(Duration::ZERO).await.unwrap();
+        for event in server.poll_events(64) {
+            match event.event {
+                Event::Data { offset, bytes } => {
+                    assert_eq!(offset, received.len() as u64);
+                    received.extend_from_slice(&bytes);
+                    server
+                        .consume_through(event.key, received.len() as u64)
+                        .unwrap();
+                }
+                Event::Closed { reason } => panic!("unexpected terminal event: {reason:?}"),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(received, payload);
+    assert_eq!(server.status().counters.shard_overflows, 0);
+    assert!(server.peer_ready(PeerId(1)));
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn admission_burst_does_not_interrupt_existing_peer() {
@@ -724,6 +993,70 @@ async fn injected_lost_lane_warmup_pong_retries_before_peer_ready() {
     .await
     .unwrap();
     client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn actual_header_message_retires_only_its_transport_shard() {
+    let mut server = r::node(0, "raw-headers").await.unwrap();
+    let mut offender = r::node(1, "raw-headers").await.unwrap();
+    let mut healthy = r::node(2, "raw-headers").await.unwrap();
+    r::joined(&mut offender, &mut server, 1).await.unwrap();
+    r::joined(&mut healthy, &mut server, 2).await.unwrap();
+    let (offender_key, _) = r::handshake(&mut offender, &mut server).await.unwrap();
+    let (healthy_key, _) = r::handshake(&mut healthy, &mut server).await.unwrap();
+    let session = offender.peer_status(PeerId(0)).unwrap();
+    let mut payload = session.pair_token.to_be_bytes().to_vec();
+    payload.extend_from_slice(&(session.sent_frames + 1).to_be_bytes());
+    payload.extend_from_slice(
+        &skvoz_core::wire::encode(
+            offender_key.stream.stream_id,
+            &skvoz_core::Frame::WindowUpdate { consumed: 0 },
+        )
+        .unwrap(),
+    );
+    let namespace = r::config(1, "raw-headers").unwrap().namespace;
+    offender
+        .inject_subject_with_headers(
+            format!(
+                "{namespace}.lane.0.{:032x}.1.data.1.{:032x}",
+                server.generation(),
+                offender.generation()
+            ),
+            payload,
+        )
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let mut closed = false;
+    while !closed {
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        healthy.turn(Duration::ZERO).await.unwrap();
+        for event in server.poll_events(64) {
+            if event.key.stream.peer == PeerId(1)
+                && matches!(
+                    event.event,
+                    Event::Closed {
+                        reason: CloseReason::TransportLost
+                    }
+                )
+            {
+                closed = true;
+            }
+        }
+    }
+    assert!(!server.peer_ready(PeerId(1)));
+    assert!(server.peer_ready(PeerId(2)));
+    r::bytes(
+        &mut healthy,
+        &mut server,
+        healthy_key,
+        b"plain payload survives another lane header error",
+    )
+    .await
+    .unwrap();
+    offender.shutdown().await.unwrap();
+    healthy.shutdown().await.unwrap();
     server.shutdown().await.unwrap();
 }
 #[tokio::test]

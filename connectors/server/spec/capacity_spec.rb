@@ -42,9 +42,12 @@ RSpec.describe 'Server container TCP resources', integration: true, capacity: tr
         rescue Errno::ENOENT
           nil
         end
+        events = File.readlines('/sys/fs/cgroup/memory.events').to_h { |line| key, value = line.split; [key, Integer(value)] }
+        expect(events.fetch('oom')).to eq(0)
+        expect(events.fetch('oom_kill')).to eq(0)
         memory = File.readlines('/sys/fs/cgroup/memory.stat').to_h { |line| key, value = line.split; [key, Integer(value)] }
         value = { 'phase' => phase, 'elapsed' => monotonic - started, 'processes' => processes,
-          'memory_stat' => memory.slice('anon', 'file', 'sock', 'kernel', 'kernel_stack', 'slab'),
+          'memory_events' => events, 'memory_stat' => memory.slice('anon', 'file', 'sock', 'kernel', 'kernel_stack', 'slab'),
           'current' => Integer(File.read('/sys/fs/cgroup/memory.current')), 'peak' => Integer(File.read('/sys/fs/cgroup/memory.peak')) }
         report['samples'] << value
         private_json(shared.join('server-report.json'), report)
@@ -91,6 +94,10 @@ RSpec.describe 'Server container TCP resources', integration: true, capacity: tr
       raise
     ensure
       server&.close
+      if server&.log&.file?
+        offset = [server.log.size - 262144, 0].max
+        shared.join('server.log').binwrite(File.binread(server.log, 262144, offset))
+      end
       private_json(shared.join('server-report.json'), report)
     end
   end

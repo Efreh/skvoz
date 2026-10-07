@@ -1,7 +1,7 @@
 # Динамический NATS runtime
 
 `skvoz_core::runtime::NatsRuntime` — опциональный runtime одной универсальной
-Core library 3.1.0. Он добавляет authenticated join, смену peer session, проверку
+Core library 4.0.0. Он добавляет authenticated join, смену peer session, проверку
 живости и восстановление транспорта для новых byte streams. Включается feature
 `nats`; HTTP/SOCKS parsing, DNS, сокеты, GUI и выдача credentials принадлежат host.
 Статический [NatsNode](../core/src/nats.rs) используется простым TCP relay
@@ -74,7 +74,7 @@ Debug конфигурации и typed errors не раскрывают endpoin
 по виртуальным хостам. Без параметра сохраняется проверка имени из URL.
 [Профили демона](daemon-ipc.md) предоставляют то же необязательное поле.
 
-NATS должен объявлять `max_payload: 65588`: максимальный wire v1 packet 65564
+NATS должен объявлять `max_payload: 65588`: максимальный wire v2 packet 65564
 bytes плюс runtime envelope 24 bytes. Runtime отвергает и меньший, и больший
 лимит, чтобы count-bounded inbound queues имели конечную границу payload bytes.
 При общем брокере этот профиль необходимо согласовать с другими приложениями.
@@ -92,6 +92,7 @@ bytes плюс runtime envelope 24 bytes. Runtime отвергает и мень
 | Принять или отклонить входящий поток | `accept(key, metadata)` / `reject(key, reason)` |
 | Поставить байты на отправку | `send(key, bytes)` → `Accepted(n)` или `WouldBlock` |
 | Получить события потока | `poll_events(max)` → `Vec<RuntimeEvent>` |
+| Ограничить передачу DATA доступной ёмкостью host | `poll_events_with_data_budget(max, admit)` |
 | Подтвердить обработку полученных байтов | `consume_through(key, end_offset)` |
 | Завершить отправляющее направление / отменить поток | `finish(key)` / `close(key)` |
 | Обслужить транспорт, negotiation и таймеры | `turn(wait).await` |
@@ -170,7 +171,7 @@ session; runtime не заменяет credential revocation.
 
 Control v1 — ровно 77 bytes: `SKC1`, kind u8, sender generation u128, recipient
 generation u128, initiator nonce u128, pair token/challenge u128, watermark u64;
-числа big-endian. Это отдельный экспериментальный envelope; stream wire v1 и
+числа big-endian. Это отдельный экспериментальный envelope; stream wire v2 и
 его [fixtures](../core/tests/fixtures/README.md) сохраняются.
 
 Node generation, initiator nonce и responder challenge генерируются OS randomness.
@@ -276,9 +277,36 @@ credential-authorized unlimited publish или broker-global saturation треб
 операционных rate/account limits. Broker `max_pending`/`write_deadline` ограничивают
 его очереди. Повышение queue capacity не заменяет loss detection и admission.
 
+Перед извлечением frames из Manager runtime ограничивает неподтверждённую
+доставку отдельно от credit фактического потребления. Для одной session DATA
+занимает не более 3 МиБ с учётом envelope и консервативного NATS framing;
+управляющим frames доступен дополнительный headroom внутри 4 МиБ. Из этого
+общего предела резервируется минимум 128 КиБ для retry/heartbeat controls;
+длительные или частые retries увеличивают резерв, а небезопасный профиль
+отклоняется при запуске. Это соответствует broker `max_pending: 4194304`;
+меньший broker limit требует согласованного transport contract.
+
+При заполнении половины DATA flight runtime отправляет lane PING. Matching
+PONG освобождает только подтверждённый префикс отправленных bytes; более поздние
+публикации остаются учтёнными. Broker flush сам по себе не освобождает этот
+flight. Закрытый gate оставляет DATA в Core и допускает доступные управляющие
+frames и работу других peers. Подтверждение доставки не возвращает receive
+credit: для него по-прежнему необходимо фактическое потребление host.
+
+Этот предел относится к одной producer→recipient session. Сумма публикаций
+независимых клиентов в общую серверную lane не получает общей квоты этим
+механизмом; при её перегрузке действуют описанные выше обнаружение потери и
+изоляция shard. Ограничение памяти flight не является лимитом байтов в секунду.
+
 DATA output публикуется bounded batch и flush выполняется на затронутые
 connections. Cancellation guard действует для всех extracted frames до завершения
 всех batch flushes: отмена может консервативно завершить все touched shards.
+Во время незавершённой публикации/flush тот же owner обрабатывает established
+lane input без новой очереди/task; immutable envelope сохраняет исходные token
+и sequence. Поэтому общий incoming count turn может превышать обычный pass
+budget, оставаясь ограниченным output batch и I/O deadline. Initial peer grants
+не извлекаются до matching PONG readiness. Manager freeze failure также
+завершает runtime session, даже если следующего DATA нет.
 Retryable heartbeat/control batches также имеют отдельные конечные slots.
 
 `RuntimeConfig::new` задаёт capacities128 DATA/CONTROL,128 join,16 commands,
@@ -300,10 +328,28 @@ payload bytes, пять групп размеров DATA (`<1500`, `1500…8191`
 `output_elapsed_ns` измеряет суммарное wall time output batches, включая
 ожидание publish/flush. Счётчики насыщаются на `u64::MAX`; они не измеряют CPU
 и не подтверждают доставку или потребление payload удалённым приложением.
-Configured transport bound считает только queued payload:
-`(join_capacity + 2*shards*subscription_capacity + (shards+1)*client_capacity) * 65588`.
-Это конечная верхняя граница payload queue slots, не RSS: headers, allocator,
-TLS/socket/runtime buffers, broker queues и caller-owned buffers отдельно.
+`validate_profile` учитывает queued messages и четыре дополнительных слота на
+соединение: одну pending decoded Message, парсер и одну временную Message.
+Обеспеченная граница —
+`(join_capacity + 2*shards*subscription_capacity + (shards+1)*client_capacity + 4*(shards+1)) * (65588+1024) + max_peers*64`.
+Последнее слагаемое обеспечивает состояние delivery flight и snapshot bytes
+незавершённого PING каждого peer.
+Парсер ограничен `2*(65588+516)` байтами capacity; тело каждого queued payload
+имеет собственный буфер точной длины. Fixed body maximum 65588 действует до
+первого INFO, при TLS upgrade и reconnect, независимо от broker max_payload.
+INFO ограничен 4096 байтами, остальные control/MSG строки — 512. HMSG не
+поддерживается: заголовки отклоняются до расширения HeaderMap и завершают
+затронутое соединение. Текущий Runtime публикует plain PUB/MSG.
+
+[Локальная поправка async-nats](../vendor/async-nats/PATCHES.md) сохраняет одну
+pending Message при полной subscription, прекращая новые чтения, пока запись,
+flush, commands и heartbeat продолжают работу. После io_timeout соединение
+терминально закрывается. Это предотвращает silent DATA drop; произвольная пауза
+host не обещает бесконечного ожидания. Upstream default и независимый static
+NatsNode сохраняют исходный loss contract.
+
+Это конечное userspace backing, не полный RSS: TLS, kernel TCP buffers, broker
+queues и caller-owned allocations оцениваются отдельно.
 
 ## Воспроизводимая квалификация
 

@@ -10,7 +10,7 @@ module Skvoz
     # Produces the same immutable public policy for the runtime and root helper.
     class NetworkConfiguration
       LIMITS = { ip_sessions: 128, core_streams: 2048, streams_per_peer: 512, lease_identities: 4096,
-        receive_window: 65536, max_frame: 16384, core_receive_bytes: 134217728, core_receive_peer_bytes: 33554432,
+        receive_window: 33554432, max_frame: 16384, core_receive_bytes: 134217728, core_receive_peer_bytes: 33554432,
         core_send_bytes: 67108864, core_send_peer_bytes: 2097152, packet_queue_bytes: 262144,
         packet_queue_records: 256, control_queue_bytes: 32768, control_queue_records: 8,
         runtime_buffer_bytes: 536870912, runtime_buffer_records: 131072, api_queue_bytes: 131072,

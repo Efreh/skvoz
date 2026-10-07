@@ -9,7 +9,7 @@ fn main() -> gtk::glib::ExitCode {
     }
     if args == ["--version"] {
         println!(
-            "skvoz-client {} runtime={} network=3 api=1",
+            "skvoz-client {} runtime={} network=4 api=1",
             env!("CARGO_PKG_VERSION"),
             skvoz_ubuntu_client::RUNTIME_VERSION
         );

@@ -7,6 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) const BACKEND_QUEUE_CAPACITY: usize = 512;
+// Amortize complete Core turns over eight full canonical DATA frames. The
+// independent 16-record gate and existing TCP/IP headroom remain unchanged.
+const NATIVE_BYTE_QUANTUM: usize = 128 * 1024;
+
 #[derive(Clone, Debug)]
 pub enum EngineRole {
     Client,
@@ -64,7 +69,7 @@ fn validate_core_profile(limits: ManagerConfig, server: bool) -> Result<(), Netw
     let canonical = EngineConfig::default().core_limits(server);
     // Frame/window are a progress contract, not merely resource upper bounds.
     // An IP session needs at least its control stream and one packet stream.
-    let session_receive = 2 * canonical.stream.receive_window as usize;
+    let session_receive = 2 * 65536;
     if limits.stream != canonical.stream
         || !(1..=canonical.max_peers).contains(&limits.max_peers)
         || !(2..=canonical.max_streams).contains(&limits.max_streams)
@@ -91,9 +96,84 @@ mod profile_tests {
     use super::*;
 
     #[test]
+    fn backend_abort_bypasses_only_cancelled_data_preserving_other_fifo_and_fin() {
+        let key = |id| RuntimeKey {
+            epoch: 1,
+            incarnation: 1,
+            stream: skvoz_core::StreamKey {
+                peer: PeerId(0),
+                stream_id: id,
+            },
+        };
+        let data = |id, offset| BackendEvent::Tcp {
+            key: key(id),
+            event: Event::Data {
+                offset,
+                bytes: Box::new([id as u8]),
+            },
+        };
+        let mut queue = VecDeque::from([
+            data(2, 0),
+            BackendEvent::TcpOpen {
+                key: key(1),
+                host: "example.org".into(),
+                port: 443,
+            },
+            data(1, 0),
+            BackendEvent::Tcp {
+                key: key(2),
+                event: Event::RemoteFinished,
+            },
+            BackendEvent::Tcp {
+                key: key(2),
+                event: Event::Closed {
+                    reason: skvoz_core::CloseReason::Finished,
+                },
+            },
+            BackendEvent::Tcp {
+                key: key(1),
+                event: Event::Closed {
+                    reason: skvoz_core::CloseReason::Cancelled,
+                },
+            },
+            data(3, 0),
+            data(3, 1),
+        ]);
+        assert!(
+            matches!(extract_backend_abort(&mut queue), Some(BackendEvent::Tcp { key: k, event: Event::Closed { reason: skvoz_core::CloseReason::Cancelled } }) if k == key(1))
+        );
+        assert_eq!(queue.len(), 5);
+        assert!(extract_backend_abort(&mut queue).is_none());
+        assert!(
+            matches!(queue.pop_front(), Some(BackendEvent::Tcp { key: k, event: Event::Data { offset: 0, .. } }) if k == key(2))
+        );
+        assert!(matches!(
+            queue.pop_front(),
+            Some(BackendEvent::Tcp {
+                event: Event::RemoteFinished,
+                ..
+            })
+        ));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(BackendEvent::Tcp {
+                event: Event::Closed {
+                    reason: skvoz_core::CloseReason::Finished
+                },
+                ..
+            })
+        ));
+        for offset in 0..2 {
+            assert!(
+                matches!(queue.pop_front(), Some(BackendEvent::Tcp { key: k, event: Event::Data { offset: n, .. } }) if k == key(3) && n == offset)
+            );
+        }
+        assert!(queue.is_empty());
+    }
+    #[test]
     fn fixed_bookkeeping_backs_backend_and_pending_cancellation_keys() {
         // Both arrays have finite capacities, without tree nodes or a copy.
-        let bytes = 512 * (std::mem::size_of::<BackendEvent>() + 512)
+        let bytes = BACKEND_QUEUE_CAPACITY * (std::mem::size_of::<BackendEvent>() + 512)
             + 2048 * std::mem::size_of::<RuntimeKey>();
         assert!(bytes <= 524288, "bookkeeping requires {bytes} bytes");
     }
@@ -182,6 +262,28 @@ pub struct EngineResources {
     pub control_bytes: usize,
     pub parser_bytes: usize,
 }
+#[cfg(any(test, all(target_os = "linux", feature = "linux-runtime")))]
+fn extract_backend_abort(queue: &mut VecDeque<BackendEvent>) -> Option<BackendEvent> {
+    let position = queue.iter().position(|event| {
+        matches!(event,
+            BackendEvent::Tcp { event: Event::Closed { reason }, .. }
+                if *reason != skvoz_core::CloseReason::Finished
+        ) || matches!(
+            event,
+            BackendEvent::Tcp {
+                event: Event::Rejected { .. },
+                ..
+            }
+        )
+    })?;
+    let terminal = queue.remove(position)?;
+    let BackendEvent::Tcp { key, .. } = &terminal else {
+        unreachable!()
+    };
+    queue.retain(|event| !matches!(event,
+        BackendEvent::Tcp { key: pending, .. } | BackendEvent::TcpOpen { key: pending, .. } if pending == key));
+    Some(terminal)
+}
 #[derive(Debug)]
 pub enum BackendEvent {
     TcpOpen {
@@ -251,6 +353,7 @@ struct Channel {
     session: SessionId,
     control: bool,
     parser: RecordParser,
+    event_room: usize,
     output: VecDeque<Pending>,
     receipts: VecDeque<Receipt>,
     sent: u64,
@@ -352,7 +455,7 @@ impl NetworkEngine {
         let send = self.native_send.get(&peer).copied().unwrap_or((0, 0));
         let receive = self.native_receive.get(&peer).copied().unwrap_or((0, 0));
         let ip = self.ip_turn.get(&peer).copied().unwrap_or((0, 0));
-        let bytes = 32768usize.saturating_sub(send.0 + receive.0 + ip.0);
+        let bytes = NATIVE_BYTE_QUANTUM.saturating_sub(send.0 + receive.0 + ip.0);
         (
             bytes,
             bytes,
@@ -393,7 +496,7 @@ impl NetworkEngine {
         Ok(())
     }
     fn backend_push(&mut self, event: BackendEvent) -> Result<(), NetworkError> {
-        if self.backend.len() >= 512 {
+        if self.backend.len() >= BACKEND_QUEUE_CAPACITY {
             return Err(NetworkError::Overloaded);
         }
         self.backend.push_back(event);
@@ -419,6 +522,16 @@ impl NetworkEngine {
     }
     pub fn poll_backend(&mut self) -> Option<BackendEvent> {
         self.backend.pop_front()
+    }
+    #[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+    pub(crate) fn defer_backend(&mut self, event: BackendEvent) {
+        // The caller just removed this slot; no intervening engine drive occurs.
+        assert!(self.backend.len() < BACKEND_QUEUE_CAPACITY);
+        self.backend.push_front(event);
+    }
+    #[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+    pub(crate) fn poll_backend_abort(&mut self) -> Option<BackendEvent> {
+        extract_backend_abort(&mut self.backend)
     }
     pub fn open_tcp(
         &mut self,
@@ -657,6 +770,7 @@ impl NetworkEngine {
                 session,
                 control,
                 parser,
+                event_room: 0,
                 output: VecDeque::new(),
                 receipts: VecDeque::new(),
                 sent: 0,
@@ -723,7 +837,7 @@ impl NetworkEngine {
     }
     fn reject(&mut self, key: RuntimeKey, kind: &str, error: &str) -> Result<(), NetworkError> {
         self.counters.rejected_opens = self.counters.rejected_opens.saturating_add(1);
-        let bytes = serde_json::to_vec(&serde_json::json!({"v":3,"type":kind,"error":error}))
+        let bytes = serde_json::to_vec(&serde_json::json!({"v":4,"type":kind,"error":error}))
             .map_err(|_| NetworkError::InvalidMetadata)?;
         self.runtime.reject(key, &bytes)?;
         Ok(())
@@ -1306,7 +1420,10 @@ impl NetworkEngine {
             .map(|p| {
                 let s = self.native_send.get(p).copied().unwrap_or((0, 0));
                 let r = self.native_receive.get(p).copied().unwrap_or((0, 0));
-                (*p, (32768usize.saturating_sub(s.0 + r.0), s.1.max(r.1)))
+                (
+                    *p,
+                    (NATIVE_BYTE_QUANTUM.saturating_sub(s.0 + r.0), s.1.max(r.1)),
+                )
             })
             .collect();
         for _ in 0..count {
@@ -1321,7 +1438,9 @@ impl NetworkEngine {
             let (mut budget, mut records) = if control {
                 (32768, 0)
             } else {
-                *quanta.entry(key.stream.peer).or_insert((32768, 0))
+                *quanta
+                    .entry(key.stream.peer)
+                    .or_insert((NATIVE_BYTE_QUANTUM, 0))
             };
             loop {
                 let stream = self.streams.get_mut(&key).unwrap();
@@ -1391,7 +1510,7 @@ impl NetworkEngine {
                 (
                     p,
                     (
-                        32768usize.saturating_sub(bytes + s.0 + r.0),
+                        NATIVE_BYTE_QUANTUM.saturating_sub(bytes + s.0 + r.0),
                         records.saturating_sub(s.1.max(r.1)),
                     ),
                 )
@@ -1554,12 +1673,25 @@ impl NetworkEngine {
             return Err(error.into());
         }
         self.retire_expired_setups();
+        for channel in self.streams.values_mut() {
+            channel.event_room = channel.parser.available_bytes();
+        }
         // Never extract an event that cannot transfer into the bounded backend.
         // Core retains terminal ownership until the actor drains existing work.
-        for observed in self
-            .runtime
-            .poll_events((512 - self.backend.len()).min(256))
-        {
+        let streams = &mut self.streams;
+        for observed in self.runtime.poll_events_with_data_budget(
+            (BACKEND_QUEUE_CAPACITY - self.backend.len()).min(256),
+            |key, bytes| {
+                streams.get_mut(&key).is_none_or(|channel| {
+                    if bytes > channel.event_room {
+                        false
+                    } else {
+                        channel.event_room -= bytes;
+                        true
+                    }
+                })
+            },
+        ) {
             let key = observed.key;
             if self.tcp.contains(&key) {
                 if let Event::Opened { metadata } = &observed.event
@@ -1590,7 +1722,22 @@ impl NetworkEngine {
             let result = match observed.event {
                 Event::IncomingOpen { metadata } => self.incoming(key, &metadata),
                 Event::Opened { metadata } => self.opened(key, &metadata),
-                Event::Data { offset, bytes } => self.data(key, offset, &bytes),
+                Event::Data { offset, bytes } => {
+                    let result = self.data(key, offset, &bytes);
+                    if result.is_err()
+                        && let Some(channel) = self.streams.get(&key)
+                    {
+                        eprintln!(
+                            "Network DATA ingestion failed: peer={} stream={} incoming_bytes={} parser_free_bytes={} reason={:?}",
+                            key.stream.peer.0,
+                            key.stream.stream_id,
+                            bytes.len(),
+                            channel.parser.available_bytes(),
+                            result.as_ref().err().unwrap()
+                        );
+                    }
+                    result
+                }
                 Event::Rejected { reason } => {
                     self.last_error = Some(
                         Rejection::decode(&reason)
@@ -1611,10 +1758,14 @@ impl NetworkEngine {
                 Event::Writable => Ok(()),
             };
             if let Err(error) = result {
-                self.last_error = Some(error);
                 if self.streams.contains_key(&key) {
+                    eprintln!(
+                        "Network record ingestion failed: peer={} stream={} reason={error:?}",
+                        key.stream.peer.0, key.stream.stream_id
+                    );
                     self.close_peer(key.stream.peer);
                 }
+                self.last_error = Some(error);
             }
         }
         // Process control first without assuming ordering across data channels.
@@ -1648,7 +1799,7 @@ impl NetworkEngine {
                 (
                     *p,
                     (
-                        32768usize.saturating_sub(s.0 + r.0 + ip.0),
+                        NATIVE_BYTE_QUANTUM.saturating_sub(s.0 + r.0 + ip.0),
                         s.1.max(r.1) + ip.1,
                     ),
                 )
@@ -1665,8 +1816,9 @@ impl NetworkEngine {
             {
                 continue;
             }
-            let (mut budget, mut records) =
-                *receive_quanta.entry(key.stream.peer).or_insert((32768, 0));
+            let (mut budget, mut records) = *receive_quanta
+                .entry(key.stream.peer)
+                .or_insert((NATIVE_BYTE_QUANTUM, 0));
             if let Err(error) = self.drain_records(key, &mut budget, &mut records, 16) {
                 self.last_error = Some(error);
                 self.close_peer(key.stream.peer);

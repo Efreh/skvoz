@@ -33,3 +33,11 @@ clients/**
 **/*.pfx
 **/credentials.json
 **/secrets.json
+
+# The pinned Rust transport patch is a source-build dependency.
+!vendor/
+!vendor/async-nats/
+!vendor/async-nats/Cargo.toml
+!vendor/async-nats/LICENSE
+!vendor/async-nats/src/
+!vendor/async-nats/src/**

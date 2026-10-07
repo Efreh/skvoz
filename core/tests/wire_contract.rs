@@ -12,7 +12,7 @@ fn unhex(text: &str) -> Vec<u8> {
 
 #[test]
 fn language_neutral_vectors_match_all_frames() {
-    for line in include_str!("fixtures/wire-v1.tsv").lines() {
+    for line in include_str!("fixtures/wire-v2.tsv").lines() {
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
@@ -40,16 +40,40 @@ fn language_neutral_vectors_match_all_frames() {
             "close" => Frame::Close {
                 reason: CloseReason::Cancelled,
             },
+            "window_grant" => Frame::WindowGrant {
+                consumed: 2,
+                limit: 16,
+                probe: 9,
+            },
+            "peer_grant" => Frame::PeerGrant {
+                epoch: 1,
+                consumed_bytes: 2,
+                limit_bytes: 65536,
+                consumed_records: 1,
+                limit_records: 64,
+                probe: 7,
+            },
+            "peer_request" => Frame::PeerRequest {
+                bytes: 1048576,
+                records: 128,
+                probe: 9,
+                requester_stream_id: 2,
+                blocked: 3,
+            },
+            "peer_freeze" => Frame::PeerFreeze { epoch: 1 },
+            "peer_frozen" => Frame::PeerFrozen {
+                epoch: 1,
+                bytes: 1024,
+                records: 1,
+            },
             _ => panic!("unknown vector"),
         };
+        let stream_id = if name.starts_with("peer_") { 0 } else { 2 };
         let bytes = unhex(value);
-        assert_eq!(wire::encode(2, &frame).unwrap(), bytes, "{name}");
+        assert_eq!(wire::encode(stream_id, &frame).unwrap(), bytes, "{name}");
         assert_eq!(
             wire::decode(&bytes).unwrap(),
-            wire::Packet {
-                stream_id: 2,
-                frame
-            },
+            wire::Packet { stream_id, frame },
             "{name}"
         );
     }
@@ -70,7 +94,7 @@ fn malformed_lengths_headers_and_versions_are_rejected() {
     }
     for (position, value, error) in [
         (0, 0, WireError::InvalidHeader),
-        (4, 2, WireError::UnsupportedVersion),
+        (4, 1, WireError::UnsupportedVersion),
         (5, 255, WireError::UnknownKind),
         (6, 1, WireError::InvalidHeader),
     ] {
@@ -119,4 +143,58 @@ fn bounded_decoder_mutation_smoke_test() {
             }
         }
     }
+}
+
+#[test]
+fn aggregate_controls_have_a_separate_zero_stream_namespace() {
+    let controls = [
+        Frame::PeerGrant {
+            epoch: 0,
+            consumed_bytes: 0,
+            limit_bytes: 65536,
+            consumed_records: 0,
+            limit_records: 64,
+            probe: 7,
+        },
+        Frame::PeerRequest {
+            bytes: 1048576,
+            records: 128,
+            probe: 9,
+            requester_stream_id: 2,
+            blocked: 3,
+        },
+        Frame::PeerFreeze { epoch: 1 },
+        Frame::PeerFrozen {
+            epoch: 1,
+            bytes: 1024,
+            records: 1,
+        },
+    ];
+    for frame in controls {
+        assert_eq!(wire::encode(2, &frame), Err(WireError::InvalidValue));
+        let bytes = wire::encode(0, &frame).unwrap();
+        assert_eq!(
+            wire::decode(&bytes).unwrap(),
+            wire::Packet {
+                stream_id: 0,
+                frame
+            }
+        );
+        for prefix in 0..bytes.len() {
+            assert!(wire::decode(&bytes[..prefix]).is_err());
+        }
+        let mut wrong_namespace = bytes;
+        wrong_namespace[15] = 2;
+        assert_eq!(wire::decode(&wrong_namespace), Err(WireError::InvalidValue));
+    }
+    assert_eq!(
+        wire::encode(
+            0,
+            &Frame::Data {
+                offset: 0,
+                bytes: Box::new([1])
+            }
+        ),
+        Err(WireError::InvalidValue)
+    );
 }

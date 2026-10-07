@@ -1,9 +1,9 @@
 # Серверный коннектор
 
-`skvoz-server` 4.0.0 — Ruby 4.0.7 host общего сетевого runtime: он управляет
+`skvoz-server` 5.0.0 — Ruby 4.0.7 host общего сетевого runtime: он управляет
 NATS 2.15.0, пользователями, устройствами и TLS. TCP-сокеты и полные IP-пакеты
-обслуживает `skvoz-network-runtime` 0.3.0, встраивающий Core 3.1.0
-(network 3, API 1). Привилегированные операции выполняет узкий Linux helper.
+обслуживает `skvoz-network-runtime` 0.4.0, встраивающий Core 4.0.0
+(network 4, API 1). Привилегированные операции выполняет узкий Linux helper.
 Одна реализация сервера принимает совместимые клиентские коннекторы независимо
 от их ОС и языка. [Общий контракт](network-runtime.md) определяет данные,
 локальное управление и владение FD.
@@ -287,7 +287,7 @@ ACL NATS каждой учётной записи разрешает тольк�
 | `address`, `advertised_port` | Внешний IP/DNS и внешний порт; порт по умолчанию равен `port`. |
 | `bind`, `port`, `monitor_port` | Брокер `0.0.0.0:4222`, мониторинг loopback:8222. |
 | `namespace` | `skvoz.application`; совпадает с постоянным состоянием. |
-| `runtime_binary`, `helper_binary`, `nats_binary` | Комплектные runtime 0.3.0, helper 0.3.0 и NATS 2.15.0. |
+| `runtime_binary`, `helper_binary`, `nats_binary` | Комплектные runtime 0.4.0, helper 0.4.0 и NATS 2.15.0. |
 | `max_identities`, `devices_per_user` | 128 и 8; конечные лимиты активных устройств. |
 | `admin_timeout`, `stop_timeout` | 5 и 8 секунд; административный запрос и остановка дочерних процессов. |
 | `allow`, `deny` | До 128 правил `{cidr,protocols,ports}`. |
@@ -379,10 +379,10 @@ TLS-материалов, а также материалы незавершён�
 
 ## Метаданные TCP и жизненный цикл
 
-Network metadata 2 различают `tcp`, `ip-session`, `ip-data`:
+Network metadata 4 различают `tcp`, `ip-session`, `ip-data`:
 
 ```json
-{"v":2,"type":"tcp","host":"example.org","port":443}
+{"v":4,"type":"tcp","host":"example.org","port":443}
 ```
 
 Проверку назначения, native connect, ACCEPT, partial SEND, CONSUME после записи
@@ -442,5 +442,5 @@ registry и только собственную cleanup. TLS/ACME проверя
 
 Брокер, runtime, enrollment и probes используют
 [общий профиль транспорта](nats-runtime.md#профиль-транспорта).
-Сервер 4.0.0 и Ubuntu 3.0.0 ожидают enrollment 2, network 3, API 1,
-runtime 0.3.0 и Core 3.1.0. Несовместимые комбинации явно отклоняются.
+Сервер 5.0.0 и Ubuntu 4.0.0 ожидают enrollment 2, network 4, API 1,
+runtime 0.4.0 и Core 4.0.0. Несовместимые комбинации явно отклоняются.

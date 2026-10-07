@@ -133,7 +133,7 @@ async fn network_initiator_rejects_unoffered_or_incomplete_required_config() {
                         .accept(
                             event.key,
                             &Accept::IpSession {
-                                v: 3,
+                                v: 4,
                                 session: grant.session.clone(),
                             }
                             .encode()
@@ -452,7 +452,7 @@ async fn network_admission_rejects_incompatible_remote_window_and_frame() {
             .open(
                 PeerId(0),
                 &Metadata::IpSession {
-                    v: 3,
+                    v: 4,
                     families: vec![4],
                     family_policy: skvoz_network::FamilyPolicy::RequireAll,
                     max_mtu: 1500,
@@ -482,7 +482,7 @@ async fn network_admission_rejects_incompatible_remote_window_and_frame() {
         let reason: serde_json::Value = serde_json::from_slice(&rejection).unwrap();
         assert_eq!(
             reason,
-            serde_json::json!({"v":3,"type":"ip-session","error":"invalid_request"})
+            serde_json::json!({"v":4,"type":"ip-session","error":"invalid_request"})
         );
         assert!(engine.sessions().is_empty());
         assert_eq!(engine.resources().streams, 0);
@@ -530,7 +530,7 @@ async fn network_initiator_closes_incompatible_accept_before_readiness() {
                     .accept(
                         event.key,
                         &Accept::IpSession {
-                            v: 3,
+                            v: 4,
                             session: "0123456789abcdef0123456789abcdef"
                                 .to_owned()
                                 .try_into()
@@ -600,7 +600,7 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
         .open(
             PeerId(0),
             &Metadata::IpSession {
-                v: 3,
+                v: 4,
                 families: vec![4],
                 family_policy: skvoz_network::FamilyPolicy::RequireAll,
                 max_mtu: 1500,
@@ -640,7 +640,7 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
                                         .open(
                                             PeerId(0),
                                             &Metadata::IpData {
-                                                v: 3,
+                                                v: 4,
                                                 session: config.session.clone(),
                                                 channel: 0,
                                             }

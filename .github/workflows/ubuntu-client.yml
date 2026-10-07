@@ -6,6 +6,7 @@ on:
     paths:
       - 'clients/ubuntu/**'
       - 'core/**'
+      - 'vendor/async-nats/**'
       - 'network/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -20,6 +21,7 @@ on:
     paths:
       - 'clients/ubuntu/**'
       - 'core/**'
+      - 'vendor/async-nats/**'
       - 'network/**'
       - 'Cargo.toml'
       - 'Cargo.lock'

@@ -249,7 +249,7 @@ impl Request {
         match self.op {
             Operation::Hello => {
                 let a: HelloArgs = arguments(&self.args)?;
-                if a.api != 1 || a.network != 3 {
+                if a.api != 1 || a.network != 4 {
                     return Err(NetworkError::UnsupportedVersion);
                 }
             }
@@ -445,7 +445,7 @@ impl HelperRequest {
         match self.op {
             HelperOperation::Hello => {
                 let a: HelloArgs = arguments(&self.args)?;
-                if a.api != 1 || a.network != 3 {
+                if a.api != 1 || a.network != 4 {
                     return Err(NetworkError::UnsupportedVersion);
                 }
             }

@@ -15,18 +15,25 @@ import threading
 import time
 
 
-def exact(sock, count):
+def exact(sock, count, progress=None):
     data = bytearray()
     while len(data) < count:
         part = sock.recv(count - len(data))
         if not part:
             raise EOFError('socket closed')
         data.extend(part)
+        if progress is not None:
+            progress['received_bytes'] = len(data)
     return bytes(data)
 
 
+# This profile covers the bounded parser, backend shadow and two small slots.
+# Rust startup tests verify the exact platform-dependent minimum and minimum-1.
+REDUCED_RUNTIME_BYTES = 32 * 1024 * 1024
+
+
 class Owner:
-    def __init__(self, binary, config, directory, peer):
+    def __init__(self, binary, config, directory, peer, *, network_version=4):
         self.lock = threading.Lock()
         self.responses = queue.Queue()
         self.events = {}
@@ -46,7 +53,7 @@ class Owner:
         child.close()
         threading.Thread(target=self.reader, daemon=True).start()
         try:
-            self.call('HELLO', {'api': 1, 'network': 3})
+            self.call('HELLO', {'api': 1, 'network': network_version})
             until = time.monotonic() + 30
             while time.monotonic() < until:
                 if self.events.get('RUNTIME_STATE', {}).get('state') == 'ready':
@@ -100,12 +107,12 @@ class Owner:
                 os.close(fd)
             self.responses.put((error, []))
 
-    def call(self, op, args=None):
+    def call(self, op, args=None, timeout=25):
         with self.lock:
             self.id += 1
             data = json.dumps({'v': 1, 'id': self.id, 'op': op, 'args': args or {}, 'fd_count': 0}).encode()
             self.socket.sendall(struct.pack('!I', len(data)) + data)
-            value, fds = self.responses.get(timeout=25)
+            value, fds = self.responses.get(timeout=timeout)
             if isinstance(value, Exception):
                 raise value
             assert value['id'] == self.id
@@ -252,22 +259,28 @@ def handshake(sock, kind, port):
             assert exact(sock, 10) == b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
 
 
-def exchange(sock, serial):
+def exchange(sock, serial, progress=None):
     payload = struct.pack('!Q', serial) + bytes(range(256)) * 4
     sock.sendall(payload)
-    assert exact(sock, len(payload)) == payload
+    if progress is not None:
+        progress.update(expected_bytes=len(payload), received_bytes=0)
+    assert exact(sock, len(payload), progress) == payload
 
 
-def short_http(owner, endpoints):
+def short_http(owner, endpoints, progress=None):
     port = int(endpoints['http'].rsplit(':',1)[1])
     with socket.create_connection(('127.0.0.1',port), timeout=20) as sock:
         sock.sendall(b'GET http://127.0.0.1:9003/ HTTP/1.1\r\n\r\n')
         response = bytearray()
+        if progress is not None:
+            progress['received_bytes'] = 0
         while True:
             data = sock.recv(4096)
             if not data:
                 break
             response.extend(data)
+            if progress is not None:
+                progress['received_bytes'] = len(response)
         assert bytes(response) == b'HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\ncapacity response'
 
 
@@ -291,7 +304,12 @@ def configuration(template, directory, nats, peer, baseline=False):
 
 def cgroup_memory():
     data = dict(line.split() for line in Path('/sys/fs/cgroup/memory.stat').read_text().splitlines())
-    return {key:int(data.get(key,0)) for key in ('anon','file','sock','kernel','kernel_stack','slab')}
+    events = dict(line.split() for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines())
+    assert int(events.get('oom', 0)) == 0 and int(events.get('oom_kill', 0)) == 0, ('cgroup OOM', events)
+    return {key:int(data.get(key,0)) for key in ('anon','file','sock','kernel','kernel_stack','slab')} | {
+        'current': int(Path('/sys/fs/cgroup/memory.current').read_text()),
+        'events': {key:int(value) for key,value in events.items()},
+    }
 
 
 def run(args):
@@ -320,8 +338,8 @@ def run(args):
             if args.reduced and peer > 0:
                 limits.update(core_streams=2,streams_per_peer=2,core_receive_bytes=131072,core_receive_peer_bytes=131072,
                     api_queue_bytes=34816,api_queue_records=6)
-                limits['runtime_buffer_bytes'] = 12592896 + 2*131072 + 2097152 + 524288 + 1081344 + 34816 + 6*256
-            owners.append(Owner(args.binary, config, directory, peer))
+                limits['runtime_buffer_bytes'] = REDUCED_RUNTIME_BYTES
+            owners.append(Owner(args.binary, config, directory, peer, network_version=3 if baseline else 4))
         endpoints = [owner.call('START_PROXY', {'http_bind': f'127.0.0.1:{10080+peer}', 'socks_bind': f'127.0.0.1:{11080+peer}'})[0] for peer, owner in enumerate(owners[1:])]
         report['samples'].append({'phase': 'before', 'runtime': [resource(o) for o in owners]})
         def capacity():

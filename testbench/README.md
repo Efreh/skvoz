@@ -144,4 +144,4 @@ NATS. Он доступен только в двух внутренних сет
 замеров скорости. Этот параметр нельзя сочетать с `--network-functional-only`.
 
 [Архитектура](../docs/architecture.md), [движок](../docs/stream-engine.md),
-[wire v1](../docs/wire.md), [NATS runtime](../docs/nats-runtime.md).
+[wire v2](../docs/wire.md), [NATS runtime](../docs/nats-runtime.md).

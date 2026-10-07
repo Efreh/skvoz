@@ -40,7 +40,7 @@ fn incoming_limits_are_known_before_accept_without_extracting_the_open() {
     stream.accept(b"").unwrap();
     assert_eq!(stream.peer_limits(), Some(limits));
     assert!(matches!(
-        stream.poll_frames(1).as_slice(),
+        stream.poll_frames(8).as_slice(),
         [Frame::Accept { .. }]
     ));
 }
@@ -51,7 +51,7 @@ fn outgoing_limits_wait_for_accept_and_preserve_small_valid_peer_send_policy() {
     stream.open(b"", 0).unwrap();
     assert_eq!(stream.peer_limits(), None);
     assert!(matches!(
-        stream.poll_frames(1).as_slice(),
+        stream.poll_frames(8).as_slice(),
         [Frame::Open { .. }]
     ));
     assert_eq!(stream.peer_limits(), None);
@@ -66,7 +66,7 @@ fn outgoing_limits_wait_for_accept_and_preserve_small_valid_peer_send_policy() {
     assert_eq!(stream.peer_limits(), Some(limits));
     assert_eq!(stream.snapshot(), before);
     assert!(
-        matches!(stream.poll_frames(1).as_slice(), [Frame::Data { offset: 0, bytes }] if bytes.as_ref() == b"a")
+        matches!(stream.poll_frames(8).as_slice(), [Frame::Data { offset: 0, bytes }] if bytes.as_ref() == b"a")
     );
     assert_eq!(stream.snapshot().send_unacknowledged_bytes, 1);
 }
@@ -85,7 +85,7 @@ fn invalid_open_and_accept_never_publish_unvalidated_limits() {
     assert_eq!(incoming.peer_limits(), None);
     let mut outgoing = Stream::new(Config::default()).unwrap();
     outgoing.open(b"", 0).unwrap();
-    outgoing.poll_frames(1);
+    outgoing.poll_frames(8);
     assert_eq!(
         outgoing.receive(&accept(invalid), 0),
         Err(Error::Protocol(ProtocolError::InvalidLimits))
@@ -123,7 +123,7 @@ fn manager_reports_only_the_requested_stream_without_ownership_changes() {
     assert_eq!(manager.resources(), resources);
     assert!(
         manager
-            .poll_frames(1)
+            .poll_frames(8)
             .iter()
             .any(|frame| frame.key == outgoing && matches!(frame.frame, Frame::Open { .. }))
     );

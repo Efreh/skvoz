@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{LinkedList, VecDeque};
 
 use crate::{
     CloseReason, Config, Direction, Error, Event, Frame, MAX_BATCH_EVENTS, MAX_FRAME_BYTES,
@@ -21,6 +21,12 @@ pub struct Stream {
     now_ms: u64,
     deadline_ms: Option<u64>,
     peer_window: u32,
+    peer_limit: u64,
+    peer_record_window: usize,
+    sent_ends: LinkedList<u64>,
+    received_ends: LinkedList<u64>,
+    local_window: u32,
+    receive_limit: u64,
     peer_max_frame: u32,
     sent: u64,
     dispatched: u64,
@@ -35,10 +41,11 @@ pub struct Stream {
     remote_finished_event: bool,
     closed_event: Option<CloseReason>,
     lifecycle_events: VecDeque<Event>,
-    received_bytes: VecDeque<u8>,
-    outgoing_data: VecDeque<Frame>,
+    received_bytes: LinkedList<Box<[u8]>>,
+    outgoing_data: LinkedList<Frame>,
     handshake_frame: Option<Frame>,
     credit_frame: Option<u64>,
+    grant_frame: Option<(u64, u64)>,
     fin_frame: Option<u64>,
     terminal_frame: Option<Frame>,
 }
@@ -52,6 +59,12 @@ impl Stream {
             now_ms: 0,
             deadline_ms: None,
             peer_window: 0,
+            peer_limit: 0,
+            peer_record_window: 0,
+            sent_ends: LinkedList::new(),
+            received_ends: LinkedList::new(),
+            local_window: config.receive_window,
+            receive_limit: config.receive_window as u64,
             peer_max_frame: 0,
             sent: 0,
             dispatched: 0,
@@ -66,13 +79,62 @@ impl Stream {
             remote_finished_event: false,
             closed_event: None,
             lifecycle_events: VecDeque::new(),
-            received_bytes: VecDeque::new(),
-            outgoing_data: VecDeque::new(),
+            received_bytes: LinkedList::new(),
+            outgoing_data: LinkedList::new(),
             handshake_frame: None,
             credit_frame: None,
+            grant_frame: None,
             fin_frame: None,
             terminal_frame: None,
         })
+    }
+
+    fn record_window(window: u32, frame: u32) -> usize {
+        (window as usize / frame as usize)
+            .saturating_add(64)
+            .min(65536)
+    }
+    pub(crate) fn receive_window(&self) -> u32 {
+        self.local_window
+    }
+    pub(crate) fn receive_record_window(&self) -> usize {
+        Self::record_window(self.local_window, self.config.max_frame)
+    }
+    pub(crate) fn send_unacknowledged_bytes(&self) -> u64 {
+        self.sent - self.peer_consumed
+    }
+    pub(crate) fn credit_blocked(&self) -> bool {
+        self.sent == self.peer_limit || self.sent_ends.len() >= self.peer_record_window
+    }
+    fn acknowledge_peer(&mut self, consumed: u64) {
+        self.peer_consumed = self.peer_consumed.max(consumed);
+        while self
+            .sent_ends
+            .front()
+            .is_some_and(|end| *end <= self.peer_consumed)
+        {
+            self.sent_ends.pop_front();
+        }
+    }
+
+    pub(crate) fn initial_receive_window(&mut self, window: u32) {
+        assert_eq!(self.phase, Phase::Idle);
+        self.local_window = window.min(self.config.receive_window);
+        self.receive_limit = self.local_window as u64;
+    }
+
+    pub(crate) fn grant_receive_window(&mut self, window: u32, probe: u64) -> Result<(), Error> {
+        if window > self.config.receive_window {
+            return Err(Error::InvalidConfig("invalid receive grant"));
+        }
+        self.local_window = self.local_window.max(window);
+        let limit = self
+            .consumed
+            .checked_add(self.local_window as u64)
+            .ok_or(Error::OffsetExhausted)?;
+        self.receive_limit = self.receive_limit.max(limit);
+        self.grant_frame = Some((self.receive_limit, probe));
+        Ok(())
     }
 
     pub fn state(&self) -> State {
@@ -127,8 +189,8 @@ impl Stream {
                     _ => 0,
                 })
                 .sum(),
-            buffered_receive_bytes: self.received_bytes.len(),
-            receive_capacity_bytes: self.received_bytes.capacity(),
+            buffered_receive_bytes: (self.received - self.delivered) as usize,
+            receive_capacity_bytes: (self.received - self.delivered) as usize,
             receive_unconsumed_bytes: self.received - self.consumed,
             send_unacknowledged_bytes: self.sent - self.peer_consumed,
             retained_metadata_bytes: frame_metadata + terminal_metadata + event_metadata,
@@ -145,7 +207,7 @@ impl Stream {
         self.deadline_ms = Some(deadline);
         self.phase = Phase::Opening(Direction::Outgoing);
         self.handshake_frame = Some(Frame::Open {
-            receive_window: self.config.receive_window,
+            receive_window: self.local_window,
             max_frame: self.config.max_frame,
             metadata: metadata.into(),
         });
@@ -160,7 +222,7 @@ impl Stream {
         self.phase = Phase::Established;
         self.deadline_ms = None;
         self.handshake_frame = Some(Frame::Accept {
-            receive_window: self.config.receive_window,
+            receive_window: self.local_window,
             max_frame: self.config.max_frame,
             metadata: metadata.into(),
         });
@@ -211,6 +273,7 @@ impl Stream {
             bytes: bytes[..count].into(),
         });
         self.sent = next;
+        self.sent_ends.push_back(next);
         Ok(SendOutcome::Accepted(count))
     }
 
@@ -240,6 +303,12 @@ impl Stream {
         }
         if offset > self.consumed {
             self.consumed = offset;
+            while self.received_ends.front().is_some_and(|end| *end <= offset) {
+                self.received_ends.pop_front();
+            }
+            self.receive_limit = self
+                .receive_limit
+                .max(offset.saturating_add(self.local_window as u64));
             self.credit_frame = Some(offset);
             self.maybe_complete();
         }
@@ -322,13 +391,9 @@ impl Stream {
                 self.writable_event = false;
                 Event::Writable
             } else if !self.received_bytes.is_empty() {
-                let count = self
-                    .received_bytes
-                    .len()
-                    .min(self.config.max_frame as usize);
-                let bytes = self.received_bytes.drain(..count).collect();
+                let bytes = self.received_bytes.pop_front().unwrap();
                 let offset = self.delivered;
-                self.delivered += count as u64;
+                self.delivered += bytes.len() as u64;
                 Event::Data { offset, bytes }
             } else if self.remote_finished_event {
                 self.remote_finished_event = false;
@@ -343,10 +408,22 @@ impl Stream {
         events
     }
 
+    pub(crate) fn retained_send_records(&self) -> usize {
+        self.sent_ends.len()
+    }
+    pub(crate) fn next_event_data_bytes(&self) -> Option<usize> {
+        if self.lifecycle_events.is_empty() && !self.writable_event {
+            self.received_bytes.front().map(|bytes| bytes.len())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn has_frames(&self) -> bool {
         self.terminal_frame.is_some()
             || self.handshake_frame.is_some()
             || self.credit_frame.is_some()
+            || self.grant_frame.is_some()
             || !self.outgoing_data.is_empty()
             || self.fin_frame.is_some()
     }
@@ -385,6 +462,8 @@ impl Stream {
                     .opening_deadline(self.now_ms)
                     .map_err(|_| ProtocolError::InvalidLimits)?;
                 self.peer_window = *receive_window;
+                self.peer_limit = *receive_window as u64;
+                self.peer_record_window = Self::record_window(*receive_window, *max_frame);
                 self.peer_max_frame = *max_frame;
                 self.phase = Phase::Opening(Direction::Incoming);
                 self.deadline_ms = Some(deadline);
@@ -404,6 +483,8 @@ impl Stream {
                 }
                 self.check_peer_limits(*receive_window, *max_frame, metadata)?;
                 self.peer_window = *receive_window;
+                self.peer_limit = *receive_window as u64;
+                self.peer_record_window = Self::record_window(*receive_window, *max_frame);
                 self.peer_max_frame = *max_frame;
                 self.phase = Phase::Established;
                 self.deadline_ms = None;
@@ -440,18 +521,14 @@ impl Stream {
                     .received
                     .checked_add(bytes.len() as u64)
                     .ok_or(ProtocolError::IncorrectOffset)?;
-                if next - self.consumed > self.config.receive_window as u64 {
+                if next > self.receive_limit
+                    || self.received_ends.len()
+                        >= Self::record_window(self.local_window, self.config.max_frame)
+                {
                     return Err(ProtocolError::ReceiveWindowExceeded);
                 }
-                let required = self.received_bytes.len() + bytes.len();
-                if required > self.received_bytes.capacity() {
-                    let target = required
-                        .max(self.received_bytes.capacity().saturating_mul(2))
-                        .min(self.config.receive_window as usize);
-                    self.received_bytes
-                        .reserve_exact(target - self.received_bytes.len());
-                }
-                self.received_bytes.extend(bytes.iter().copied());
+                self.received_bytes.push_back(bytes.clone());
+                self.received_ends.push_back(next);
                 self.received = next;
             }
             Frame::WindowUpdate { consumed } => {
@@ -459,8 +536,36 @@ impl Stream {
                 if *consumed > self.dispatched {
                     return Err(ProtocolError::InvalidCredit);
                 }
-                self.peer_consumed = self.peer_consumed.max(*consumed);
+                self.acknowledge_peer(*consumed);
+                self.peer_limit = self
+                    .peer_limit
+                    .max(consumed.saturating_add(self.peer_window as u64));
                 self.notify_writable();
+            }
+            Frame::WindowGrant {
+                consumed, limit, ..
+            } => {
+                self.require_established()?;
+                if *consumed > self.dispatched
+                    || *limit < *consumed
+                    || limit - consumed > MAX_RECEIVE_WINDOW as u64
+                    || *limit < self.sent
+                {
+                    return Err(ProtocolError::InvalidCredit);
+                }
+                self.acknowledge_peer(*consumed);
+                self.peer_limit = self.peer_limit.max(*limit);
+                self.peer_record_window = self.peer_record_window.max(Self::record_window(
+                    (limit - consumed) as u32,
+                    self.peer_max_frame,
+                ));
+                self.notify_writable();
+            }
+            Frame::PeerGrant { .. }
+            | Frame::PeerRequest { .. }
+            | Frame::PeerFreeze { .. }
+            | Frame::PeerFrozen { .. } => {
+                return Err(ProtocolError::UnexpectedFrame);
             }
             Frame::Fin { final_offset } => {
                 self.require_established()?;
@@ -486,12 +591,50 @@ impl Stream {
         Ok(())
     }
 
+    pub(crate) fn next_frame_size(&self) -> Option<(usize, bool)> {
+        let describe = |frame: &Frame| {
+            crate::wire::encoded_size(2, frame)
+                .ok()
+                .map(|size| (size, matches!(frame, Frame::Data { .. })))
+        };
+        if let Some(frame) = self
+            .terminal_frame
+            .as_ref()
+            .or(self.handshake_frame.as_ref())
+        {
+            return describe(frame);
+        }
+        if let Some((limit, probe)) = self.grant_frame {
+            return describe(&Frame::WindowGrant {
+                consumed: self.consumed,
+                limit,
+                probe,
+            });
+        }
+        if let Some(consumed) = self.credit_frame {
+            return describe(&Frame::WindowUpdate { consumed });
+        }
+        if let Some(frame) = self.outgoing_data.front() {
+            return describe(frame);
+        }
+        self.fin_frame
+            .and_then(|final_offset| describe(&Frame::Fin { final_offset }))
+    }
     fn next_frame(&mut self) -> Option<Frame> {
         if let Some(frame) = self.terminal_frame.take() {
             return Some(frame);
         }
         if let Some(frame) = self.handshake_frame.take() {
             return Some(frame);
+        }
+        if let Some((limit, probe)) = self.grant_frame.take() {
+            self.credit_frame = None;
+            self.grant_frame = None;
+            return Some(Frame::WindowGrant {
+                consumed: self.consumed,
+                limit,
+                probe,
+            });
         }
         if let Some(consumed) = self.credit_frame.take() {
             return Some(Frame::WindowUpdate { consumed });
@@ -511,13 +654,14 @@ impl Stream {
     }
 
     fn available_credit(&self) -> u64 {
-        self.peer_window as u64 - (self.sent - self.peer_consumed)
+        self.peer_limit.saturating_sub(self.sent)
     }
 
     fn can_send(&self) -> bool {
         self.phase == Phase::Established
             && !self.local_finished
             && self.outgoing_data.len() < self.config.max_pending_frames
+            && self.sent_ends.len() < self.peer_record_window
             && self.available_credit() > 0
     }
 
@@ -538,21 +682,27 @@ impl Stream {
         {
             self.phase = Phase::Closed;
             self.credit_frame = None;
+            self.grant_frame = None;
             self.writable_event = false;
             self.closed_event = Some(CloseReason::Finished);
-            self.received_bytes = VecDeque::new();
-            self.outgoing_data = VecDeque::new();
+            self.received_bytes = LinkedList::new();
+            self.received_ends.clear();
+            self.sent_ends.clear();
+            self.outgoing_data = LinkedList::new();
         }
     }
 
     fn abort(&mut self, reason: CloseReason, frame: Option<Frame>) {
         self.phase = Phase::Closed;
         self.deadline_ms = None;
-        self.received_bytes = VecDeque::new();
-        self.outgoing_data = VecDeque::new();
+        self.received_bytes = LinkedList::new();
+        self.received_ends.clear();
+        self.sent_ends.clear();
+        self.outgoing_data = LinkedList::new();
         self.lifecycle_events = VecDeque::new();
         self.handshake_frame = None;
         self.credit_frame = None;
+        self.grant_frame = None;
         self.fin_frame = None;
         self.terminal_frame = frame;
         self.blocked = false;
@@ -614,10 +764,56 @@ impl Stream {
 mod boundary_tests {
     use super::*;
 
+    #[test]
+    fn standalone_tiny_data_records_remain_bounded_after_event_transfer() {
+        let config = Config {
+            receive_window: MAX_RECEIVE_WINDOW,
+            ..Config::default()
+        };
+        let mut a = Stream::new(config).unwrap();
+        let mut b = Stream::new(config).unwrap();
+        a.open(b"", 0).unwrap();
+        b.receive(&a.poll_frames(1).pop().unwrap(), 0).unwrap();
+        b.accept(b"").unwrap();
+        a.receive(&b.poll_frames(1).pop().unwrap(), 0).unwrap();
+        a.poll_events(8);
+        b.poll_events(8);
+        let records = Stream::record_window(config.receive_window, config.max_frame);
+        for _ in 0..records {
+            assert_eq!(a.send(b"x"), Ok(SendOutcome::Accepted(1)));
+            b.receive(&a.poll_frames(1).pop().unwrap(), 0).unwrap();
+        }
+        assert_eq!(a.send(b"x"), Ok(SendOutcome::WouldBlock));
+        assert_eq!(a.sent_ends.len(), records);
+        assert_eq!(b.received_ends.len(), records);
+        let mut delivered = 0;
+        while delivered < records {
+            for event in b.poll_events(256) {
+                if let Event::Data { offset, bytes } = event {
+                    assert_eq!(offset, delivered as u64);
+                    assert_eq!(&*bytes, b"x");
+                    delivered += bytes.len();
+                }
+            }
+        }
+        assert_eq!(b.snapshot().receive_capacity_bytes, 0);
+        assert_eq!(b.received_ends.len(), records);
+        assert_eq!(a.send(b"x"), Ok(SendOutcome::WouldBlock));
+        b.consume_through(delivered as u64).unwrap();
+        a.receive(&b.poll_frames(1).pop().unwrap(), 0).unwrap();
+        assert!(a.sent_ends.is_empty());
+        assert!(b.received_ends.is_empty());
+        assert_eq!(a.send(b"x"), Ok(SendOutcome::Accepted(1)));
+    }
+
     fn near_offset_limit() -> Stream {
         let mut stream = Stream::new(Config::default()).unwrap();
         stream.phase = Phase::Established;
         stream.peer_window = stream.config.receive_window;
+        stream.peer_limit = u64::MAX;
+        stream.peer_record_window =
+            Stream::record_window(stream.config.receive_window, stream.config.max_frame);
+        stream.receive_limit = u64::MAX;
         stream.peer_max_frame = stream.config.max_frame;
         stream.sent = u64::MAX - 1;
         stream.dispatched = u64::MAX - 1;
@@ -629,13 +825,12 @@ mod boundary_tests {
     }
 
     #[test]
-    fn send_offset_exhaustion_is_atomic() {
+    fn send_offset_boundary_accepts_only_the_credit_limited_prefix() {
         let mut stream = near_offset_limit();
+        assert_eq!(stream.send(b"ab"), Ok(SendOutcome::Accepted(1)));
         let before = stream.snapshot();
-        assert_eq!(stream.send(b"ab"), Err(Error::OffsetExhausted));
+        assert_eq!(stream.send(b"b"), Ok(SendOutcome::WouldBlock));
         assert_eq!(stream.snapshot(), before);
-        assert!(stream.poll_frames(1).is_empty());
-        assert_eq!(stream.send(b"a"), Ok(SendOutcome::Accepted(1)));
         stream.finish().unwrap();
         assert_eq!(
             stream.poll_frames(8),

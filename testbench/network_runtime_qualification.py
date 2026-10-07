@@ -110,6 +110,11 @@ def qualify(root, settings, certificate_factory):
 
     def save_logs():
         for role in roles:
+            if role in ('server','client'):
+                try:
+                    (OUT/(role+'-diagnostics.json')).write_text(json.dumps(api(role,'diagnostics'),indent=2))
+                except Exception as error:
+                    (OUT/(role+'-diagnostics.json')).write_text(json.dumps({'error':str(error)}))
             copied = subprocess.run(['docker','cp',roles[role]+':/run/skvoz-joint','-'],capture_output=True)
             if copied.returncode == 0:
                 with tarfile.open(fileobj=io.BytesIO(copied.stdout)) as tar:
@@ -391,7 +396,7 @@ def qualify(root, settings, certificate_factory):
             destination=settings.report_directory.resolve()
             destination.mkdir(mode=0o700,parents=True,exist_ok=True)
             destination.chmod(0o700)
-            snapshot_names={f'{role}-{label}.json' for role in ('server','client') for label in ('nft','nft-terse','links','routes4','routes6')}
+            snapshot_names={f'{role}-{label}.json' for role in ('server','client') for label in ('nft','nft-terse','links','routes4','routes6','diagnostics')}
             for path in OUT.rglob('*'):
                 if path.is_file() and (path.suffix=='.log' or path.name=='report.json' or path.name in snapshot_names):
                     relative=path.relative_to(OUT)

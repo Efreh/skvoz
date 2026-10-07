@@ -1,6 +1,6 @@
 # Core daemon и локальный IPC v1
 
-Этот контракт описывает runnable Linux executable `skvoz-core-daemon`1.4.0.
+Этот контракт описывает runnable Linux executable `skvoz-core-daemon`2.0.0.
 Он встраивает ту же [универсальную Core library/NatsRuntime](nats-runtime.md),
 которую можно использовать из Rust. Python/Ruby/другие host languages общаются
 через pathname Unix socket; отдельного client/server Core или native bindings нет.
@@ -274,12 +274,12 @@ sequenceDiagram
 | peers | 128 | 1..512 |
 | streams | 1024 | 1..8192 |
 | streams_per_peer | 128 | 1..8192 |
-| receive_window | 8192 | 1..1048576 |
+| receive_window | 8192 | 1..33554432, фактический grant ограничен byte budget |
 | max_frame | 1024 | 1..32768 and <=receive_window |
 | pending_frames | 8 | 1..64 |
 | open_timeout_ms | 5000 | 100..60000 |
-| receive_bytes | 8388608 | 1..536870912, >=receive_window |
-| receive_bytes_per_peer | 1048576 | 1..67108864, >=receive_window |
+| receive_bytes | 8388608 | 1..536870912, aggregate backing |
+| receive_bytes_per_peer | 1048576 | 1..67108864, aggregate peer backing |
 | send_bytes | 2097152 | 1..67108864 |
 | send_bytes_per_peer | 262144 | 1..8388608 |
 | shards | 8 | 1..32, same profile across peers |

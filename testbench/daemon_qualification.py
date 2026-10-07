@@ -122,6 +122,12 @@ class Daemon:
 def ready_client(path):
     c = Client(str(path))
     wait_until(lambda: c.request(11, payload=struct.pack('!Q', 0))[3] == b'\1')
+    c.idle_receive_backing = c.status()[6]
+    limits = json.loads((Path(path).parent / 'profile.json').read_text()).get('limits', {})
+    c.receive_budget = limits.get('receive_bytes', 8 * 1024 * 1024)
+    c.receive_peer_budget = limits.get('receive_bytes_per_peer', 1024 * 1024)
+    c.initial_peer_credit = min(limits.get('receive_window', 8192), 65536,
+        max(1, c.receive_budget // limits.get('peers', 128) // 8), c.receive_peer_budget)
     return c
 
 
@@ -173,8 +179,22 @@ def exchange(client, message, half_close=True):
     raise TimeoutError('exchange deadline')
 
 
+def bounded_peer_backing(client, status):
+    if not status[8]:
+        return status[6] == 0
+    return client.initial_peer_credit * status[8] <= status[6] <= min(
+        client.receive_budget, client.receive_peer_budget * status[8])
+
+
 def assert_clean(client):
-    wait_until(lambda: client.status()[5:8] == (0, 0, 0))
+    def clean():
+        status = client.status()
+        # STATUS: lifecycle, owners, bindings, queued records/bytes, streams,
+        # peer receive backing, pending SEND bytes, active peers, membership,
+        # connections, shard failures and peer timeouts. Live idle peers retain
+        # their initially advertised credit independently of stream ownership.
+        return status[2:6] == (0, 0, 0, 0) and status[7] == 0 and bounded_peer_backing(client, status)
+    wait_until(clean)
 
 
 def failed_start(binary, directory, profile, overrides=None, mode='--config', permissions=0o600, expected=2):
@@ -260,7 +280,7 @@ def qualify(root, directory, env, args):
         assert a.request(5, open_stream(a), b'')[0] == 0
         a.close()
         clients.remove(a)
-        wait_until(lambda: b.status()[5:8] == (0, 0, 0))
+        assert_clean(b)
         report['checks'].append('active owner EOF releases reservations')
         # A client cannot guess consumption before DATA has been fully written.
         slow = ready_client(one.path)
@@ -421,7 +441,11 @@ def qualify(root, directory, env, args):
         fire = open_stream(bad, b'fire')
         assert bad.request(2, payload=struct.pack('!Q', 0) + b'overflow')[0] == 5
         assert bad.request(5, fire, b'trigger')[0] == 0
-        wait_until(lambda: healthy.status()[1] == 1 and healthy.status()[5:8] == (1, 8192, 0))
+        def bad_owner_released():
+            status = healthy.status()
+            return status[1] == 1 and status[2] == 1 and status[5] == 1 and status[7] == 0 \
+                and bounded_peer_backing(healthy, status)
+        wait_until(bad_owner_released)
         assert healthy.request(5, live, b'healthy-tiny-after')[0] == 0
         while True:
             kind, _, key, payload = healthy.event()

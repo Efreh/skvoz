@@ -111,7 +111,7 @@ def spawn_runtime(helper=None):
     proc = child((DROP if os.getuid() == 0 else []) + argv, descriptors, 'runtime.log')
     right.close()
     channel = Channel(left)
-    channel.call('HELLO', {'api':1, 'network':3})
+    channel.call('HELLO', {'api':1, 'network':4})
     while channel.event('RUNTIME_STATE')['state'] != 'ready':
         if proc.poll() is not None:
             raise RuntimeError('runtime exited')
@@ -125,7 +125,7 @@ def client_helper():
     peer = socket.socket(socket.AF_UNIX)
     peer.connect('/run/skvoz-network-helper/10001/control.sock')
     channel = Channel(peer)
-    channel.call('HELLO', {'api':1, 'network':3})
+    channel.call('HELLO', {'api':1, 'network':4})
     recovered, _ = channel.call('RECOVER')
     return channel, recovered
 
@@ -184,6 +184,9 @@ def serve(role):
                     result, _ = helper.call('RESTORE_CLIENT', {'handle':handle, 'reason':'user_stop'})
                 elif op == 'status':
                     result, _ = runtime.call('STATUS')
+                elif op == 'diagnostics':
+                    result, _ = runtime.call('STATUS')
+                    result = {'status': result, 'events': runtime.events}
                 elif op == 'kill':
                     proc.kill()
                     proc.wait(timeout=5)

@@ -2,7 +2,7 @@ use crate::{IpPrefix, NetworkError};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, net::IpAddr};
 
-pub const NETWORK_VERSION: u8 = 3;
+pub const NETWORK_VERSION: u8 = 4;
 pub const METADATA_MAX: usize = 512;
 pub const CONTROL_MAX: usize = 16384;
 pub const RECORD_HEADER: usize = 8;
@@ -485,6 +485,9 @@ impl RecordParser {
         self.bytes.extend(bytes);
         self.header()?;
         Ok(())
+    }
+    pub(crate) fn available_bytes(&self) -> usize {
+        self.capacity - self.bytes.len()
     }
     fn header(&self) -> Result<Option<(u8, usize)>, NetworkError> {
         if self.bytes.len() < 8 {

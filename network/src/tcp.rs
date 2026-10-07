@@ -82,6 +82,8 @@ pub(crate) struct TcpConnection {
     send_cursor: usize,
     receive: VecDeque<WritePending>,
     receive_bytes: usize,
+    receive_limit: usize,
+    record_limit: usize,
     local_eof: bool,
     finished: bool,
     remote_eof: bool,
@@ -101,15 +103,20 @@ pub(crate) struct TcpConnection {
     budget: Budget,
     _reservation: Reservation,
 }
+pub(crate) struct DataFailure {
+    pub event: Event,
+    pub error: Option<NetworkError>,
+}
 impl TcpConnection {
     pub fn new(
         key: RuntimeKey,
         socket: Socket,
         budget: &Budget,
         initial: Vec<u8>,
+        limits: skvoz_core::ManagerConfig,
     ) -> Result<Self, NetworkError> {
         let reservation = budget.reserve(4096 + initial.capacity(), 4)?;
-        Self::with_reservation(key, socket, budget, initial, reservation)
+        Self::with_reservation(key, socket, budget, initial, limits, reservation)
             .map_err(|failure| failure.error)
     }
     pub fn with_reservation(
@@ -117,13 +124,14 @@ impl TcpConnection {
         socket: Socket,
         budget: &Budget,
         initial: Vec<u8>,
+        limits: skvoz_core::ManagerConfig,
         mut reservation: Reservation,
     ) -> Result<Self, SetupFailure> {
-        let fd = match &socket {
-            Socket::Tcp(s) => s.as_fd(),
-            Socket::Unix(s) => s.as_fd(),
-        };
-        if skvoz_network_native::configure_socket_buffers(fd, 131072).is_err() {
+        // Explicit TCP buffer sizes disable Linux autotuning. Local Unix
+        // sockets retain a bounded queue; TCP uses the kernel's active policy.
+        if let Socket::Unix(stream) = &socket
+            && skvoz_network_native::configure_socket_buffers(stream.as_fd(), 131072).is_err()
+        {
             return Err(SetupFailure {
                 error: NetworkError::InvalidState,
                 socket,
@@ -152,6 +160,10 @@ impl TcpConnection {
             send_cursor: 0,
             receive: VecDeque::new(),
             receive_bytes: 0,
+            receive_limit: limits
+                .receive_budget_per_peer
+                .min(limits.stream.receive_window as usize),
+            record_limit: limits.receive_records_per_peer(),
             local_eof: false,
             finished: false,
             remote_eof: false,
@@ -187,35 +199,9 @@ impl TcpConnection {
                     self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
                 }
             }
-            Event::Data { offset, bytes } => {
-                if self.remote_eof
-                    || self.receive.len() >= 128
-                    || self
-                        .receive_bytes
-                        .checked_add(bytes.len())
-                        .is_none_or(|n| n > 65536)
-                {
-                    return Err(NetworkError::Overloaded);
-                }
-                if self.receive.len() == self.receive.capacity() {
-                    let target = (self.receive.capacity().max(2) * 2).min(128);
-                    self._reservation.resize(
-                        4096 + self.send.capacity() + target * std::mem::size_of::<WritePending>(),
-                        4,
-                    )?;
-                    self.receive.reserve_exact(target - self.receive.len());
-                    self.account_capacity()?;
-                }
-                let reservation = self.budget.reserve(0, 1)?;
-                self.receive_bytes += bytes.len();
-                self.receive.push_back(WritePending {
-                    _reservation: reservation,
-                    bytes,
-                    cursor: 0,
-                    offset,
-                });
-                self.write_deadline
-                    .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
+            event @ Event::Data { .. } => {
+                self.try_data(event)
+                    .map_err(|failure| failure.error.unwrap_or(NetworkError::Overloaded))?;
             }
             Event::RemoteFinished => self.remote_eof = true,
             Event::Closed {
@@ -246,6 +232,73 @@ impl TcpConnection {
             Event::IncomingOpen { .. } => return Err(NetworkError::InvalidState),
         }
         Ok(true)
+    }
+    /// Shared-budget exhaustion retains the original event for an ordered retry.
+    /// Every reservation is atomic; an availability snapshot is not sufficient.
+    pub(crate) fn try_data(&mut self, event: Event) -> Result<(), DataFailure> {
+        let Event::Data { offset, bytes } = event else {
+            return Err(DataFailure {
+                event,
+                error: Some(NetworkError::InvalidState),
+            });
+        };
+        let failure = |bytes, error| DataFailure {
+            event: Event::Data { offset, bytes },
+            error,
+        };
+        if self.remote_eof
+            || self.receive.len() >= self.record_limit
+            || self
+                .receive_bytes
+                .checked_add(bytes.len())
+                .is_none_or(|n| n > self.receive_limit)
+        {
+            return Err(failure(bytes, Some(NetworkError::Overloaded)));
+        }
+        let reservation = match self.budget.reserve(bytes.len(), 1) {
+            Ok(reservation) => reservation,
+            Err(_) => return Err(failure(bytes, None)),
+        };
+        if self.receive.len() == self.receive.capacity() {
+            let target = (self.receive.capacity().max(2) * 2).min(self.record_limit);
+            let old_capacity = self.receive.capacity();
+            let base = 4096 + self.send.capacity();
+            let node = std::mem::size_of::<WritePending>();
+            // Charge both old and replacement arrays during ownership transfer.
+            if self
+                ._reservation
+                .resize(base + (old_capacity + target) * node, 4)
+                .is_err()
+            {
+                return Err(failure(bytes, None));
+            }
+            let mut replacement = VecDeque::with_capacity(target);
+            if replacement.capacity() > target
+                && self
+                    ._reservation
+                    .resize(base + (old_capacity + replacement.capacity()) * node, 4)
+                    .is_err()
+            {
+                drop(replacement);
+                // Keeping a conservative reservation is safe and retryable.
+                return Err(failure(bytes, None));
+            }
+            replacement.append(&mut self.receive);
+            self.receive = replacement;
+            if let Err(error) = self.account_capacity() {
+                return Err(failure(bytes, Some(error)));
+            }
+        }
+        self.receive_bytes += bytes.len();
+        self.receive.push_back(WritePending {
+            _reservation: reservation,
+            bytes,
+            cursor: 0,
+            offset,
+        });
+        self.write_deadline
+            .get_or_insert_with(|| Instant::now() + Duration::from_secs(30));
+        Ok(())
     }
     pub fn turn(&mut self, engine: &mut NetworkEngine) -> Result<(), NetworkError> {
         self.turn_port(engine)
@@ -297,16 +350,16 @@ impl TcpConnection {
                     receive_limit -= n;
                     self.downloaded = self.downloaded.saturating_add(n as u64);
                     engine.account(self.key.stream.peer, 0, n, 1);
-                    let consumed = front
-                        .offset
-                        .checked_add(front.cursor as u64)
-                        .ok_or(NetworkError::InvalidState)?;
-                    // Only this completed native write can grant remote credit.
-                    if !self.core_closed {
-                        engine.consume(self.key, consumed)?;
-                    }
                     self.write_deadline = Some(Instant::now() + Duration::from_secs(30));
                     if front.cursor == front.bytes.len() {
+                        let consumed = front
+                            .offset
+                            .checked_add(front.bytes.len() as u64)
+                            .ok_or(NetworkError::InvalidState)?;
+                        // Retain byte and record promises until the entire owned chunk is released.
+                        if !self.core_closed {
+                            engine.consume(self.key, consumed)?;
+                        }
                         self.receive.pop_front();
                     }
                 }
@@ -516,6 +569,8 @@ mod tests {
             Socket::Unix(a),
             &Budget::new(1_000_000, 256),
             initial,
+            crate::config::Limits::canonical(crate::config::Role::Client)
+                .manager(crate::config::Role::Client),
         )
         .unwrap();
         c.opened = true;
@@ -544,7 +599,15 @@ mod tests {
             let (a, b) = UnixStream::pair().unwrap();
             a.set_nonblocking(true).unwrap();
             b.set_nonblocking(true).unwrap();
-            let mut c = TcpConnection::new(key(), Socket::Unix(a), &budget, Vec::new()).unwrap();
+            let mut c = TcpConnection::new(
+                key(),
+                Socket::Unix(a),
+                &budget,
+                Vec::new(),
+                crate::config::Limits::canonical(crate::config::Role::Client)
+                    .manager(crate::config::Role::Client),
+            )
+            .unwrap();
             c.opened = true;
             (c, b)
         };
@@ -595,7 +658,7 @@ mod tests {
         assert!(
             connection
                 .event(Event::Rejected {
-                    reason: br#"{"v":3,"type":"tcp","error":"forbidden"}"#
+                    reason: br#"{"v":4,"type":"tcp","error":"forbidden"}"#
                         .to_vec()
                         .into_boxed_slice(),
                 })
@@ -629,6 +692,151 @@ mod tests {
         assert_eq!(port.sent, initial);
         assert_eq!(c.uploaded, 241);
         assert!(port.finished);
+    }
+    #[test]
+    fn actual_shared_budget_shortage_preserves_box_for_exact_retry_and_fin() {
+        let (mut old, _stalled) = pair(Vec::new());
+        let budget = old.budget.clone();
+        old.event(Event::Data {
+            offset: 0,
+            bytes: vec![7; 65536].into(),
+        })
+        .unwrap();
+        let mut old_port = port();
+        old.turn_port(&mut old_port).unwrap();
+        assert!(old.downloaded > 0 && old.downloaded < 65536);
+        let (socket, mut owner) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        owner.set_nonblocking(true).unwrap();
+        let mut next = TcpConnection::new(
+            key(),
+            Socket::Unix(socket),
+            &budget,
+            Vec::new(),
+            crate::config::Limits::canonical(crate::config::Role::Client)
+                .manager(crate::config::Role::Client),
+        )
+        .unwrap();
+        next.opened = true;
+        let expected = (0..4093).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        let payload: Box<[u8]> = expected.clone().into();
+        let pointer = payload.as_ptr();
+        let mut event = Event::Data {
+            offset: 0,
+            bytes: payload,
+        };
+        // An observed free budget can be occupied before the atomic reserve.
+        assert!(budget.available().bytes > expected.len());
+        let blocker = budget.reserve(budget.available().bytes, 1).unwrap();
+        for _ in 0..2 {
+            let failure = next
+                .try_data(event)
+                .expect_err("actual reservation must fail");
+            assert!(failure.error.is_none());
+            event = failure.event;
+            let Event::Data { bytes, .. } = &event else {
+                panic!("original DATA required")
+            };
+            assert_eq!(bytes.as_ptr(), pointer);
+            assert_eq!(bytes.as_ref(), expected);
+            assert!(next.receive.is_empty());
+        }
+        assert!(
+            !old.event(Event::Closed {
+                reason: skvoz_core::CloseReason::Cancelled
+            })
+            .unwrap()
+        );
+        drop(old);
+        drop(blocker);
+        assert!(next.try_data(event).is_ok());
+        next.event(Event::RemoteFinished).unwrap();
+        owner.shutdown(Shutdown::Write).unwrap();
+        let mut out = Vec::new();
+        let mut p = port();
+        for _ in 0..8 {
+            p.used = (0, 0);
+            next.turn_port(&mut p).unwrap();
+            let mut buffer = [0; 8192];
+            match owner.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert_eq!(out, expected);
+        assert_eq!(p.consumed, [4093]);
+        assert!(next.write_shutdown);
+        assert!(p.finished);
+        drop(next);
+        assert_eq!(budget.usage(), crate::budget::Usage::default());
+    }
+    #[test]
+    fn partial_write_and_terminal_host_retention_keep_the_full_payload_charged() {
+        let (mut connection, _owner) = pair(Vec::new());
+        let budget = connection.budget.clone();
+        let baseline = budget.usage();
+        connection
+            .event(Event::Data {
+                offset: 0,
+                bytes: vec![7; 65536].into(),
+            })
+            .unwrap();
+        assert_eq!(
+            connection
+                .receive
+                .front()
+                .unwrap()
+                ._reservation
+                .usage()
+                .bytes,
+            65536
+        );
+        let mut port = port();
+        connection.turn_port(&mut port).unwrap();
+        assert!(connection.downloaded > 0 && connection.downloaded < 65536);
+        assert!(port.consumed.is_empty());
+        assert_eq!(
+            connection
+                .receive
+                .front()
+                .unwrap()
+                ._reservation
+                .usage()
+                .bytes,
+            65536
+        );
+        assert!(
+            !connection
+                .event(Event::Closed {
+                    reason: skvoz_core::CloseReason::Cancelled
+                })
+                .unwrap()
+        );
+        let retained = budget.usage();
+        assert!(retained.bytes >= baseline.bytes + 65536);
+        let (socket, _new_owner) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut next = TcpConnection::new(
+            key(),
+            Socket::Unix(socket),
+            &budget,
+            Vec::new(),
+            crate::config::Limits::canonical(crate::config::Role::Client)
+                .manager(crate::config::Role::Client),
+        )
+        .unwrap();
+        next.event(Event::Data {
+            offset: 0,
+            bytes: vec![9; 65536].into(),
+        })
+        .unwrap();
+        assert!(budget.usage().bytes >= retained.bytes + 65536);
+        drop(connection);
+        assert!(budget.usage().bytes >= 65536);
+        drop(next);
+        assert_eq!(budget.usage(), crate::budget::Usage::default());
     }
     #[test]
     fn copying_remote_data_never_consumes_native_write_grants_exact_prefix() {

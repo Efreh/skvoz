@@ -657,6 +657,7 @@ mod tests {
             sequence: u64::MAX,
             session: 1,
         };
+        let before = host.runtime.status().resources;
         host.command(
             1,
             Frame {
@@ -666,9 +667,11 @@ mod tests {
                 payload: 0u64.to_be_bytes().to_vec(),
             },
         );
-        assert_eq!(host.runtime.status().resources.streams, 0);
-        assert_eq!(host.runtime.status().resources.reserved_receive_bytes, 0);
+        assert_eq!(before.streams, 0);
+        assert_eq!(host.runtime.status().resources, before);
         assert!(host.bindings.is_empty());
+        assert!(host.keys.is_empty());
+        assert!(host.owners[&1].streams.is_empty());
         let reply = Frame::decode(host.owners[&1].output[0].bytes[4..].to_vec()).unwrap();
         assert_eq!(
             u16::from_be_bytes(reply.payload[..2].try_into().unwrap()),

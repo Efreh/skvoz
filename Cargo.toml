@@ -1,6 +1,7 @@
 [workspace]
 members = ["core", "daemon", "connectors/tcp", "testbench", "clients/ubuntu", "network", "network/native", "network/helper", "network/ffi"]
 resolver = "3"
+exclude = ["vendor/async-nats"]
 
 [workspace.package]
 edition = "2024"
@@ -9,3 +10,6 @@ license = "MIT"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[patch.crates-io]
+async-nats = { path = "vendor/async-nats" }

@@ -123,7 +123,13 @@ impl Profile {
             Duration::from_millis(limit(&mut l, "shutdown_timeout_ms", 5000, 100, 60000)? as u64);
         let manager = ManagerConfig {
             stream: Config {
-                receive_window: limit(&mut l, "receive_window", 8192, 1, 1024 * 1024)? as u32,
+                receive_window: limit(
+                    &mut l,
+                    "receive_window",
+                    8192,
+                    1,
+                    skvoz_core::MAX_RECEIVE_WINDOW as usize,
+                )? as u32,
                 max_frame: limit(&mut l, "max_frame", 1024, 1, 32768)? as u32,
                 max_pending_frames: limit(&mut l, "pending_frames", 8, 1, 64)?,
                 max_metadata: 512,

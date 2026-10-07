@@ -8,7 +8,7 @@ import socket
 import subprocess
 import time
 
-from tcp_capacity import Owner, configuration, connect, exact, exchange, resource, short_http
+from tcp_capacity import REDUCED_RUNTIME_BYTES, Owner, configuration, connect, exact, exchange, resource, short_http
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--directory', required=True)
@@ -37,7 +37,7 @@ try:
         if peer:
             limits = cfg['network']['limits']
             limits.update(core_streams=2,streams_per_peer=2,core_receive_bytes=131072,core_receive_peer_bytes=131072,api_queue_bytes=34816,api_queue_records=6)
-            limits['runtime_buffer_bytes'] = 12592896+2*131072+2097152+524288+1081344+34816+6*256
+            limits['runtime_buffer_bytes'] = REDUCED_RUNTIME_BYTES
             report['limits'] = limits
         owners.append(Owner(args.binary,cfg,directory,peer))
     endpoints = owners[1].call('START_PROXY',{'http_bind':'127.0.0.1:10080','socks_bind':'127.0.0.1:11080'})[0]

@@ -68,6 +68,20 @@ struct Output {
 }
 impl Output {
     fn push(&self, message: OwnedMessage) -> Result<(), RuntimeFailure> {
+        self.enqueue(message, None)
+    }
+    fn push_response(
+        &self,
+        message: OwnedMessage,
+        busy: &AtomicBool,
+    ) -> Result<(), RuntimeFailure> {
+        self.enqueue(message, Some(busy))
+    }
+    fn enqueue(
+        &self,
+        message: OwnedMessage,
+        completed: Option<&AtomicBool>,
+    ) -> Result<(), RuntimeFailure> {
         let envelope = serde_json::from_slice::<Value>(&message.json).ok();
         let event = envelope
             .as_ref()
@@ -119,6 +133,11 @@ impl Output {
             request_id,
             terminal_request,
         });
+        // A completed response and the free command slot become visible under
+        // the same lock. Ordinary events must not release command admission.
+        if let Some(busy) = completed {
+            busy.store(false, Ordering::Release);
+        }
         self.changed.notify_all();
         Ok(())
     }
@@ -226,16 +245,22 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeFailure::Overloaded)?;
         let core = budget
             .reserve(
-                2 * limits
-                    .receive_budget
-                    .min(limits.max_streams * limits.stream.receive_window as usize)
-                    + limits.send_budget,
+                limits.receive_budget
+                    + limits.send_budget
+                    + limits
+                        .metadata_backing()
+                        .ok_or(RuntimeFailure::InvalidArgument)?,
                 0,
             )
             .map_err(|_| RuntimeFailure::Overloaded)?;
         let fixed = budget
             .reserve(
                 524288
+                    + config
+                        .network
+                        .limits
+                        .backend_payload_backing()
+                        .map_err(|_| RuntimeFailure::InvalidArgument)?
                     + if helper_required {
                         local_api::BODY_MAX * 40
                     } else {
@@ -594,8 +619,15 @@ impl Actor {
             Ok(v) => Response::success(id, v, fd.is_some()),
             Err(e) => Response::failure(id, e),
         };
-        let result = self.message(&response, fd);
-        self.busy.store(false, Ordering::Release);
+        let result = serde_json::to_vec(&response)
+            .map_err(|_| RuntimeFailure::Internal)
+            .and_then(|json| {
+                self.output
+                    .push_response(OwnedMessage { json, fd }, &self.busy)
+            });
+        if result.is_err() {
+            self.busy.store(false, Ordering::Release);
+        }
         result
     }
     fn event(&mut self, name: &str, data: Value) -> Result<(), RuntimeFailure> {
@@ -747,7 +779,7 @@ impl Actor {
                 return self.respond(r.id, Err(ApiError::InvalidState), None);
             }
             self.hello = true;
-            return self.respond(r.id,Ok(json!({"api":1,"network":3,"role":self.config.role,"capabilities":{"profiles":if self.config.network.families.is_empty(){vec!["tcp"]}else{vec!["tcp","ip"]},"families":self.config.network.families,"max_mtu":self.config.network.max_mtu,"max_channels":self.config.network.channels}})),None);
+            return self.respond(r.id,Ok(json!({"api":1,"network":4,"role":self.config.role,"capabilities":{"profiles":if self.config.network.families.is_empty(){vec!["tcp"]}else{vec!["tcp","ip"]},"families":self.config.network.families,"max_mtu":self.config.network.max_mtu,"max_channels":self.config.network.channels}})),None);
         }
         if r.op == Operation::Hello {
             return self.respond(r.id, Err(ApiError::InvalidState), None);
@@ -1044,7 +1076,13 @@ impl Actor {
                 return Err(error.into());
             }
         };
-        match TcpConnection::new(key, Socket::Unix(runtime), &self.budget, Vec::new()) {
+        match TcpConnection::new(
+            key,
+            Socket::Unix(runtime),
+            &self.budget,
+            Vec::new(),
+            self.config.network.limits.manager(self.config.role),
+        ) {
             Ok(mut connection) => {
                 connection.reply = Some((
                     id,
@@ -1115,7 +1153,7 @@ impl Actor {
         if self.helper_id == 0 {
             self.helper_enqueue(
                 local_api::HelperOperation::Hello,
-                json!({"api":1,"network":3}),
+                json!({"api":1,"network":4}),
                 HelperKind::Hello,
             )?;
         }
@@ -1186,7 +1224,7 @@ impl Actor {
         }
         match pending.kind {
             HelperKind::Hello => {
-                if frame.fd.is_some() || result != json!({"api":1,"network":3,"role":"server"}) {
+                if frame.fd.is_some() || result != json!({"api":1,"network":4,"role":"server"}) {
                     return Err(RuntimeFailure::Internal);
                 }
                 self.helper_enqueue(
@@ -1326,6 +1364,39 @@ impl Actor {
         for _ in 0..self.output.terminal_batch() / 2 {
             let Some(event) = self.engine.as_mut().and_then(NetworkEngine::poll_backend) else {
                 break;
+            };
+            let event = match event {
+                BackendEvent::Tcp {
+                    key,
+                    event: event @ skvoz_core::Event::Data { .. },
+                } => {
+                    if let Some(connection) = self.tcp.get_mut(&key) {
+                        match connection.try_data(event) {
+                            Ok(()) => continue,
+                            Err(failure) if failure.error.is_none() => {
+                                let engine = self.engine.as_mut().unwrap();
+                                engine.defer_backend(BackendEvent::Tcp {
+                                    key,
+                                    event: failure.event,
+                                });
+                                let Some(terminal) = engine.poll_backend_abort() else {
+                                    break;
+                                };
+                                terminal
+                            }
+                            Err(_) => BackendEvent::Tcp {
+                                key,
+                                event: skvoz_core::Event::Closed {
+                                    reason: skvoz_core::CloseReason::ProtocolError,
+                                },
+                            },
+                        }
+                    } else {
+                        // The host has already released this cancelled stream.
+                        continue;
+                    }
+                }
+                event => event,
             };
             match event {
                 BackendEvent::TcpOpen { key, host, port } => {
@@ -1526,7 +1597,13 @@ impl Actor {
                     {
                         continue;
                     }
-                    match TcpConnection::new(key, Socket::Tcp(socket), &self.budget, Vec::new()) {
+                    match TcpConnection::new(
+                        key,
+                        Socket::Tcp(socket),
+                        &self.budget,
+                        Vec::new(),
+                        self.config.network.limits.manager(self.config.role),
+                    ) {
                         Ok(mut connection) => match self.engine.as_mut().unwrap().accept_tcp(key) {
                             Ok(()) => {
                                 connection.opened = true;
@@ -1763,6 +1840,7 @@ impl Actor {
                                 Socket::Tcp(socket),
                                 &self.budget,
                                 initial,
+                                self.config.network.limits.manager(self.config.role),
                                 reservation,
                             ) {
                                 Ok(mut connection) => {
@@ -2165,20 +2243,47 @@ impl Actor {
                 .is_some_and(NetworkEngine::tcp_cancellations_pending)
         {
             if Instant::now() >= until {
+                eprintln!(
+                    "Runtime cleanup deadline: stage=native tcp={} closing={} helper_pending={} helper_queue={} core_done=false helper_done=false",
+                    self.tcp.len(),
+                    self.engine
+                        .as_ref()
+                        .is_some_and(NetworkEngine::tcp_cancellations_pending),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(RuntimeFailure::Internal);
                 break;
             }
             if let Err(error) = self.native_turn() {
+                eprintln!(
+                    "Runtime cleanup failure: stage=native error={error:?} tcp={} helper_pending={} helper_queue={}",
+                    self.tcp.len(),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(error);
                 break;
             }
             if let Some(engine) = self.engine.as_mut()
-                && engine.drive(Duration::ZERO).await.is_err()
+                && let Err(error) = engine.drive(Duration::ZERO).await
             {
+                eprintln!(
+                    "Runtime cleanup failure: stage=engine_drive error={error:?} tcp={} helper_pending={} helper_queue={}",
+                    self.tcp.len(),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(RuntimeFailure::Internal);
                 break;
             }
             if let Err(error) = self.backend_turn().await {
+                eprintln!(
+                    "Runtime cleanup failure: stage=backend error={error:?} tcp={} helper_pending={} helper_queue={}",
+                    self.tcp.len(),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(error);
                 break;
             }
@@ -2188,34 +2293,38 @@ impl Actor {
         if self.helper.is_some() {
             self.helper_queue.clear();
             if self.helper_id == 0
-                && self
-                    .helper_enqueue(
-                        local_api::HelperOperation::Hello,
-                        json!({"api":1,"network":3}),
-                        HelperKind::Hello,
-                    )
-                    .is_err()
+                && let Err(error) = self.helper_enqueue(
+                    local_api::HelperOperation::Hello,
+                    json!({"api":1,"network":4}),
+                    HelperKind::Hello,
+                )
             {
+                eprintln!(
+                    "Runtime cleanup failure: stage=helper_hello_enqueue error={error:?} tcp={} helper_pending={} helper_queue={}",
+                    self.tcp.len(),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(RuntimeFailure::Internal)
             }
-            if self
-                .helper_enqueue(
-                    local_api::HelperOperation::StopServer,
-                    json!({}),
-                    HelperKind::Stop,
-                )
-                .is_err()
-            {
+            if let Err(error) = self.helper_enqueue(
+                local_api::HelperOperation::StopServer,
+                json!({}),
+                HelperKind::Stop,
+            ) {
+                eprintln!(
+                    "Runtime cleanup failure: stage=helper_stop_enqueue error={error:?} tcp={} helper_pending={} helper_queue={}",
+                    self.tcp.len(),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(RuntimeFailure::Internal)
             }
         }
         let mut engine = self.engine.take();
         let shutdown = async {
             if let Some(engine) = engine.as_mut() {
-                engine
-                    .shutdown()
-                    .await
-                    .map_err(|_| RuntimeFailure::Internal)
+                engine.shutdown().await
             } else {
                 Ok(())
             }
@@ -2228,11 +2337,23 @@ impl Actor {
                 break;
             }
             if Instant::now() >= until {
+                eprintln!(
+                    "Runtime cleanup deadline: stage=core_helper tcp={} helper_pending={} helper_queue={} core_done={core_done} helper_done={helper_done}",
+                    self.tcp.len(),
+                    self.helper_pending.is_some(),
+                    self.helper_queue.len()
+                );
                 result = Err(RuntimeFailure::Internal);
                 break;
             }
             if !helper_done {
-                if self.helper_turn().is_err() {
+                if let Err(error) = self.helper_turn() {
+                    eprintln!(
+                        "Runtime cleanup failure: stage=helper error={error:?} tcp={} helper_pending={} helper_queue={} core_done={core_done} helper_done={helper_done}",
+                        self.tcp.len(),
+                        self.helper_pending.is_some(),
+                        self.helper_queue.len()
+                    );
                     result = Err(RuntimeFailure::Internal);
                     helper_done = true;
                     self.helper.take();
@@ -2243,7 +2364,13 @@ impl Actor {
                 }
             }
             tokio::select! {
-                core_result=&mut shutdown,if !core_done=>{core_done=true;if core_result.is_err(){result=Err(RuntimeFailure::Internal)}},
+                core_result=&mut shutdown,if !core_done=>{
+                    core_done=true;
+                    if let Err(error) = core_result {
+                        eprintln!("Runtime cleanup failure: stage=engine_shutdown error={error:?} tcp={} helper_pending={} helper_queue={} core_done={core_done} helper_done={helper_done}", self.tcp.len(), self.helper_pending.is_some(), self.helper_queue.len());
+                        result=Err(RuntimeFailure::Internal)
+                    }
+                },
                 _=tokio::time::sleep(Duration::from_millis(5))=>{},
             }
         }
@@ -2391,6 +2518,52 @@ mod tests {
         })
     }
     #[test]
+    fn observable_response_releases_command_admission_but_events_do_not() {
+        let out = output();
+        let busy = Arc::new(AtomicBool::new(true));
+        out.push(OwnedMessage {
+            json: br#"{"event":"STATS","data":{}}"#.to_vec(),
+            fd: None,
+        })
+        .unwrap();
+        out.poll(8192, Duration::ZERO).unwrap();
+        assert!(busy.load(Ordering::Acquire));
+        let (observed, acknowledged) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker_out = out.clone();
+            let worker_busy = busy.clone();
+            scope.spawn(move || {
+                for id in 1..=128 {
+                    worker_out
+                        .push_response(
+                            OwnedMessage {
+                                json: serde_json::to_vec(
+                                    &json!({"v":1,"id":id,"error":null,"result":{}}),
+                                )
+                                .unwrap(),
+                                fd: None,
+                            },
+                            &worker_busy,
+                        )
+                        .unwrap();
+                    acknowledged.recv().unwrap();
+                }
+            });
+            for id in 1..=128 {
+                let response: Value =
+                    serde_json::from_slice(&out.poll(8192, Duration::from_secs(1)).unwrap().json)
+                        .unwrap();
+                assert_eq!(response["id"], id);
+                assert!(
+                    busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                );
+                observed.send(()).unwrap();
+            }
+        });
+        assert_eq!(out.budget.usage().bytes, 0);
+    }
+    #[test]
     fn transient_request_coalescing_preserves_terminal_advertised_records_and_order() {
         let out = output();
         let message = |seq, id, result| {
@@ -2514,7 +2687,7 @@ mod tests {
             .unwrap();
         let budget = Budget::new(65536, 4);
         let request = Request::parse_json(
-            br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":3},"fd_count":0}"#,
+            br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":4},"fd_count":0}"#,
         )
         .unwrap();
         sender
@@ -2579,7 +2752,7 @@ mod tests {
         drop(observer);
         assert_eq!(
             handle.request_json(
-                br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":3},"fd_count":0}"#,
+                br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":4},"fd_count":0}"#,
                 Some(duplicate)
             ),
             Err(RuntimeFailure::InvalidArgument)

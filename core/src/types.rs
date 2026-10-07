@@ -1,6 +1,9 @@
+/// Conservative scalar delivery receipt state, including Option alignment.
+pub const TRANSPORT_DELIVERY_STATE_BYTES: usize = 64;
+
 use std::fmt;
 
-pub const MAX_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+pub const MAX_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024;
 pub const MAX_METADATA_BYTES: usize = 64 * 1024;
 pub const MAX_PENDING_FRAMES: usize = 1024;
@@ -114,12 +117,52 @@ pub enum Frame {
     WindowUpdate {
         consumed: u64,
     },
+    WindowGrant {
+        consumed: u64,
+        limit: u64,
+        probe: u64,
+    },
+    PeerGrant {
+        epoch: u64,
+        consumed_bytes: u64,
+        limit_bytes: u64,
+        consumed_records: u64,
+        limit_records: u64,
+        probe: u64,
+    },
+    PeerRequest {
+        bytes: u32,
+        records: u32,
+        probe: u64,
+        requester_stream_id: u64,
+        blocked: u8,
+    },
+    PeerFreeze {
+        epoch: u64,
+    },
+    PeerFrozen {
+        epoch: u64,
+        bytes: u64,
+        records: u64,
+    },
     Fin {
         final_offset: u64,
     },
     Close {
         reason: CloseReason,
     },
+}
+
+impl Frame {
+    pub(crate) fn is_peer_control(&self) -> bool {
+        matches!(
+            self,
+            Self::PeerGrant { .. }
+                | Self::PeerRequest { .. }
+                | Self::PeerFreeze { .. }
+                | Self::PeerFrozen { .. }
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

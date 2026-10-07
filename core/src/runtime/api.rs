@@ -281,12 +281,21 @@ impl RuntimeConfig {
         {
             return Err(RuntimeError::Config);
         }
+        super::delivery_limits(self)?;
         self.subscription_capacity
             .checked_mul(2)
             .and_then(|n| n.checked_mul(self.shards))
             .and_then(|n| n.checked_add(self.join_capacity))
             .and_then(|n| n.checked_add(self.client_capacity.checked_mul(self.shards + 1)?))
-            .and_then(|n| n.checked_mul(TRANSPORT_PACKET_BYTES))
+            .and_then(|n| n.checked_add((self.shards + 1).checked_mul(4)?))
+            .and_then(|n| n.checked_mul(TRANSPORT_PACKET_BYTES + 1024))
+            .and_then(|n| {
+                n.checked_add(
+                    limits
+                        .max_peers
+                        .checked_mul(crate::TRANSPORT_DELIVERY_STATE_BYTES)?,
+                )
+            })
             .ok_or(RuntimeError::Config)
     }
 }

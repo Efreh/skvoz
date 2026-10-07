@@ -5,6 +5,7 @@
 //! owns stream state, byte credit and admission. Frames are an experimental API,
 //! not a stable wire format. Polling data does not acknowledge consumption.
 
+mod credit;
 mod manager;
 #[cfg(feature = "nats")]
 pub mod nats;

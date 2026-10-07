@@ -42,11 +42,17 @@ static uint64_t create(const char *path) {
     return handle;
 }
 
-static void request(uint64_t handle, const char *json, uint32_t expected_id) {
+static void request(uint64_t handle, const char *op, const char *json,
+                    uint32_t expected_id) {
     uint32_t id = 0;
-    if (skvoz_network_request(handle, (const uint8_t *)json, strlen(json), -1, &id)
-            || id != expected_id)
+    uint32_t result = skvoz_network_request(handle, (const uint8_t *)json,
+                                            strlen(json), -1, &id);
+    if (result || id != expected_id) {
+        fprintf(stderr, "FFI request admission: role=%s op=%s expected_id=%u returned_id=%u result=%u\n",
+                handle == server_handle ? "server" : "client", op,
+                expected_id, id, result);
         fail("request admission");
+    }
 }
 
 /* Every delivery first probes twice with no buffer. Even FD responses must
@@ -89,7 +95,7 @@ static int response(uint64_t handle, uint32_t id) {
 }
 
 static void hello_ready(uint64_t handle) {
-    request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":3},\"fd_count\":0}", 1);
+    request(handle, "HELLO", "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}", 1);
     int hello = 0, ready = 0;
     double deadline = now() + 30;
     while (now() < deadline && (!hello || !ready)) {
@@ -109,7 +115,7 @@ static int open_tcp(const char *address, uint32_t id) {
     char json[512];
     int count = snprintf(json, sizeof(json), "{\"v\":1,\"id\":%u,\"op\":\"OPEN_TCP\",\"args\":{\"host\":\"%s\",\"port\":4444},\"fd_count\":0}", id, address);
     if (count < 0 || (size_t)count >= sizeof(json)) fail("OPEN length");
-    request(client_handle, json, id);
+    request(client_handle, "OPEN_TCP", json, id);
     int fd = response(client_handle, id);
     if (fd < 0 || !(fcntl(fd, F_GETFD) & FD_CLOEXEC)) fail("owned CLOEXEC socket");
     int flags = fcntl(fd, F_GETFL);
@@ -139,7 +145,7 @@ int main(int argc, char **argv) {
     client_handle = create(argv[2]);
     hello_ready(server_handle);
     hello_ready(client_handle);
-    request(client_handle, "{\"v\":1,\"id\":2,\"op\":\"START_PROXY\",\"args\":{\"http_bind\":null,\"socks_bind\":null},\"fd_count\":0}", 2);
+    request(client_handle, "START_PROXY", "{\"v\":1,\"id\":2,\"op\":\"START_PROXY\",\"args\":{\"http_bind\":null,\"socks_bind\":null},\"fd_count\":0}", 2);
     if (response(client_handle, 2) != -1) fail("START descriptor");
     int fd = open_tcp(argv[3], 3);
     unsigned char bytes[32771], received[4096];
