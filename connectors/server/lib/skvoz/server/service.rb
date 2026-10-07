@@ -160,7 +160,7 @@ module Skvoz
         renew(initial: true) unless @tls.valid?
         @runtime_stage = 'binary_validation'
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
-        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.4.1 network=4 api=1 core=4.0.1')
+        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.4.2 network=4 api=1 core=4.0.1')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         @runtime_stage = 'nats_validation'
@@ -215,7 +215,7 @@ module Skvoz
             raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
             candidate, id = @state.enroll(login, token)
             apply(candidate) if candidate
-            { v: 2, namespace: @config['namespace'], peer_id: id, network_runtime: { network: 4, api: 1, version: '0.4.1', core: '4.0.1' } }
+            { v: 2, namespace: @config['namespace'], peer_id: id, network_runtime: { network: 4, api: 1, version: '0.4.2', core: '4.0.1' } }
           end
         end.start(@task)
       end

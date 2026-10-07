@@ -10,15 +10,15 @@
 опциональная возможность `nats` добавляет статический NatsNode и динамический
 NatsRuntime на Tokio/async-nats. Роль приложения не меняет реализацию или контракт ядра.
 
-[Серверный коннектор](server-connector.md) 5.0.1 на Ruby управляет NATS,
+[Серверный коннектор](server-connector.md) 5.0.2 на Ruby управляет NATS,
 пользователями, профилями устройств и TLS. TCP/IP I/O выполняет
-[общий Rust runtime](network-runtime.md) 0.4.1 с тем же Core 4.0.1;
+[общий Rust runtime](network-runtime.md) 0.4.2 с тем же Core 4.0.1;
 Ruby получает только управляющие события. Узкий helper создаёт общий Linux TUN,
 маршруты и policy gateway. Default policy допускает публичные unicast назначения,
 а обычные private/local сервисы требуют явных правил.
 Граница сервера не зависит от клиентской ОС, языка или local ingress.
 
-[Клиент Ubuntu](ubuntu-client.md) 4.0.1 использует GTK4/libadwaita и тот же
+[Клиент Ubuntu](ubuntu-client.md) 4.0.2 использует GTK4/libadwaita и тот же
 runtime с двумя режимами: локальные HTTP/CONNECT/SOCKS5 TCP-интерфейсы и L3
 IPv4/IPv6 через TUN. UI не копирует packet payload через API.
 Root helper настраивает клиентские маршруты/DNS/guard с разрешением polkit.

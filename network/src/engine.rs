@@ -77,8 +77,7 @@ fn validate_core_profile(limits: ManagerConfig, server: bool) -> Result<(), Netw
         || !(session_receive..=canonical.receive_budget).contains(&limits.receive_budget)
         || !(session_receive..=canonical.receive_budget_per_peer)
             .contains(&limits.receive_budget_per_peer)
-        // Smaller shared SEND pools can split records into tiny accepted
-        // prefixes under contention and exhaust the envelope flight bound.
+        // Preserve the canonical shared SEND staging and contention headroom.
         || limits.send_budget != canonical.send_budget
         || limits.send_budget_per_peer != canonical.send_budget_per_peer
     {
@@ -356,8 +355,6 @@ struct Channel {
     event_room: usize,
     output: VecDeque<Pending>,
     receipts: VecDeque<Receipt>,
-    sent: u64,
-    flight: VecDeque<u64>,
 }
 /// One owner exclusively drives one Core runtime and its incoming dispatcher.
 pub struct NetworkEngine {
@@ -773,8 +770,6 @@ impl NetworkEngine {
                 event_room: 0,
                 output: VecDeque::new(),
                 receipts: VecDeque::new(),
-                sent: 0,
-                flight: VecDeque::new(),
             },
         );
         self.schedule.push_back(key);
@@ -1236,6 +1231,20 @@ impl NetworkEngine {
             if size > *budget || *records >= max_records {
                 break;
             }
+            if !self.streams[&key].control {
+                let session = self
+                    .sessions
+                    .get(&key.stream.peer)
+                    .ok_or(NetworkError::InvalidState)?;
+                let config = session.config.as_ref().ok_or(NetworkError::InvalidState)?;
+                if session.receive_bytes + size > config.packet_queue_bytes
+                    || session.receive_records >= config.packet_queue_records
+                {
+                    // Leave the record in the bounded parser until its native
+                    // consumer releases room. Core consumption follows delivery.
+                    break;
+                }
+            }
             let record = self
                 .streams
                 .get_mut(&key)
@@ -1395,23 +1404,32 @@ impl NetworkEngine {
         s.send_records += 1;
         Ok(())
     }
+    #[cfg(feature = "linux-runtime")]
+    pub(crate) fn packet_input_ready(&self) -> bool {
+        Self::packet_input_ready_for(self.sessions.values())
+    }
+    #[cfg(any(test, feature = "linux-runtime"))]
+    fn packet_input_ready_for<'a>(sessions: impl Iterator<Item = &'a Session>) -> bool {
+        let mut active = false;
+        for session in sessions {
+            if session.state != SessionState::Active {
+                continue;
+            }
+            active = true;
+            if let Some(config) = &session.config
+                && session.send_bytes + usize::from(config.mtu) + 8 <= config.packet_queue_bytes
+                && session.send_records < config.packet_queue_records
+            {
+                return true;
+            }
+        }
+        // Drain stale packets during setup/retirement. For a shared server TUN,
+        // a blocked peer must not stop reads for another peer with available room.
+        !active
+    }
     fn flush(&mut self) -> Result<(), NetworkError> {
-        // Byte credit alone permits many tiny frames. Keep a finite envelope
-        // flight bound using the same Core consumption prefix, without a new wire.
-        for (key, channel) in &mut self.streams {
-            if let Some(snapshot) = self.runtime.snapshot(*key) {
-                let consumed = channel
-                    .sent
-                    .saturating_sub(snapshot.send_unacknowledged_bytes);
-                retire_flight(&mut channel.flight, consumed);
-            }
-        }
-        let mut flights: BTreeMap<PeerId, usize> = BTreeMap::new();
-        for (key, channel) in &self.streams {
-            if !channel.control {
-                *flights.entry(key.stream.peer).or_default() += channel.flight.len();
-            }
-        }
+        // Core enforces adaptive stream credit and shared byte/record flight.
+        // Native work quanta bound each turn, independently of round-trip time.
         let count = self.schedule.len();
         let mut quanta: BTreeMap<PeerId, (usize, usize)> = self
             .native_send
@@ -1444,11 +1462,7 @@ impl NetworkEngine {
             };
             loop {
                 let stream = self.streams.get_mut(&key).unwrap();
-                if stream.output.is_empty()
-                    || budget == 0
-                    || records >= 16
-                    || (!control && flights.get(&key.stream.peer).copied().unwrap_or(0) >= 16)
-                {
+                if stream.output.is_empty() || budget == 0 || records >= 16 {
                     break;
                 }
                 let batch = gather_output(&stream.output, budget, 16 - records);
@@ -1468,14 +1482,6 @@ impl NetworkEngine {
                                     break;
                                 }
                             }
-                        }
-                        stream.sent = stream
-                            .sent
-                            .checked_add(n as u64)
-                            .expect("Core accepted offset cannot overflow");
-                        if !control {
-                            stream.flight.push_back(stream.sent);
-                            *flights.entry(key.stream.peer).or_default() += 1;
                         }
                         let (completed_bytes, completed_records) =
                             advance_output(&mut stream.output, n);
@@ -2234,24 +2240,79 @@ mod deadline_tests {
     }
 }
 
-fn retire_flight(flight: &mut VecDeque<u64>, consumed: u64) {
-    while flight.front().is_some_and(|end| *end <= consumed) {
-        flight.pop_front();
-    }
-}
 #[cfg(test)]
-mod flight_tests {
+mod ingress_tests {
     use super::*;
+
+    fn session(send_bytes: usize, send_records: usize) -> Session {
+        let id = SessionId::try_from("01".repeat(16)).unwrap();
+        Session {
+            id: id.clone(),
+            control: RuntimeKey {
+                epoch: 1,
+                incarnation: 1,
+                stream: skvoz_core::StreamKey {
+                    peer: PeerId(0),
+                    stream_id: 1,
+                },
+            },
+            config: Some(SessionConfig {
+                session: id,
+                families: vec![4],
+                source_grants: vec!["192.0.2.10/32".parse().unwrap()],
+                routes: vec!["0.0.0.0/0".parse().unwrap()],
+                dns_servers: vec!["192.0.2.53".parse().unwrap()],
+                mtu: 1500,
+                channels: 1,
+                packet_queue_bytes: 262144,
+                packet_queue_records: 256,
+                setup_timeout_ms: 15000,
+                egress: Egress {
+                    ipv4: "nat44".into(),
+                    ipv6: "none".into(),
+                },
+            }),
+            requested: None,
+            state: SessionState::Active,
+            channels: BTreeMap::new(),
+            local_ready: true,
+            deadline: Instant::now(),
+            seed: 0,
+            send_bytes,
+            send_records,
+            receive_bytes: 0,
+            receive_records: 0,
+        }
+    }
+
     #[test]
-    fn envelope_flight_releases_only_fully_consumed_accepted_frames() {
-        let mut flight = VecDeque::from([60, 120, 180]);
-        retire_flight(&mut flight, 59);
-        assert_eq!(flight.len(), 3);
-        retire_flight(&mut flight, 60);
-        assert_eq!(flight, VecDeque::from([120, 180]));
-        retire_flight(&mut flight, 179);
-        assert_eq!(flight, VecDeque::from([180]));
-        retire_flight(&mut flight, 180);
-        assert!(flight.is_empty());
+    fn tun_ingress_waits_for_a_complete_mtu_record_and_record_slot() {
+        let mut peer = session(262144 - 1508, 255);
+        assert!(NetworkEngine::packet_input_ready_for([&peer].into_iter()));
+        peer.send_bytes += 1;
+        assert!(!NetworkEngine::packet_input_ready_for([&peer].into_iter()));
+        peer.send_bytes = 0;
+        peer.send_records = 256;
+        assert!(!NetworkEngine::packet_input_ready_for([&peer].into_iter()));
+    }
+
+    #[test]
+    fn stalled_peer_preserves_tun_reads_for_healthy_peer_and_retirement() {
+        let blocked = session(262144, 256);
+        let mut healthy = session(0, 0);
+        assert!(NetworkEngine::packet_input_ready_for(
+            [&blocked, &healthy].into_iter()
+        ));
+        assert!(NetworkEngine::packet_input_ready_for(
+            [&healthy, &blocked].into_iter()
+        ));
+        healthy.state = SessionState::Preparing;
+        assert!(!NetworkEngine::packet_input_ready_for(
+            [&blocked, &healthy].into_iter()
+        ));
+        assert!(NetworkEngine::packet_input_ready_for(
+            [&healthy].into_iter()
+        ));
+        assert!(NetworkEngine::packet_input_ready_for(std::iter::empty()));
     }
 }

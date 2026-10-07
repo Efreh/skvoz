@@ -2077,6 +2077,9 @@ impl Actor {
         }
         let mut buffer = [0u8; 1501];
         for _ in 0..16 {
+            if !engine.packet_input_ready() {
+                break;
+            }
             match tun.try_read_packet(&mut buffer) {
                 Ok(n) => {
                     let session = if self.config.role == Role::Client {

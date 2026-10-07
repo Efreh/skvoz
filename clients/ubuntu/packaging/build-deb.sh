@@ -8,9 +8,9 @@ runtime=${2:-"$root/target/release/skvoz-network-runtime"}
 helper=${3:-"$root/target/release/skvoz-network-helper"}
 output=${4:-"$root/clients/ubuntu/dist"}
 [ "$(dpkg --print-architecture)" = amd64 ] || { echo 'Only amd64 packages are supported' >&2; exit 1; }
-[ "$("$runtime" --version)" = 'skvoz-network-runtime 0.4.1 network=4 api=1 core=4.0.1' ] || { echo 'Incompatible bundled runtime' >&2; exit 1; }
+[ "$("$runtime" --version)" = 'skvoz-network-runtime 0.4.2 network=4 api=1 core=4.0.1' ] || { echo 'Incompatible bundled runtime' >&2; exit 1; }
 [ "$("$helper" --version)" = 'skvoz-network-helper 0.4.0 api=1 network=4' ] || { echo 'Incompatible helper' >&2; exit 1; }
-[ "$("$binary" --version)" = "skvoz-client $version runtime=0.4.1 network=4 api=1" ] || { echo 'Incompatible client version' >&2; exit 1; }
+[ "$("$binary" --version)" = "skvoz-client $version runtime=0.4.2 network=4 api=1" ] || { echo 'Incompatible client version' >&2; exit 1; }
 mkdir -p "$output"
 stage=$(mktemp -d)
 chmod 755 "$stage"
