@@ -3,6 +3,8 @@ FROM rust:1.92.0-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY clients/ubuntu/Cargo.toml clients/ubuntu/Cargo.toml
+COPY clients/android/native/Cargo.toml clients/android/native/Cargo.toml
+RUN mkdir -p clients/android/native/src && printf "// Metadata-only workspace stub.\n" > clients/android/native/src/lib.rs
 RUN mkdir -p clients/ubuntu/src/bin && printf "fn main() {}\n" > clients/ubuntu/src/main.rs && printf "// Metadata-only workspace stub.\n" > clients/ubuntu/src/lib.rs && printf "fn main() {}\n" > clients/ubuntu/src/bin/test_driver.rs
 COPY vendor/async-nats vendor/async-nats
 COPY core core

@@ -1,14 +1,18 @@
-//! Linux descriptor ownership, TUN packet I/O, and bounded Unix control framing.
+//! Linux/Android descriptor ownership, TUN packet I/O, and bounded Unix control framing.
 #![deny(unsafe_op_in_unsafe_fn)]
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 mod control;
+#[cfg(target_os = "linux")]
 mod process;
+#[cfg(target_os = "linux")]
 mod state;
 mod tun;
 
 pub use control::{CONTROL_BODY_MAX, ControlFrame, FramedUnix, IncrementalUnix, PeerCredentials};
+#[cfg(target_os = "linux")]
 pub use process::{inherit_control, restrict_helper_caps};
+#[cfg(target_os = "linux")]
 pub use state::{SecureStateDir, read_private_config, read_root_config};
 pub use tun::TunDevice;
 
@@ -146,6 +150,7 @@ pub fn wait_interest(
 /// Validate a systemd inherited AF_UNIX listener and its root-anchored per-UID
 /// endpoint. The descriptor is adopted; errors close it. The bound socket must
 /// be uid0600 under the fixed root-owned, nonwritable runtime parents.
+#[cfg(target_os = "linux")]
 pub fn activated_client_listener(
     fd: OwnedFd,
 ) -> io::Result<(std::os::unix::net::UnixListener, u32)> {
@@ -251,6 +256,7 @@ pub fn configure_socket_buffers(fd: BorrowedFd<'_>, bytes: usize) -> io::Result<
 /// Adopt an explicitly transferred inherited CLI descriptor. Duplicate first so
 /// CLOEXEC validation failures preserve the original; successful transfer closes
 /// the original exactly once. Embedding/FFI borrowed callers use duplicate instead.
+#[cfg(target_os = "linux")]
 pub fn adopt_inherited(fd: RawFd) -> io::Result<OwnedFd> {
     if fd < 3 {
         return Err(invalid("invalid transferred descriptor"));

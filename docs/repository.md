@@ -20,13 +20,14 @@ skvoz/
 ├── network/            # общий TCP/IP runtime поверх того же Core
 │   ├── src/            # safe Rust codec, engine, actor и TCP I/O
 │   ├── tests/          # контракт и владение пакетами
-│   ├── native/         # узкая Linux FD/TUN/SCM_RIGHTS boundary
+│   ├── native/         # общая Linux/Android FD/TUN boundary; process/create — Linux
 │   ├── helper/         # root policy, durable leases, kernel gateway
 │   └── ffi/            # ABI 1 того же actor, header и C consumers
 ├── clients/            # каждый клиент — clients/<name>/
 │   ├── python/         # stdlib IPC helper/echo example
 │   ├── ruby/           # stdlib IPC helper/echo example
 │   ├── ubuntu/         # Rust/GTK: src, tests, spec, packaging
+│   ├── android/        # Kotlin/Compose app, JNI crate, Gradle, tests и tools
 │   └── README.md       # нативный клиент и самостоятельные IPC-примеры
 ├── connectors/         # коннекторы внешнего I/O
 │   ├── server/         # Ruby host, Gemfile/lock, bin/lib/spec, Docker/Compose
@@ -39,7 +40,7 @@ skvoz/
 │   ├── src/
 │   ├── tests/
 │   └── run.py          # контейнер NATS: check/demo/tcp/load/qualify/daemon/network
-├── .github/workflows/  # раздельные сборки сервера и Ubuntu
+├── .github/workflows/  # раздельные сборки сервера, Ubuntu и Android
 ├── docs/               # архитектура и контракты
 └── README.md           # вход в общий проект
 ```
@@ -51,7 +52,7 @@ skvoz/
 
 `clients/<name>/` содержит клиентское приложение или самостоятельный адаптер IPC
 со своими инструментами и документацией. Python/Ruby — примеры адаптеров,
-Ubuntu — законченное настольное приложение. Новые SDK, коннекторы, node, сервисы
+Ubuntu — настольное приложение, Android — мобильный Kotlin host того же Core/network. Новые SDK, коннекторы, node, сервисы
 или другие компоненты размещаются отдельно по назначению после определения
 границ. Готовые структуры для несуществующих компонентов не создаются.
 
@@ -77,6 +78,8 @@ Ubuntu — законченное настольное приложение. Н�
 | Сервер: процессы, пользователи, TLS | `connectors/server/lib/skvoz/server/{service,process,state,tls,enrollment}.rb` |
 | Сервер: bootstrap, static policy и runtime control | `connectors/server/lib/skvoz/server/{bootstrap,network_configuration,runtime_control}.rb` |
 | Ubuntu: подключение, выделение устройства и настройки | `clients/ubuntu/src/{backend,enrollment,settings}.rs` |
+| Android: UI, lifecycle, storage, VpnService | `clients/android/app/src/main/java/org/skvoz/android/` |
+| Android: JNI, ABI builds, APK checks | `clients/android/native/`, `clients/android/tools/` |
 | Ubuntu: runtime/helper control и FD | `clients/ubuntu/src/ipc.rs`; протокольные интерфейсы — `network/src/proxy.rs` |
 | Ubuntu: запуск приложения и связь UI, backend и desktop | `clients/ubuntu/src/app.rs` |
 | Ubuntu: окно, фон, индикатор и журнал | `clients/ubuntu/src/{ui,desktop,tray,telemetry}.rs` |

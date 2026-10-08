@@ -1,6 +1,6 @@
 # Общий сетевой модуль
 
-`skvoz-network` 0.4.2 содержит переносимые сетевые состояния и Linux runtime,
+`skvoz-network` 0.4.2 содержит переносимые сетевые состояния и общий Linux/Android runtime,
 который использует один [Core/NatsRuntime](../docs/nats-runtime.md). Core
 передаёт непрозрачные байты; сетевой модуль проверяет network v4, управляет
 TCP-потоками и полными IPv4/IPv6-пакетами. Локальный контракт, строгая
@@ -29,11 +29,17 @@ IP-сессия согласует CONFIG, открывает все канал�
 число записей. Kernel socket buffers и память системного resolver учитываются
 отдельно при квалификации.
 
-Граница Linux FD/TUN/SCM_RIGHTS находится в [native/](native/README.md),
+Граница Linux/Android FD/TUN и Linux process/create/SCM_RIGHTS находится в [native/](native/README.md),
 привилегированные операции — в [helper/](helper/README.md), тонкая C ABI1 —
 в [ffi/](ffi/README.md). Основная библиотека сохраняет запрет `unsafe`.
 FFI не создаёт второй engine или собственную очередь событий. Недостаточный
 буфер сохраняет ту же authoritative запись и FD до успешного получения.
+
+`portable-runtime` включает тот же actor для Linux и Android; `linux-runtime`
+сохраняет Linux CLI host. Android допускает только client role без helper,
+получает проверенный owned TUN FD от [мобильного клиента](../docs/android-client.md).
+Общий enrollment2 используется Ubuntu и Android; host lifecycle/trusted anchor
+storage остаются ответственностью платформы. Wire/API/component versions сохранены.
 
 Из корня репозитория:
 
@@ -67,5 +73,4 @@ python3 testbench/run.py network-runtime
 ```
 
 Он требует Docker с `/dev/net/tun` и использует capabilities только в
-одноразовых контейнерах. Поддержка Android и гарантии скорости этим компонентом
-не объявляются.
+одноразовых контейнерах. Android device/TUN и гарантии скорости требуют отдельной квалификации.

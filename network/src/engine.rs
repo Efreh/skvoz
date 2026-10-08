@@ -261,7 +261,13 @@ pub struct EngineResources {
     pub control_bytes: usize,
     pub parser_bytes: usize,
 }
-#[cfg(any(test, all(target_os = "linux", feature = "linux-runtime")))]
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "portable-runtime"
+    )
+))]
 fn extract_backend_abort(queue: &mut VecDeque<BackendEvent>) -> Option<BackendEvent> {
     let position = queue.iter().position(|event| {
         matches!(event,
@@ -435,7 +441,7 @@ impl NetworkEngine {
             reserved_config: None,
         })
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn tcp_allowance(&self, peer: PeerId) -> (usize, usize, usize) {
         let (send, receive, records) = self.native_allowance(peer);
         if self.sessions.contains_key(&peer) {
@@ -520,13 +526,19 @@ impl NetworkEngine {
     pub fn poll_backend(&mut self) -> Option<BackendEvent> {
         self.backend.pop_front()
     }
-    #[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "portable-runtime"
+    ))]
     pub(crate) fn defer_backend(&mut self, event: BackendEvent) {
         // The caller just removed this slot; no intervening engine drive occurs.
         assert!(self.backend.len() < BACKEND_QUEUE_CAPACITY);
         self.backend.push_front(event);
     }
-    #[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        feature = "portable-runtime"
+    ))]
     pub(crate) fn poll_backend_abort(&mut self) -> Option<BackendEvent> {
         extract_backend_abort(&mut self.backend)
     }
@@ -586,7 +598,7 @@ impl NetworkEngine {
             self.tcp_closing.insert(index, key);
         }
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn finish_native_tcp(&mut self, key: RuntimeKey) -> Result<bool, NetworkError> {
         if self
             .native_terminal
@@ -604,7 +616,7 @@ impl NetworkEngine {
             .0 += 1;
         Ok(true)
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn close_native_tcp(&mut self, key: RuntimeKey) -> bool {
         if self
             .runtime
@@ -634,7 +646,7 @@ impl NetworkEngine {
         let _ = self.runtime.close(key);
         true
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn tcp_cancellations_pending(&self) -> bool {
         !self.tcp_closing.is_empty()
     }
@@ -1328,7 +1340,7 @@ impl NetworkEngine {
         receipt.state = ReceiptState::Delivered;
         Some(packet)
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn note_native_packet_write(&mut self, size: usize) {
         self.counters.downloaded = self.counters.downloaded.saturating_add(size as u64);
     }
@@ -1404,11 +1416,11 @@ impl NetworkEngine {
         s.send_records += 1;
         Ok(())
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn packet_input_ready(&self) -> bool {
         Self::packet_input_ready_for(self.sessions.values())
     }
-    #[cfg(any(test, feature = "linux-runtime"))]
+    #[cfg(any(test, feature = "portable-runtime"))]
     fn packet_input_ready_for<'a>(sessions: impl Iterator<Item = &'a Session>) -> bool {
         let mut active = false;
         for session in sessions {
@@ -1599,7 +1611,7 @@ impl NetworkEngine {
             let _ = self.reject_expired_setup(peer);
         }
     }
-    #[cfg(feature = "linux-runtime")]
+    #[cfg(feature = "portable-runtime")]
     pub(crate) fn session_streams(&self, id: &SessionId) -> Result<Vec<RuntimeKey>, NetworkError> {
         let peer = self.session_peer(id)?;
         Ok(self

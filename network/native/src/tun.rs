@@ -1,7 +1,9 @@
 use crate::{invalid, require_nonblocking, set_cloexec};
+#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
 /// One nonpersistent, single-queue Linux TUN carrying complete IP packets.
@@ -15,7 +17,9 @@ pub struct TunDevice {
 impl TunDevice {
     /// Create a TUN inside the caller's namespace. Requires CAP_NET_ADMIN.
     /// Only the interface and MTU are changed; addresses/routes belong to the host.
+    #[cfg(target_os = "linux")]
     pub fn create(name: &str, mtu: usize) -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
         validate_mtu(mtu)?;
         let mut request = interface_request(name)?;
         request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as i16;

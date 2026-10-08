@@ -3,10 +3,12 @@
 //! Broker permissions MUST bind sender, recipient and sender shard. A subject is
 //! not an identity proof without that provisioning contract. See the runtime guide.
 mod api;
+mod diagnostics;
 pub use api::{
     Authentication, Counters, Lifecycle, Membership, PeerStatus, RuntimeConfig, RuntimeError,
     RuntimeEvent, RuntimeKey, Status, Trust, verified_tls_config,
 };
+pub use diagnostics::TurnDiagnostics;
 
 use crate::{
     CloseReason, Manager, ManagerConfig, PeerId, PeerLimits, Resources, SendOutcome, Snapshot,
@@ -27,6 +29,9 @@ use std::{
 
 pub const TRANSPORT_PACKET_BYTES: usize = wire::MAX_PACKET_BYTES + 24;
 const CONTROL_BYTES: usize = 77;
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
 fn shard(id: PeerId, count: usize) -> usize {
     (id.0 % count as u64) as usize
 }
@@ -248,6 +253,7 @@ pub struct NatsRuntime {
     lifecycle: Lifecycle,
     last_error: Option<RuntimeError>,
     counters: Counters,
+    diagnostics: TurnDiagnostics,
     active: usize,
     attempt: usize,
     retry_at: Instant,
@@ -272,6 +278,14 @@ fn random() -> Result<u128, RuntimeError> {
     }
 }
 impl NatsRuntime {
+    /// Disabled by default. A new collection resets owner-local counters.
+    pub fn set_diagnostics_enabled(&mut self, enabled: bool) {
+        self.diagnostics.set_enabled(enabled);
+    }
+    pub fn diagnostics(&self) -> TurnDiagnostics {
+        self.diagnostics
+    }
+
     pub async fn connect(
         config: RuntimeConfig,
         limits: ManagerConfig,
@@ -292,6 +306,7 @@ impl NatsRuntime {
             lifecycle: Lifecycle::Connecting,
             last_error: None,
             counters: Counters::default(),
+            diagnostics: TurnDiagnostics::default(),
             active: 0,
             attempt: 0,
             retry_at: now,
@@ -1714,6 +1729,11 @@ impl NatsRuntime {
         if self.lifecycle != Lifecycle::Ready {
             return Ok(0);
         }
+        let measured = self.diagnostics.enabled;
+        let profile_turn = measured.then(Instant::now);
+        if measured {
+            self.diagnostics.turns = self.diagnostics.turns.saturating_add(1);
+        }
         self.manager.tick(self.now()?)?;
         self.sync_manager_failures();
         let mut progress = self.control_work().await?;
@@ -1760,9 +1780,21 @@ impl NatsRuntime {
                 progress += 1;
             }
         }
+        let profile_output = measured.then(Instant::now);
         progress += self.output().await?;
+        if let Some(start) = profile_output {
+            self.diagnostics.output_us =
+                self.diagnostics.output_us.saturating_add(elapsed_us(start));
+        }
         self.apply_failures();
+        if measured {
+            self.diagnostics.progress = self.diagnostics.progress.saturating_add(progress as u64);
+        }
         if progress == 0 && !wait.is_zero() {
+            let profile_idle = measured.then(Instant::now);
+            if measured {
+                self.diagnostics.idle_count = self.diagnostics.idle_count.saturating_add(1);
+            }
             let timeout = wait
                 .min(self.config.heartbeat_interval)
                 .min(self.config.retry_initial);
@@ -1792,6 +1824,14 @@ impl NatsRuntime {
                 }
                 self.apply_failures();
             }
+            // Includes handling the incoming arrival, matching the complete idle branch.
+            if let Some(start) = profile_idle {
+                self.diagnostics.idle_us =
+                    self.diagnostics.idle_us.saturating_add(elapsed_us(start));
+            }
+        }
+        if let Some(start) = profile_turn {
+            self.diagnostics.turn_us = self.diagnostics.turn_us.saturating_add(elapsed_us(start));
         }
         Ok(progress)
     }

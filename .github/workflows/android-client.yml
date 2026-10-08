@@ -1,0 +1,160 @@
+name: Android client
+on:
+  push:
+    branches: [main, master]
+    tags: ['android-v*']
+    paths:
+      - 'clients/android/**'
+      - 'core/**'
+      - 'network/**'
+      - 'vendor/async-nats/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'connectors/server/lib/**'
+      - 'connectors/server/bin/**'
+      - 'connectors/server/Gemfile'
+      - 'connectors/server/Gemfile.lock'
+      - 'connectors/server/spec/support/**'
+      - 'connectors/server/spec/spec_helper.rb'
+      - '.github/workflows/android-client.yml'
+  pull_request:
+    paths:
+      - 'clients/android/**'
+      - 'core/**'
+      - 'network/**'
+      - 'vendor/async-nats/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'connectors/server/lib/**'
+      - 'connectors/server/bin/**'
+      - 'connectors/server/Gemfile'
+      - 'connectors/server/Gemfile.lock'
+      - 'connectors/server/spec/support/**'
+      - 'connectors/server/spec/spec_helper.rb'
+      - '.github/workflows/android-client.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: android-client-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_BUILD_JOBS: '1'
+  CARGO_INCREMENTAL: '0'
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Pinned Android and Rust tools
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;30.0.16248370'
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy --target aarch64-linux-android,x86_64-linux-android
+          rustup default 1.92.0
+      - name: Source contracts and shared JNI host
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p skvoz-android-native --all-targets -- -D warnings
+          cargo test --locked -p skvoz-android-native -p skvoz-network -p skvoz-network-native --features skvoz-network/portable-runtime
+          cargo build --release --locked -p skvoz-android-native -p skvoz-network --features skvoz-network/linux-runtime
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
+        with:
+          ruby-version: '4.0.7'
+          bundler: '4.0.22'
+          bundler-cache: true
+          working-directory: connectors/server
+      - name: Real JNI, verified TLS, HTTP, CONNECT, SOCKS and cancellation
+        env:
+          SKVOZ_INTEGRATION: '1'
+        run: |
+          image=nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
+          docker pull "$image"
+          container=$(docker create "$image")
+          trap 'docker rm -v "$container" >/dev/null' EXIT
+          fixture=$(mktemp -d --tmpdir=/tmp skvoz-android-ci.XXXXXX)
+          trap 'docker rm -v "$container" >/dev/null; rm -rf -- "$fixture"' EXIT
+          git archive HEAD | tar -x -C "$fixture"
+          mkdir -p "$fixture/connectors/server/vendor" "$fixture/bin"
+          cp -a connectors/server/vendor/bundle "$fixture/connectors/server/vendor/"
+          cp target/release/skvoz-network-runtime target/release/libskvoz_android.so "$fixture/bin/"
+          docker cp "$container:/usr/local/bin/nats-server" "$fixture/bin/nats-server"
+          chmod -R a+rX "$fixture"
+          export BUNDLE_GEMFILE="$fixture/connectors/server/Gemfile"
+          export BUNDLE_PATH="$fixture/connectors/server/vendor/bundle"
+          export BUNDLE_APP_CONFIG="$fixture/connectors/server/.bundle"
+          export BUNDLE_FROZEN=true
+          export SKVOZ_TEST_RUNTIME="$fixture/bin/skvoz-network-runtime"
+          export SKVOZ_ANDROID_NATIVE="$fixture/bin"
+          export SKVOZ_TEST_NATS="$fixture/bin/nats-server"
+          cd "$fixture"
+          sudo --preserve-env=PATH,JAVA_HOME,GEM_HOME,GEM_PATH,BUNDLE_PATH,BUNDLE_APP_CONFIG,BUNDLE_GEMFILE,BUNDLE_FROZEN,SKVOZ_INTEGRATION,SKVOZ_TEST_RUNTIME,SKVOZ_ANDROID_NATIVE,SKVOZ_TEST_NATS \
+            setpriv --reuid 10001 --regid 10001 --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+            "$(command -v bundle)" exec rspec clients/android/spec --fail-fast
+      - name: Build APK, JVM tests and Android lint
+        working-directory: clients/android
+        run: |
+          version=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "SKVOZ_VERSION=$version" >> "$GITHUB_ENV"
+          code=$((1000000 + GITHUB_RUN_NUMBER))
+          test "$code" -lt 2100000000
+          echo "SKVOZ_VERSION_CODE=$code" >> "$GITHUB_ENV"
+          ./gradlew --no-daemon --max-workers=1 -PskvozVersionCode="$code" assembleDebug assembleDebugAndroidTest testDebugUnitTest lintDebug
+          python3 tools/check-apk.py app/build/outputs/apk/debug/app-debug.apk --version "$version" --version-code "$code" --build-tools "$ANDROID_HOME/build-tools/37.0.0"
+      - name: Require official signing credentials
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/android-v'))
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          SKVOZ_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for key in KEYSTORE_B64 SKVOZ_SIGNING_STORE_PASSWORD; do
+            if [[ -z "${!key}" ]]; then echo "Missing official Android signing secret: $key" >&2; exit 1; fi
+          done
+          umask 077
+          export SKVOZ_SIGNING_KEYSTORE="$RUNNER_TEMP/android-release.keystore"
+          signing_cert="$RUNNER_TEMP/android-release-cert.der"
+          trap 'rm -f -- "$SKVOZ_SIGNING_KEYSTORE" "$signing_cert"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/android-release.keystore"
+          test -s "$RUNNER_TEMP/android-release.keystore"
+          keytool -exportcert -alias skvoz-android -keystore "$SKVOZ_SIGNING_KEYSTORE" -storepass:env SKVOZ_SIGNING_STORE_PASSWORD -file "$signing_cert"
+          test -s "$signing_cert"
+          expected_cert=$(sha256sum "$signing_cert" | cut -d ' ' -f1)
+          cd clients/android
+          ./gradlew --no-daemon --max-workers=1 -PskvozVersionCode="$SKVOZ_VERSION_CODE" assembleRelease lintRelease
+          python3 tools/check-apk.py app/build/outputs/apk/release/app-release.apk --version "$SKVOZ_VERSION" --version-code "$SKVOZ_VERSION_CODE" --certificate-sha256 "$expected_cert" --build-tools "$ANDROID_HOME/build-tools/37.0.0"
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk "dist/skvoz-android-$SKVOZ_VERSION-$SKVOZ_VERSION_CODE.apk"
+          (cd dist && sha256sum ./*.apk > SHA256SUMS && sha256sum -c SHA256SUMS)
+      - name: Publish verified APK and SHA256
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/android-v'))
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' clients/android/app/build.gradle.kts)
+          test "$version" = "$SKVOZ_VERSION"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+            test "$tag" = "android-v$version"
+            options=(--verify-tag)
+          else
+            tag="android-v$version-build.$GITHUB_RUN_NUMBER"
+            options=(--target "$GITHUB_SHA")
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then echo 'Refusing to replace an existing Android release' >&2; exit 1; fi
+          printf '%s\n' "SKVOZ Android API31+, arm64-v8a/x86_64. Source: $GITHUB_SHA. versionCode: $SKVOZ_VERSION_CODE. APK подписан постоянным ключом разработчика; SHA256SUMS приложен." > "$RUNNER_TEMP/android-notes.txt"
+          gh release create "$tag" --draft "${options[@]}" --title "SKVOZ Android $version" --notes-file "$RUNNER_TEMP/android-notes.txt"
+          gh release upload "$tag" clients/android/dist/*.apk clients/android/dist/SHA256SUMS
+          gh release edit "$tag" --draft=false --latest=false

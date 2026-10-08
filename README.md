@@ -8,6 +8,7 @@ SKVOZ доставляет двунаправленные байтовые по�
 | Задача | С чего начать |
 | --- | --- |
 | Использовать настольное приложение | [Клиент Ubuntu](docs/ubuntu-client.md): установка deb, подключение и два режима работы. |
+| Использовать Android приложение | [Клиент Android](docs/android-client.md): APK, Прокси/ВПН и системные настройки. |
 | Развернуть серверный коннектор | [Руководство сервера](docs/server-connector.md): Docker/Compose, NATS, учётные данные и TLS. |
 | Встроить доставку данных в своё приложение | [Библиотека Core](core/README.md) для Rust или [демон и IPC](docs/daemon-ipc.md) для других языков. |
 | Разрабатывать и проверять проект | [Первый запуск стенда](docs/getting-started.md), [карта исходников](docs/repository.md), [архитектура](docs/architecture.md). |
@@ -21,6 +22,7 @@ SKVOZ доставляет двунаправленные байтовые по�
 | [network/](network/README.md) | Общий TCP/IP runtime со встроенным Core, API 1, native boundary, Linux helper и FFI; сетевая квалификация новой интеграции продолжается. |
 | [connectors/server/](connectors/server/README.md) | Ruby host общего Rust runtime, управление NATS, пользователями и сертификатами; один образ для GHCR и локальной сборки. |
 | [clients/ubuntu/](clients/ubuntu/README.md) | Нативное GTK4/libadwaita приложение с общим runtime, локальными подключениями и сетевым интерфейсом. |
+| [clients/android/](clients/android/README.md) | Compose/Material3 приложение со встроенным тем же Rust runtime и Android VpnService; проверка на устройствах продолжается. |
 | [clients/python/](clients/python/README.md), [clients/ruby/](clients/ruby/README.md) | Самостоятельные IPC-примеры на стандартных библиотеках. |
 | [connectors/tcp/](connectors/tcp/README.md) | Экспериментальный ретранслятор одного TCP-сокета через встроенный Core. |
 | [testbench/](testbench/README.md) | Реальные NATS/TCP-сценарии и измерения нагрузки; отдельный стенд, не зависимость продукта. |

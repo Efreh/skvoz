@@ -12,6 +12,11 @@ clients/**
 !clients/ruby/
 !clients/ruby/**
 !clients/ubuntu/Cargo.toml
+!clients/android/
+clients/android/**
+!clients/android/native/
+clients/android/native/**
+!clients/android/native/Cargo.toml
 !connectors/
 !connectors/tcp/
 !connectors/tcp/**

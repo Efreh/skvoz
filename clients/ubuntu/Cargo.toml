@@ -29,7 +29,7 @@ workspace = true
 [features]
 default = ["desktop"]
 desktop = ["dep:gtk", "dep:adw"]
-qualification = []
+qualification = ["skvoz-network/enrollment-diagnostics"]
 
 [[bin]]
 name = "skvoz-client"

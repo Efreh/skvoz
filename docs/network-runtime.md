@@ -15,7 +15,7 @@ network 4, локальный API — 1. Это текущий контракт 
 управляющий JSON. Один runtime владеет одним Core, PeerId и диспетчером событий.
 [Самостоятельный демон Core / IPC 1](daemon-ipc.md) сохраняет отдельное назначение.
 
-Linux FD, TUN и `SCM_RIGHTS` вынесены в [native boundary](../network/native/README.md).
+Общие Linux/Android FD/TUN и Linux process/create/`SCM_RIGHTS` вынесены в [native boundary](../network/native/README.md).
 Основная библиотека и Core запрещают `unsafe`. Узкий
 [helper](../network/helper/README.md) создаёт TUN и собственные маршруты,
 правила firewall и настройки DNS. Он не принимает shell, скрипты, произвольные
@@ -347,3 +347,29 @@ cargo test --locked -p skvoz-network-native -p skvoz-network-helper -p skvoz-net
 [руководстве стенда](../testbench/README.md).
 Успех кодеков, compiler или ABI сам по себе не подтверждает сетевую
 изоляцию, поддержку платформы и пропускную способность.
+
+## Диагностика при библиотечном встраивании
+
+`RuntimeHandle::diagnostics(enabled) -> Result<RuntimeDiagnostics, RuntimeFailure>`
+управляет дополнительным сбором и читает последний числовой образец. Это Rust
+embedding API, не новая команда локального API1/FFI ABI1 или network wire.
+По умолчанию сбор выключен. ON/OFF изменяет epoch `collection`; переход OFF→ON
+начинает новые накопленные значения. До публикации `sample_age_ms=null`, при OFF
+числовые значения сброшены. Закрытый runtime возвращает `Closed`.
+
+Один actor владеет одним Core runtime; его внутренний recovery сохраняет текущие
+счётчики, но Core timing учитывает только Ready turns. Новый RuntimeHandle
+начинает отдельный collection, даже если его номер совпадает с предыдущим;
+host должен убрать старый образец при замене handle. Образцы публикуются не чаще
+раза в секунду. `elapsed_ms` — возраст сбора; `sample_age_ms` — возраст последнего
+образца. Host явно отличает pending, disabled и устаревшие значения.
+
+Фиксированное хранение диагностических значений резервирует1024 байта из прежнего
+runtime budget. Actor использует локальные счётчики, одно чтение atomic control
+за turn и один mailbox lock при публикации; синхронизации на каждый пакет нет.
+При OFF дополнительные timestamps пропускаются. `native_us` измеряет TUN turn,
+`drive_us` — вызов сетевого drive, `core_*_us` — вложенные времена Core в
+микросекундах с ожиданиями. Эти интервалы перекрываются и не показывают загрузку
+CPU. `read_full`/`write_full` считают полные серии из16 TUN операций,
+`read_block`/`write_block` — WouldBlock, `read_paused` — паузы при backpressure.
+Сбой чтения диагностики host обрабатывает отдельно от управления соединением.

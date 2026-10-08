@@ -1,4 +1,5 @@
 //! One owner actor shared by the executable and native embedding boundary.
+mod diagnostics;
 use crate::{
     budget::{Budget, Reservation},
     config::{Role, StartupConfig},
@@ -6,6 +7,7 @@ use crate::{
     tcp::{Socket, TcpConnection},
     *,
 };
+pub use diagnostics::RuntimeDiagnostics;
 use serde_json::{Value, json};
 use skvoz_core::PeerId;
 use skvoz_core::runtime::{Lifecycle, NatsRuntime, RuntimeKey};
@@ -28,6 +30,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Notify, Semaphore, mpsc},
 };
+fn elapsed_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFailure {
     InvalidArgument,
@@ -209,9 +214,14 @@ pub struct RuntimeHandle {
     done: std::sync::mpsc::Receiver<Result<(), RuntimeFailure>>,
     thread: Option<thread::JoinHandle<()>>,
     last_id: u32,
+    diagnostics: Arc<diagnostics::Mailbox>,
 }
 impl RuntimeHandle {
     pub fn start(config: StartupConfig, helper: Option<OwnedFd>) -> Result<Self, RuntimeFailure> {
+        #[cfg(target_os = "android")]
+        if config.role != Role::Client || helper.is_some() {
+            return Err(RuntimeFailure::InvalidArgument);
+        }
         config
             .validate()
             .map_err(|_| RuntimeFailure::InvalidArgument)?;
@@ -256,6 +266,7 @@ impl RuntimeHandle {
         let fixed = budget
             .reserve(
                 524288
+                    + diagnostics::RESERVATION
                     + config
                         .network
                         .limits
@@ -297,6 +308,7 @@ impl RuntimeHandle {
             wake.clone(),
             shutdown_deadline.clone(),
         );
+        let diagnostics = actor.diagnostics.clone();
         let thread = thread::Builder::new()
             .name("skvoz-network".into())
             .spawn(move || {
@@ -326,6 +338,7 @@ impl RuntimeHandle {
             done,
             thread: Some(thread),
             last_id: 0,
+            diagnostics,
         })
     }
     pub fn request_json(
@@ -382,6 +395,20 @@ impl RuntimeHandle {
                 })
             }
         }
+    }
+    /// Opt-in owner timings. Pending/disabled snapshots have no sample age.
+    /// This control does not extract messages, alter credit, or wake traffic loops.
+    pub fn diagnostics(&self, enabled: bool) -> Result<RuntimeDiagnostics, RuntimeFailure> {
+        let output = self
+            .output
+            .state
+            .lock()
+            .map_err(|_| RuntimeFailure::Internal)?;
+        if self.stop.load(Ordering::Acquire) || output.closed {
+            return Err(RuntimeFailure::Closed);
+        }
+        drop(output);
+        self.diagnostics.read(enabled)
     }
     pub fn next_message(
         &mut self,
@@ -483,7 +510,15 @@ struct ProxyPending {
     _reservation: Reservation,
     terminal: bool,
 }
+#[derive(Default)]
+struct ActorDiagnostics {
+    control: u64,
+    started: Option<Instant>,
+    value: RuntimeDiagnostics,
+}
 struct Actor {
+    diagnostics: Arc<diagnostics::Mailbox>,
+    profile: ActorDiagnostics,
     config: StartupConfig,
     policy: Option<Arc<crate::config::ServerConfig>>,
     engine: Option<NetworkEngine>,
@@ -596,6 +631,8 @@ impl Actor {
             shutdown_deadline,
             counters: local_api::Counters::default(),
             admission_errors: [0; 10],
+            diagnostics: Arc::new(diagnostics::Mailbox::new()),
+            profile: ActorDiagnostics::default(),
             terminal_wait: None,
         }
     }
@@ -724,9 +761,37 @@ impl Actor {
                  _=tokio::time::sleep(Duration::from_millis(5))=>{},
                 }
             } else if !connect_error {
+                let control = self.diagnostics.control();
+                if control != self.profile.control {
+                    let enabled = control & 1 != 0;
+                    self.profile = ActorDiagnostics {
+                        control,
+                        started: enabled.then(Instant::now),
+                        value: RuntimeDiagnostics {
+                            enabled,
+                            collection: control >> 1,
+                            ..RuntimeDiagnostics::default()
+                        },
+                    };
+                    if let Some(engine) = self.engine.as_mut() {
+                        // Toggle off first to reset a new collection even after a rapid off/on.
+                        engine.runtime.set_diagnostics_enabled(false);
+                        engine.runtime.set_diagnostics_enabled(enabled);
+                    }
+                }
                 self.backend_turn().await?;
                 self.proxy_turn().await?;
+                let profile_native = self.profile.value.enabled.then(Instant::now);
                 self.native_turn()?;
+                if let Some(start) = profile_native {
+                    self.profile.value.turns = self.profile.value.turns.saturating_add(1);
+                    self.profile.value.native_us = self
+                        .profile
+                        .value
+                        .native_us
+                        .saturating_add(elapsed_us(start));
+                }
+                let profile_drive = self.profile.value.enabled.then(Instant::now);
                 if let Some(engine) = self.engine.as_mut()
                     && let Err(error) = engine
                         .drive_with_wake(Duration::from_millis(5), self.wake.notified())
@@ -739,6 +804,13 @@ impl Actor {
                     );
                     self.state("starting", Some(ApiError::NetworkUnavailable))?;
                 }
+                if let Some(start) = profile_drive {
+                    self.profile.value.drive_us = self
+                        .profile
+                        .value
+                        .drive_us
+                        .saturating_add(elapsed_us(start));
+                }
                 self.finish_stop()?;
                 self.ip_events()?;
             } else {
@@ -747,9 +819,34 @@ impl Actor {
             if self.hello && self.stats.elapsed() >= Duration::from_secs(1) {
                 self.stats = Instant::now();
                 self.update_counters();
+                self.publish_diagnostics();
                 self.event("STATS", json!({"counters":self.counters}))?;
             }
         }
+    }
+    fn publish_diagnostics(&mut self) {
+        if !self.profile.value.enabled {
+            return;
+        }
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        let c = engine.runtime.diagnostics();
+        let value = &mut self.profile.value;
+        value.samples = value.samples.saturating_add(1);
+        value.elapsed_ms = self
+            .profile
+            .started
+            .map(|s| u64::try_from(s.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        value.core_turns = c.turns;
+        value.core_turn_us = c.turn_us;
+        value.core_progress = c.progress;
+        value.core_idle_count = c.idle_count;
+        value.core_idle_us = c.idle_us;
+        value.core_output_us = c.output_us;
+        // A diagnostics-reader failure must never retire healthy traffic.
+        let _ = self.diagnostics.publish(self.profile.control, *value);
     }
     fn update_counters(&mut self) {
         let usage = self.budget.usage();
@@ -2043,6 +2140,8 @@ impl Actor {
                 .poll_packet()
                 .map(|p| (p, Instant::now() + Duration::from_secs(1)));
         }
+        let measured = self.profile.value.enabled;
+        let mut written = 0usize;
         for _ in 0..16 {
             let Some((packet, deadline)) = self.packet_pending.as_ref() else {
                 break;
@@ -2056,6 +2155,9 @@ impl Actor {
             }
             match tun.try_write_packet(&packet.packet) {
                 Ok(()) => {
+                    if measured {
+                        written += 1;
+                    }
                     let (packet, _) = self.packet_pending.take().unwrap();
                     engine.account_native(packet.key.stream.peer, 0, packet.packet.len() + 8, 1);
                     engine.note_native_packet_write(packet.packet.len());
@@ -2071,17 +2173,34 @@ impl Actor {
                         .poll_packet()
                         .map(|p| (p, Instant::now() + Duration::from_secs(1)));
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if measured {
+                        self.profile.value.write_block =
+                            self.profile.value.write_block.saturating_add(1);
+                    }
+                    break;
+                }
                 Err(_) => return Err(RuntimeFailure::Internal),
             }
         }
+        if measured && written == 16 {
+            self.profile.value.write_full = self.profile.value.write_full.saturating_add(1);
+        }
         let mut buffer = [0u8; 1501];
+        let mut read = 0usize;
         for _ in 0..16 {
             if !engine.packet_input_ready() {
+                if measured {
+                    self.profile.value.read_paused =
+                        self.profile.value.read_paused.saturating_add(1);
+                }
                 break;
             }
             match tun.try_read_packet(&mut buffer) {
                 Ok(n) => {
+                    if measured {
+                        read += 1;
+                    }
                     let session = if self.config.role == Role::Client {
                         engine
                             .sessions()
@@ -2122,9 +2241,18 @@ impl Actor {
                             self.counters.packet_dropped.saturating_add(1);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if measured {
+                        self.profile.value.read_block =
+                            self.profile.value.read_block.saturating_add(1);
+                    }
+                    break;
+                }
                 Err(_) => return Err(RuntimeFailure::Internal),
             }
+        }
+        if measured && read == 16 {
+            self.profile.value.read_full = self.profile.value.read_full.saturating_add(1);
         }
         Ok(())
     }
@@ -2740,6 +2868,7 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(1);
         let (_done_sender, done) = std::sync::mpsc::channel();
         let mut handle = RuntimeHandle {
+            diagnostics: Arc::new(diagnostics::Mailbox::new()),
             commands: Some(commands),
             output,
             budget: Budget::new(2_000_000, 64),
@@ -2751,6 +2880,7 @@ mod tests {
             thread: None,
             last_id: 0,
         };
+        assert!(!handle.diagnostics(false).unwrap().enabled);
         let duplicate = skvoz_network_native::duplicate_cloexec(observer.as_fd()).unwrap();
         drop(observer);
         assert_eq!(
@@ -2764,6 +2894,10 @@ mod tests {
             handle.request_json(b"{}", None),
             Err(RuntimeFailure::Closed)
         );
+        assert!(matches!(
+            handle.diagnostics(true),
+            Err(RuntimeFailure::Closed)
+        ));
         use std::io::Read;
         assert_eq!(owner.read(&mut [0]).unwrap(), 0);
         drop(config);

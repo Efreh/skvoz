@@ -4,6 +4,7 @@ pub mod budget;
 mod codec;
 pub mod config;
 mod engine;
+pub mod enrollment;
 pub mod local_api;
 mod packet;
 pub mod policy;
@@ -38,11 +39,23 @@ impl From<skvoz_core::runtime::RuntimeError> for NetworkError {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "portable-runtime"
+))]
 mod proxy;
-#[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "portable-runtime"
+))]
 pub mod runtime;
-#[cfg(all(target_os = "linux", feature = "linux-runtime"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "portable-runtime"
+))]
 mod tcp;
-#[cfg(all(target_os = "linux", feature = "linux-runtime"))]
-pub use runtime::{OwnedMessage, PollError, RuntimeFailure, RuntimeHandle};
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "portable-runtime"
+))]
+pub use runtime::{OwnedMessage, PollError, RuntimeDiagnostics, RuntimeFailure, RuntimeHandle};

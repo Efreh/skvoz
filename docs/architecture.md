@@ -26,6 +26,14 @@ Root helper настраивает клиентские маршруты/DNS/gua
 Core wire — 2. Источники новой интеграции ещё требуют квалификации
 установленных приложений и реального gateway.
 
+[Клиент Android](android-client.md) 1.1.0 встраивает тот же `RuntimeHandle`
+через bounded JNI в APK. Kotlin/Compose управляет foreground service, профилем
+в DataStore/Android Keystore и Android VpnService.Builder; packets/TCP bytes
+остаются внутри Rust. Один nonblocking TUN FD принадлежит actor; Linux helper
+не нужен. Default доверие экспортируется из Android trusted anchors в private
+ManagedCa PEM, imported CA — явное переопределение. Реальное device/TUN поведение
+требует отдельной квалификации; crossbuild/JVM checks её не заменяют.
+
 Manager привязывает поток к `(PeerId, stream_id)` и отдельно ограничивает число
 активных и закрывающихся потоков. Aggregate byte/record backing обеспечивает
 уже объявленный peer credit; приём и отправка ограничены глобально и по peers.
@@ -58,6 +66,13 @@ flowchart TB
         ui <-->|"API 1: команды, события, TUN FD"| cr
         ui <-->|"Polkit, helper API 1, TUN FD"| ch
     end
+    subgraph android["Клиент Android"]
+        au["Compose: настройки и состояние"]
+        as["Фоновая служба; Android Keystore; VpnService.Builder"]
+        ar["JNI: общий Rust runtime/Core, TCP и TUN"]
+        au <-->|"Состояние и действия"| as
+        as <-->|"API 1: передача TUN FD"| ar
+    end
     subgraph server["Серверный контейнер"]
         host["Ruby UID 10001: процессы, пользователи, TLS"]
         sr["Rust runtime UID 10001: тот же Core, TCP/TUN I/O"]
@@ -69,6 +84,7 @@ flowchart TB
         sr <-->|"Общие потоки Core"| broker
         sr <-->|"Native сокет / TUN и kernel gateway"| target
     end
+    ar <-->|"INFO → TLS → CONNECT"| broker
     cr <-->|"Потоки Core через TLS"| broker
 ```
 
