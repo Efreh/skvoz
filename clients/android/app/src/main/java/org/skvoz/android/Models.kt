@@ -57,6 +57,7 @@ internal data class ConnectionState(
     val uploaded: Long = 0, val downloaded: Long = 0, val upRate: Long = 0, val downRate: Long = 0,
     val started: Long = 0, val elapsed: Long = 0, val alwaysOn: Boolean = false,
     val lockdown: Boolean = false, val journal: List<JournalEntry> = emptyList(),
+    val display: ConnectionDisplaySnapshot? = null,
 ) { val active get() = phase !in setOf("disconnected", "error") }
 internal fun journal(previous: List<JournalEntry>, time: Long, code: String): List<JournalEntry> {
     return previous.takeLast(199) + JournalEntry(time, journalCode(code))

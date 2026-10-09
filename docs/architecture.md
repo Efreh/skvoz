@@ -26,7 +26,7 @@ Root helper настраивает клиентские маршруты/DNS/gua
 Core wire — 2. Источники новой интеграции ещё требуют квалификации
 установленных приложений и реального gateway.
 
-[Клиент Android](android-client.md) 1.1.0 встраивает тот же `RuntimeHandle`
+[Клиент Android](android-client.md) 1.2.0 встраивает тот же `RuntimeHandle`
 через bounded JNI в APK. Kotlin/Compose управляет foreground service, профилем
 в DataStore/Android Keystore и Android VpnService.Builder; packets/TCP bytes
 остаются внутри Rust. Один nonblocking TUN FD принадлежит actor; Linux helper

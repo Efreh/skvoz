@@ -7,35 +7,53 @@ import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.os.SystemClock
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import android.provider.Settings as AndroidSettings
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.serialization.json.*
 
 internal const val ACTION_START = "org.skvoz.android.START"
 internal const val ACTION_STOP = "org.skvoz.android.STOP"
+internal const val ACTION_SHOW_CONNECTION = "org.skvoz.android.SHOW_CONNECTION"
 private const val CHANNEL = "connection"
 
 internal class Foreground(private val service: Service, private val owner: ConnectionOwner) {
     private val notificationId = if (owner.mode == Mode.VPN) 2 else 1
     private var observing = false
+    private val cadence = NotificationCadence()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val app get() = service.application as SkvozApplication
     fun start() {
         val manager = service.getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(NotificationChannel(CHANNEL, "Соединение", NotificationManager.IMPORTANCE_LOW))
+        manager.createNotificationChannel(NotificationChannel(CHANNEL, "Соединение", NotificationManager.IMPORTANCE_DEFAULT).apply {
+            setSound(null, null); enableVibration(false); enableLights(false); setShowBadge(false)
+        })
         val type = if (Build.VERSION.SDK_INT < 34) 0 else if (owner.mode == Mode.VPN) ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        service.startForeground(notificationId, notification("Подготовка"), type)
-        if (!observing) { observing = true; scope.launch { app.connections.state.collectLatest { state -> manager.notify(notificationId, notification(phaseText(state.phase))) } } }
+        service.startForeground(notificationId, notification(ConnectionState(phase = "preparing", mode = owner.mode)), type)
+        if (!observing) { observing = true; scope.launch { app.connections.state.collect { state ->
+            if (state.mode != owner.mode) return@collect
+            val interactive = service.getSystemService(PowerManager::class.java).isInteractive
+            val allowed = interactive && NotificationManagerCompat.from(service).areNotificationsEnabled() && manager.getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
+            if (cadence.shouldPublish(notificationContent(state), SystemClock.elapsedRealtime(), interactive, allowed))
+                manager.notify(notificationId, notification(state))
+        } } }
     }
-    private fun notification(text: String): Notification {
-        val open = PendingIntent.getActivity(service, 0, Intent(service, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    private fun notification(state: ConnectionState): Notification {
+        val content = notificationContent(state)
+        val open = PendingIntent.getActivity(service, 0, Intent(service, MainActivity::class.java).setAction(ACTION_SHOW_CONNECTION)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val action = if (owner.alwaysOn) PendingIntent.getActivity(service, 1, Intent(AndroidSettings.ACTION_VPN_SETTINGS), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             else PendingIntent.getService(service, 1, Intent(service, service.javaClass).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        return Notification.Builder(service, CHANNEL).setSmallIcon(R.drawable.ic_connection)
-            .setContentTitle("Соединение SKVOZ").setContentText(text).setContentIntent(open).setOngoing(true)
-            .setOnlyAlertOnce(true).setCategory(Notification.CATEGORY_SERVICE)
-            .addAction(Notification.Action.Builder(null, if (owner.alwaysOn) "Настройки ВПН" else "Отключить", action).build()).build()
+        return NotificationCompat.Builder(service, CHANNEL).setSmallIcon(R.drawable.ic_connection)
+            .setContentTitle(content.title).setContentText(content.status).setContentIntent(open).setOngoing(true)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content.expanded))
+            .setOnlyAlertOnce(true).setSilent(true).setShowWhen(false).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE).setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .addAction(0, if (owner.alwaysOn) "Настройки ВПН" else "Отключиться", action).build()
     }
     fun close() { scope.cancel(); service.stopForeground(Service.STOP_FOREGROUND_REMOVE) }
 }

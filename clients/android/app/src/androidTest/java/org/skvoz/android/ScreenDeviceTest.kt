@@ -8,10 +8,17 @@ import org.junit.Test
 class ScreenDeviceTest {
     @get:Rule val compose = createAndroidComposeRule<MainActivity>()
     @Test fun modesAndSettingsRemainAccessible() {
-        compose.onNodeWithText("Соединение SKVOZ").assertIsDisplayed()
-        compose.onNodeWithText("Настройки").performClick()
-        compose.onNodeWithText("Настройки соединения").assertExists()
+        compose.waitUntil(timeoutMillis = 5000) {
+            compose.onAllNodesWithText("Подключить").fetchSemanticsNodes().isNotEmpty()
+        }
+        if (compose.onAllNodesWithText("Профиль подключения").fetchSemanticsNodes().isNotEmpty()) {
+            compose.onNodeWithText("Пароль").assertExists()
+            compose.onNodeWithContentDescription("Назад").performClick()
+        }
+        compose.onNodeWithContentDescription("Меню").performClick()
+        compose.onNodeWithText("Настройки", useUnmergedTree = true).performClick()
+        compose.onNodeWithText("Доверие TLS").performClick()
         compose.onNodeWithText("Импорт CA").assertExists()
-        compose.onNodeWithText("Пароль").assertExists()
+        compose.onNodeWithText("Проверка TLS обязательна").assertExists()
     }
 }

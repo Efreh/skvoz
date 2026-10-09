@@ -72,7 +72,7 @@ internal class ConnectionController(private val app: SkvozApplication) {
     fun report(code: String) { record(code); mutable.update { it.copy(phase = "error", error = code) } }
     private fun transition(phase: String, owner: ConnectionOwner, error: String? = null) {
         record(error ?: phase)
-        diagnosticMutable.value = DiagnosticState()
+        diagnosticMutable.value = DiagnosticState(run = mutable.value.started)
         mutable.update { it.copy(phase = phase, mode = owner.mode, error = error, alwaysOn = owner.alwaysOn,
             lockdown = owner.lockdown, upRate = 0, downRate = 0) }
     }
@@ -83,7 +83,8 @@ internal class ConnectionController(private val app: SkvozApplication) {
         var attempt = 0
         try {
             monitor.register()
-            mutable.update { it.copy(uploaded = 0, downloaded = 0, started = started, elapsed = 0, upRate = 0, downRate = 0) }
+            mutable.update { it.copy(phase = "preparing", mode = owner.mode, error = null, alwaysOn = owner.alwaysOn, lockdown = owner.lockdown,
+                uploaded = 0, downloaded = 0, started = started, elapsed = 0, upRate = 0, downRate = 0, display = null) }
             while (currentCoroutineContext().isActive) {
                 try {
                     transition(if (attempt == 0) "preparing" else "reconnecting", owner)
@@ -113,6 +114,7 @@ internal class ConnectionController(private val app: SkvozApplication) {
         val settings = app.profiles.read()
         settings.validate(true)
         if (settings.mode != owner.mode) throw ClientFailure("mode_mismatch")
+        mutable.update { it.copy(display = settings.displaySnapshot()) }
         val config = enrollProfile(settings, signals, owner)
         currentCoroutineContext().ensureActive()
         if (signals.network.get() != network) throw ClientFailure("network_unavailable")
@@ -152,7 +154,7 @@ internal class ConnectionController(private val app: SkvozApplication) {
         return { event ->
             if (event["event"]?.jsonPrimitive?.content == "STATS") {
                 val counters = event["data"]!!.jsonObject["counters"]!!.jsonObject
-                try { val basic = basicMetrics(counters); diagnosticMutable.update { it.copy(basic = basic) } }
+                try { val basic = basicMetrics(counters); diagnosticMutable.update { it.copy(basic = basic, run = started) } }
                 catch (_: Exception) { diagnosticMutable.update { it.copy(code = "diagnostics_unavailable") } }
                 val up = counters["uploaded"]!!.jsonPrimitive.long
                 val down = counters["downloaded"]!!.jsonPrimitive.long
@@ -171,6 +173,10 @@ internal class ConnectionController(private val app: SkvozApplication) {
         }).jsonObject
         if (result["http"]?.jsonPrimitive?.content != "http://127.0.0.1:${settings.httpPort}" ||
             result["socks"]?.jsonPrimitive?.content != "socks5://127.0.0.1:${settings.socksPort}") throw ClientFailure("native_invalid_response")
+        mutable.update { it.copy(display = it.display?.copy(
+            httpUri = result.getValue("http").jsonPrimitive.content,
+            socksUri = result.getValue("socks").jsonPrimitive.content,
+        )) }
     }
     private suspend fun setupVpn(session: NativeSession, owner: ConnectionOwner, settings: Settings) {
         val handle = session.call("START_IP", buildJsonObject {

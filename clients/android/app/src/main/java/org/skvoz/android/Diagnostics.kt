@@ -7,7 +7,7 @@ internal val DETAILED_METRICS = listOf("collection", "samples", "elapsed_ms", "t
 internal data class DiagnosticSnapshot(val enabled: Boolean, val age: ULong?, val values: Map<String, ULong>) {
     val fresh get() = enabled && age != null && age <= 3000uL
 }
-internal data class DiagnosticState(val basic: Map<String, ULong> = emptyMap(), val detail: DiagnosticSnapshot? = null, val code: String? = null)
+internal data class DiagnosticState(val basic: Map<String, ULong> = emptyMap(), val detail: DiagnosticSnapshot? = null, val code: String? = null, val run: Long = 0)
 internal data class DiagnosticControls(val open: Boolean = false, val detailed: Boolean = false)
 // Control epochs preserve rapid UI OFF/ON even while the native IO owner is polling.
 internal class DiagnosticControl {
@@ -66,7 +66,7 @@ internal fun diagnosticSnapshot(raw: String): DiagnosticSnapshot {
 }
 // Explicit fields only: never stringify profile, raw events, exceptions or device state.
 internal fun diagnosticReport(state: ConnectionState, diagnostics: DiagnosticState): String = buildString {
-    appendLine("SKVOZ Android 1.1.0; runtime=0.4.2; API=1; network=4; Core=4.0.1")
+    appendLine("SKVOZ Android ${BuildConfig.VERSION_NAME}; runtime=0.4.2; API=1; network=4; Core=4.0.1")
     appendLine("phase=${journalCode(state.phase)}; error=${state.error?.let(::journalCode) ?: "none"}")
     BASIC_METRICS.forEach { key -> diagnostics.basic[key]?.let { appendLine("$key=$it") } }
     val detail = diagnostics.detail

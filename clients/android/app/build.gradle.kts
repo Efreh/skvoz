@@ -12,8 +12,8 @@ android {
         applicationId = "org.skvoz.android"
         minSdk = 31
         targetSdk = 37
-        versionCode = providers.gradleProperty("skvozVersionCode").orElse("5").get().toInt()
-        versionName = "1.1.0"
+        versionCode = providers.gradleProperty("skvozVersionCode").orElse("6").get().toInt()
+        versionName = "1.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
@@ -51,6 +51,9 @@ dependencies {
     implementation(composeBom)
     androidTestImplementation(composeBom)
     implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.navigation:navigation-compose:2.10.2")
+    implementation("androidx.core:core-ktx:1.19.1")
+    implementation("androidx.window:window:1.5.1")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.ui:ui-tooling-preview")
