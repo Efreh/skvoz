@@ -38,6 +38,9 @@ import org.skvoz.android.ui.*
     val diagnostics by model.diagnostics.collectAsStateWithLifecycle()
     val controls by model.diagnosticControls.collectAsStateWithLifecycle()
     val ranges by model.ranges.collectAsStateWithLifecycle()
+    val preferences by model.displayPreferences.collectAsStateWithLifecycle()
+    val resources by model.resources.collectAsStateWithLifecycle()
+    val resourceRanges by model.resourceRanges.collectAsStateWithLifecycle()
     val nav = rememberNavController()
     val entry by nav.currentBackStackEntryAsState()
     val route = entry?.destination
@@ -76,6 +79,10 @@ import org.skvoz.android.ui.*
         model.diagnosticPanel(isDiagnostics)
         onDispose { model.diagnosticPanel(false) }
     }
+    DisposableEffect(home, editor.loaded) {
+        model.resourceHome(home && editor.loaded)
+        onDispose { model.resourceHome(false) }
+    }
     BackHandler(enabled = home && !menu, onBack = onBackground)
     val title = when {
         route?.hasRoute<ProfileRoute>() == true -> "Профиль подключения"
@@ -105,12 +112,12 @@ import org.skvoz.android.ui.*
                             }
                         } else NavHost(nav, startDestination = ConnectionRoute) {
                             composable<ConnectionRoute> { HomeScreen(editor, state, startup, ranges, onConnect, model::stop, onVpnSettings,
-                                { go(ProfileRoute) }, { go(ApplicationsRoute) }, { mode -> model.edit { it.copy(mode = mode) } }, copy, { go(TrustRoute) }) }
+                                { go(ProfileRoute) }, { go(ApplicationsRoute) }, { mode -> model.edit { it.copy(mode = mode) } }, copy, { go(TrustRoute) }, preferences.format, preferences.showResources, resources, resourceRanges) }
                             composable<ProfileRoute> { ProfileScreen(editor, state, startup != null, model::text,
                                 { mode -> model.edit { it.copy(mode = mode) } }, onConnect, { go(ApplicationsRoute) }) }
                             composable<ApplicationsRoute> { ApplicationsScreen(editor, state, startup != null, model::selected,
                                 { policy -> model.edit { it.copy(appPolicy = policy) } }, model::listApps, { focus.clearFocus(); keyboard?.hide(); nav.popBackStack() }) }
-                            composable<SettingsRoute> { SettingsScreen(editor, state, { go(ProxyRoute) }, { go(ApplicationsRoute) }, { go(TrustRoute) }, onVpnSettings, onBatterySettings) }
+                            composable<SettingsRoute> { SettingsScreen(editor, state, { go(ProxyRoute) }, { go(ApplicationsRoute) }, { go(TrustRoute) }, onVpnSettings, onBatterySettings, preferences, model::speedFormat, model::showResources) }
                             composable<ProxyRoute> { ProxyScreen(editor, state, startup != null, model::text, onConnect, copy) }
                             composable<TrustRoute> { TrustScreen(editor, startup != null, onImport, { model.edit { it.copy(customCa = false) } }) }
                             composable<DiagnosticsRoute> { DiagnosticsScreen(state, diagnostics, controls, ranges, model::diagnosticDetail, copy) }

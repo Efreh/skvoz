@@ -12,8 +12,8 @@ android {
         applicationId = "org.skvoz.android"
         minSdk = 31
         targetSdk = 37
-        versionCode = providers.gradleProperty("skvozVersionCode").orElse("6").get().toInt()
-        versionName = "1.2.0"
+        versionCode = providers.gradleProperty("skvozVersionCode").orElse("7").get().toInt()
+        versionName = "1.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }

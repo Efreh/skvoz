@@ -8,10 +8,16 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import org.skvoz.android.*
 
 @Composable internal fun SettingsScreen(editor: Editor, state: ConnectionState,
-    proxy: () -> Unit, apps: () -> Unit, trust: () -> Unit, vpn: () -> Unit, battery: () -> Unit) {
+    proxy: () -> Unit, apps: () -> Unit, trust: () -> Unit, vpn: () -> Unit, battery: () -> Unit,
+    preferences: DisplayPreferenceState = DisplayPreferenceState(DisplayPreferences()), format: (SpeedFormat) -> Unit = {}, resources: (Boolean) -> Unit = {}) {
     var batteryDialog by remember { mutableStateOf(false) }
     FormPage {
         if (editor.dirty) Notice("Изменения не применены")
@@ -19,6 +25,30 @@ import org.skvoz.android.*
         TaskRow("Настройки прокси", "HTTP ${editor.httpPort} · SOCKS5 ${editor.socksPort}", Glyph.SETTINGS, proxy)
         TaskRow("Приложения ВПН", policySummary(editor.settings.appPolicy, editor.settings.packages.size), Glyph.APPS, apps)
         TaskRow("Доверие TLS", if (editor.settings.customCa) "Импортированный CA" else "Доверенные центры Android", Glyph.SHIELD, trust)
+        SectionTitle("Формат скорости")
+        Column(Modifier.fillMaxWidth().selectableGroup()) {
+            SpeedFormat.entries.forEach { item ->
+                Row(Modifier.fillMaxWidth().selectable(preferences.format == item,
+                    enabled = preferences.value != null && !preferences.saving, role = Role.RadioButton, onClick = { format(item) })
+                    .heightIn(min = SkvozLayout.TouchHeight), verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(preferences.format == item, onClick = null, enabled = preferences.value != null && !preferences.saving,
+                        modifier = Modifier.clearAndSetSemantics {})
+                    Text(if (item == SpeedFormat.BYTES) "Байты/с" else "Биты/с", Modifier.weight(1f))
+                }
+            }
+        }
+        Hint(if (preferences.saving) "Сохранение…" else "Масштаб выбирается автоматически. Выбор сохраняется сразу и не требует переподключения.")
+        SectionTitle("Ресурсы приложения")
+        Row(Modifier.fillMaxWidth().toggleable(preferences.showResources,
+            enabled = preferences.value != null && !preferences.saving, role = Role.Switch, onValueChange = resources)
+            .heightIn(min = SkvozLayout.TouchHeight), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Показывать ресурсы приложения", Modifier.weight(1f))
+            Switch(preferences.showResources, onCheckedChange = null, enabled = preferences.value != null && !preferences.saving,
+                modifier = Modifier.clearAndSetSemantics {})
+        }
+        Hint("Общий CPU и RAM, включая Rust, на главном экране. Сбор работает только пока этот экран виден. Выбор сохраняется сразу.")
+        if (preferences.error != null) Notice("Не удалось ${if (preferences.value == null) "прочитать" else "сохранить"} настройки отображения.", error = true)
         SectionTitle("Работа в фоне")
         TaskRow("При выключенном экране", when (editor.batteryExempt) {
             true -> "Экономия заряда для SKVOZ отключена"; false -> "Android может ограничивать сеть"; null -> "Статус экономии заряда неизвестен"

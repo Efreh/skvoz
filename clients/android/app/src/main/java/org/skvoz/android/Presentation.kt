@@ -95,6 +95,18 @@ internal data class DisplayRanges(
 }
 
 internal fun volume(bytes: Long): String = volume(bytes.coerceAtLeast(0).toULong())
+internal fun speed(bytes: Long, format: SpeedFormat) = speed(bytes.coerceAtLeast(0).toULong(), format)
+internal fun speed(bytes: ULong, format: SpeedFormat): String {
+    if (format == SpeedFormat.BYTES) return "${volume(bytes)}/с"
+    // Convert in floating point to avoid overflowing unsigned byte counters when multiplying by eight.
+    val bits = bytes.toDouble() * 8.0
+    return when {
+        bits >= 1e9 -> "%.1f Гбит/с".format(bits / 1e9)
+        bits >= 1e6 -> "%.1f Мбит/с".format(bits / 1e6)
+        bits >= 1e3 -> "%.1f Кбит/с".format(bits / 1e3)
+        else -> "${(bytes * 8uL)} бит/с"
+    }
+}
 internal fun volume(bytes: ULong): String = when {
     bytes >= 1073741824uL -> "%.1f ГиБ".format(bytes.toDouble() / 1073741824.0)
     bytes >= 1048576uL -> "%.1f МиБ".format(bytes.toDouble() / 1048576.0)

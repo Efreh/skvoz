@@ -14,6 +14,7 @@ import androidx.core.app.NotificationManagerCompat
 import android.provider.Settings as AndroidSettings
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
 import kotlinx.serialization.json.*
 
 internal const val ACTION_START = "org.skvoz.android.START"
@@ -34,16 +35,16 @@ internal class Foreground(private val service: Service, private val owner: Conne
         })
         val type = if (Build.VERSION.SDK_INT < 34) 0 else if (owner.mode == Mode.VPN) ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         service.startForeground(notificationId, notification(ConnectionState(phase = "preparing", mode = owner.mode)), type)
-        if (!observing) { observing = true; scope.launch { app.connections.state.collect { state ->
+        if (!observing) { observing = true; scope.launch { combine(app.connections.state, app.displayPreferences.state) { state, preferences -> state to preferences.format }.collect { (state, format) ->
             if (state.mode != owner.mode) return@collect
             val interactive = service.getSystemService(PowerManager::class.java).isInteractive
             val allowed = interactive && NotificationManagerCompat.from(service).areNotificationsEnabled() && manager.getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
-            if (cadence.shouldPublish(notificationContent(state), SystemClock.elapsedRealtime(), interactive, allowed))
-                manager.notify(notificationId, notification(state))
+            if (cadence.shouldPublish(notificationContent(state, format), SystemClock.elapsedRealtime(), interactive, allowed))
+                manager.notify(notificationId, notification(state, format))
         } } }
     }
-    private fun notification(state: ConnectionState): Notification {
-        val content = notificationContent(state)
+    private fun notification(state: ConnectionState, format: SpeedFormat = app.displayPreferences.state.value.format): Notification {
+        val content = notificationContent(state, format)
         val open = PendingIntent.getActivity(service, 0, Intent(service, MainActivity::class.java).setAction(ACTION_SHOW_CONNECTION)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val action = if (owner.alwaysOn) PendingIntent.getActivity(service, 1, Intent(AndroidSettings.ACTION_VPN_SETTINGS), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)

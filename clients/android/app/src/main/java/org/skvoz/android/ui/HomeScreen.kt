@@ -21,6 +21,8 @@ import org.skvoz.android.*
     editor: Editor, state: ConnectionState, startup: PendingStartup?, ranges: DisplayRanges,
     submit: () -> Unit, stop: () -> Unit, vpnSettings: () -> Unit,
     profile: () -> Unit, applications: () -> Unit, mode: (Mode) -> Unit, copy: (String) -> Unit, trust: () -> Unit,
+    speedFormat: SpeedFormat = SpeedFormat.BYTES, showResources: Boolean = false,
+    resources: ResourceState = ResourceState(), resourceRanges: ResourceRanges = ResourceRanges(),
 ) {
     val fontScale = LocalDensity.current.fontScale
     val error = editor.error ?: state.error
@@ -96,8 +98,8 @@ import org.skvoz.android.*
                     }
                     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Hint("Текущая скорость")
-                        Meter("Получение", if (state.phase == "connected") state.downRate.coerceAtLeast(0).toULong() else 0uL, ranges.rate, true, Glyph.DOWN)
-                        Meter("Отправка", if (state.phase == "connected") state.upRate.coerceAtLeast(0).toULong() else 0uL, ranges.rate, true, Glyph.UP)
+                        Meter("Получение", if (state.phase == "connected") state.downRate.coerceAtLeast(0).toULong() else 0uL, ranges.rate, true, Glyph.DOWN, speedFormat)
+                        Meter("Отправка", if (state.phase == "connected") state.upRate.coerceAtLeast(0).toULong() else 0uL, ranges.rate, true, Glyph.UP, speedFormat)
                     }
                     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (!state.active && state.started > 0) Hint("Последняя сессия")
@@ -112,6 +114,7 @@ import org.skvoz.android.*
                             }
                         }
                     }
+                    if (showResources) ResourceMeters(resources, resourceRanges)
                     if ((display?.mode ?: editor.settings.mode) == Mode.VPN || editor.settings.mode == Mode.VPN) {
                         val policy = display?.appPolicy ?: editor.settings.appPolicy
                         val count = display?.packageCount ?: editor.settings.packages.size
@@ -141,5 +144,16 @@ internal fun policySummary(policy: AppPolicy, count: Int) =
     Row(Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}, horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
         Text(label, Modifier.weight(1f), color = SkvozColors.Secondary, style = MaterialTheme.typography.bodyMedium)
         Text(value, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+@Composable internal fun ResourceMeters(resources: ResourceState, ranges: ResourceRanges) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Hint("Ресурсы приложения")
+        Meter("CPU", cpuBasisPoints(resources.cpu), ranges.cpu, glyph = Glyph.CPU,
+            valueLabel = cpuLabel(resources.cpu), rangeLabel = cpuLabel(ranges.cpu.toDouble() / 100))
+        Meter("RAM (PSS)", (resources.pssBytes ?: 0).coerceAtLeast(0).toULong(), ranges.ram, glyph = Glyph.MEMORY,
+            valueLabel = resources.pssBytes?.let { volume(it) } ?: "—")
+        Hint("Весь процесс, включая Rust. CPU: 100% — одно ядро; RAM — оценка памяти процесса.")
     }
 }

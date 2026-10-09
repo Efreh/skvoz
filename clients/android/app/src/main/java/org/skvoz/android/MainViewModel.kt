@@ -55,11 +55,23 @@ internal class MainViewModel(private val app: SkvozApplication) : ViewModel() {
     val ranges = rangesMutable.asStateFlow()
     private val diagnosticControl = MutableStateFlow(DiagnosticControls())
     val diagnosticControls = diagnosticControl.asStateFlow()
+    val displayPreferences = app.displayPreferences.state
+    private val resourceReader = AndroidResourceReader()
+    private val resourceSampler = ResourceSampler(viewModelScope, resourceReader::cpu, resourceReader::memory)
+    val resources = resourceSampler.state
+    fun speedFormat(format: SpeedFormat) { viewModelScope.launch { app.displayPreferences.select(format) } }
+    fun showResources(show: Boolean) { viewModelScope.launch { app.displayPreferences.resources(show) } }
+    private val resourceRangesMutable = MutableStateFlow(ResourceRanges())
+    val resourceRanges = resourceRangesMutable.asStateFlow()
+    private var homeVisible = false
+    fun resourceHome(value: Boolean) { homeVisible = value; applyResourceControl() }
+    private fun applyResourceControl() { resourceSampler.visibility(visible && homeVisible && displayPreferences.value.showResources) }
     private var visible = false
     fun diagnosticVisibility(value: Boolean) {
         visible = value
         if (!value) diagnosticControl.value = diagnosticControl.value.copy(detailed = false)
         applyDiagnosticControl()
+        applyResourceControl()
     }
     fun diagnosticPanel(value: Boolean) {
         diagnosticControl.value = DiagnosticControls(open = value, detailed = if (value) diagnosticControl.value.detailed else false)
@@ -69,10 +81,14 @@ internal class MainViewModel(private val app: SkvozApplication) : ViewModel() {
         diagnosticControl.value = diagnosticControl.value.copy(detailed = value && diagnosticControl.value.open && visible)
         applyDiagnosticControl()
     }
-    private fun applyDiagnosticControl() = app.connections.detailedDiagnostics(visible && diagnosticControl.value.open && diagnosticControl.value.detailed)
-    override fun onCleared() { app.connections.detailedDiagnostics(false) }
+    private fun applyDiagnosticControl() {
+        app.connections.detailedDiagnostics(visible && diagnosticControl.value.open && diagnosticControl.value.detailed)
+    }
+    override fun onCleared() { resourceSampler.visibility(false); app.connections.detailedDiagnostics(false) }
     init {
         load()
+        viewModelScope.launch { displayPreferences.collect { applyResourceControl() } }
+        viewModelScope.launch { resources.collect { sample -> resourceRangesMutable.update { it.update(sample) } } }
         viewModelScope.launch { combine(connection, diagnostics) { state, sample -> state to sample }.collect { (state, sample) ->
             rangesMutable.update { it.update(state, sample) }
         } }

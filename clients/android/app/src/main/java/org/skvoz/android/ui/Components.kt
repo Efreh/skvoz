@@ -139,9 +139,10 @@ internal fun Modifier.accentTone(enabled: Boolean = true) = if (!enabled) this e
     if (alwaysOn) Hint("Прокси недоступен, пока Always-on управляет ВПН в Android.")
 }
 
-@Composable internal fun Meter(label: String, value: ULong, range: ULong, rate: Boolean = false, glyph: Glyph? = null) {
-    val formatted = volume(value) + if (rate) "/с" else ""
-    val scale = volume(range) + if (rate) "/с" else ""
+@Composable internal fun Meter(label: String, value: ULong, range: ULong, rate: Boolean = false, glyph: Glyph? = null,
+    speedFormat: SpeedFormat = SpeedFormat.BYTES, valueLabel: String? = null, rangeLabel: String? = null) {
+    val formatted = valueLabel ?: if (rate) speed(value, speedFormat) else volume(value)
+    val scale = rangeLabel ?: if (rate) speed(range, speedFormat) else volume(range)
     val stacked = LocalDensity.current.fontScale >= 1.5f
     Column(Modifier.fillMaxWidth().clearAndSetSemantics { contentDescription = "$label: $formatted. Шкала от нуля до $scale" },
         verticalArrangement = Arrangement.spacedBy(SkvozLayout.DetailGap)) {

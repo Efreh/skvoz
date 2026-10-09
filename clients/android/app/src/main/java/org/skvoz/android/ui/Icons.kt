@@ -8,7 +8,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.unit.dp
 
-internal enum class Glyph { BACK, MENU, NEXT, COPY, SERVER, SHIELD, APPS, SETTINGS, JOURNAL, POWER, ERROR, CHECK, DOWN, UP, CLOSE }
+internal enum class Glyph { BACK, MENU, NEXT, COPY, SERVER, SHIELD, APPS, SETTINGS, JOURNAL, POWER, ERROR, CHECK, DOWN, UP, CLOSE, CPU, MEMORY }
 internal val glyphs: Map<Glyph, ImageVector> = Glyph.entries.associateWith { glyph ->
     ImageVector.Builder(glyph.name, 24.dp, 24.dp, 24f, 24f).apply {
         path(stroke = SolidColor(Color.White), strokeLineWidth = 1.6f, strokeLineCap = StrokeCap.Round, strokeLineJoin = StrokeJoin.Round) {
@@ -27,6 +27,21 @@ internal val glyphs: Map<Glyph, ImageVector> = Glyph.entries.associateWith { gly
                 Glyph.CHECK -> { moveTo(5f, 12f); lineTo(10f, 17f); lineTo(20f, 6f) }
                 Glyph.DOWN -> { moveTo(12f, 3f); lineTo(12f, 20f); moveTo(6f, 14f); lineTo(12f, 20f); lineTo(18f, 14f) }
                 Glyph.UP -> { moveTo(12f, 21f); lineTo(12f, 4f); moveTo(6f, 10f); lineTo(12f, 4f); lineTo(18f, 10f) }
+                Glyph.CPU -> {
+                    moveTo(6f, 6f); lineTo(18f, 6f); lineTo(18f, 18f); lineTo(6f, 18f); close()
+                    moveTo(9f, 9f); lineTo(15f, 9f); lineTo(15f, 15f); lineTo(9f, 15f); close()
+                    for (v in listOf(8f, 12f, 16f)) {
+                        moveTo(v, 3f); lineTo(v, 6f); moveTo(v, 18f); lineTo(v, 21f)
+                        moveTo(3f, v); lineTo(6f, v); moveTo(18f, v); lineTo(21f, v)
+                    }
+                }
+                Glyph.MEMORY -> {
+                    moveTo(3f, 6f); lineTo(21f, 6f); lineTo(21f, 17f); lineTo(3f, 17f); close()
+                    for (x in listOf(6f, 11f, 16f)) {
+                        moveTo(x, 9f); lineTo(x + 2f, 9f); lineTo(x + 2f, 13f); lineTo(x, 13f); close()
+                        moveTo(x + 1f, 17f); lineTo(x + 1f, 21f)
+                    }
+                }
                 Glyph.CLOSE -> { moveTo(5f, 5f); lineTo(19f, 19f); moveTo(19f, 5f); lineTo(5f, 19f) }
             }
         }
