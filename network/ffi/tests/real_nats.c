@@ -95,14 +95,15 @@ static int response(uint64_t handle, uint32_t id) {
 }
 
 static void hello_ready(uint64_t handle) {
-    request(handle, "HELLO", "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}", 1);
+    request(handle, "HELLO", "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}", 1);
     int hello = 0, ready = 0;
     double deadline = now() + 30;
     while (now() < deadline && (!hello || !ready)) {
         int fd;
         if (!next(handle, &fd)) continue;
         if (fd != -1) { close(fd); fail("startup descriptor"); }
-        if (strstr(message, "\"id\":1,") && strstr(message, "\"error\":null"))
+        if (strstr(message, "\"id\":1,") && strstr(message, "\"error\":null") &&
+                strstr(message, "\"api\":1") && strstr(message, "\"network\":5"))
             hello = 1;
         if (strstr(message, "\"event\":\"RUNTIME_STATE\"") &&
                 strstr(message, "\"state\":\"ready\"")) ready = 1;

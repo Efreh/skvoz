@@ -1,7 +1,10 @@
 #![cfg(feature = "real-nats")]
 //! Safe orchestration of an actual C ABI consumer and isolated private target.
-use skvoz_network::config::{CoreConfig, Limits, Role, ServerConfig, StartupConfig};
+use skvoz_network::config::{
+    AuthorityConfig, CoreConfig, Limits, Role, ServerConfig, StartupConfig,
+};
 use skvoz_network::local_api::parse_strict_json;
+use skvoz_network::routing::Registry;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -45,39 +48,44 @@ fn configured(role: Role, target: &str, directory: &Path) -> StartupConfig {
         "../../network/tests/fixtures/client-startup.json"
     ))
     .unwrap();
-    let id = if role == Role::Server { 0 } else { 1 };
+    let credential = if role == Role::Server { 0 } else { 1 };
+    let node_id = std::env::var("SKVOZ_NATS_FFI_NODE_ID")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let id = if role == Role::Server { node_id } else { 1 };
     config.role = role;
     config.core = CoreConfig {
         url: std::env::var("SKVOZ_NATS_URL").unwrap(),
         tls_server_name: None,
         trust: "managed_ca".into(),
         ca_file: Some(std::env::var("SKVOZ_NATS_CA").unwrap().into()),
-        username: format!("p{id}"),
-        password: std::env::var(format!("SKVOZ_NATS_P{id}_PASSWORD")).unwrap(),
+        username: format!("ffi-p{credential}"),
+        password: std::env::var(format!("SKVOZ_NATS_FFI_P{credential}_PASSWORD")).unwrap(),
         namespace: format!(
-            "skvoz.runtime.{}.ffi",
+            "skvoz.ffi.{}",
             std::env::var("SKVOZ_NATS_RUN_TOKEN").unwrap()
         ),
         peer_id: id.to_string(),
-        membership: if role == Role::Server {
-            "broker_authorized"
-        } else {
-            "allowlist"
-        }
-        .into(),
-        allowed_peers: if role == Role::Server {
-            vec![]
-        } else {
-            vec!["0".into()]
-        },
-        initiate: if role == Role::Server {
-            vec![]
-        } else {
-            vec!["0".into()]
-        },
+        membership: "allowlist".into(),
+        allowed_peers: vec![],
+        initiate: vec![],
     };
     config.network.limits = Limits::canonical(role);
     if role == Role::Server {
+        let mut authority = config.core.clone();
+        authority.peer_id = "0".into();
+        authority.username = "ffi-authority".into();
+        authority.password = std::env::var("SKVOZ_NATS_FFI_AUTHORITY_PASSWORD").unwrap();
+        config.routing.egress = true;
+        config.routing.authority = Some(AuthorityConfig {
+            core: authority,
+            registry: Registry {
+                revision: 1,
+                devices: vec![1],
+                nodes: vec![node_id],
+            },
+        });
         config.network.families.clear();
         let value = parse_strict_json(format!(
             "{{\"ipv4\":null,\"ipv6\":null,\"dns_servers\":[],\"allow\":[{{\"cidr\":\"{target}/32\",\"protocols\":[6],\"ports\":[4444]}}],\"deny\":[],\"service_prefixes\":[],\"lease_store\":\"{}\",\"server_addresses\":[],\"management_endpoints\":[]}}",

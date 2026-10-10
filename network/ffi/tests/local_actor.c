@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
         fail("fixture read");
     if (skvoz_network_create(bytes, length, -1, &owner) || !owner)
         fail("create");
-    const char *hello = "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}";
+    const char *hello = "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}";
     uint32_t id = 0;
     if (skvoz_network_request(owner, (const uint8_t *)hello, strlen(hello), -1, &id)
             || id != 1)
@@ -59,7 +59,8 @@ int main(int argc, char **argv) {
         bytes[repeated] = '\0';
         if (strstr((const char *)bytes, "\"id\":1,") &&
                 strstr((const char *)bytes, "\"error\":null") &&
-                strstr((const char *)bytes, "\"api\":1"))
+                strstr((const char *)bytes, "\"api\":1") &&
+                strstr((const char *)bytes, "\"network\":5"))
             found = 1;
     }
     if (!found) fail("HELLO waited for broker readiness");

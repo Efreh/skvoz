@@ -19,6 +19,7 @@ from network_qualification import qualify as qualify_network
 from network_runtime_qualification import qualify as qualify_network_runtime
 from tcp_capacity_qualification import qualify as qualify_tcp_capacity
 from tcp_capacity_resources import qualify as qualify_tcp_resources
+from network_topology import EGRESS_ID, users as topology_users
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4"
@@ -223,6 +224,12 @@ def main():
             shared_publish = '", "'.join([f"{runtime}.join.0.{peer}" for peer in (1, 2)] + [f"{runtime}.lane.0.*.{peer}.*.{peer}.*" for peer in (1, 2)])
             shared_subscribe = '", "'.join([f"{runtime}.join.{peer}.*" for peer in (1, 2)] + [f"{runtime}.lane.{peer}.*.*.*.*.*" for peer in (1, 2)])
             mesh_users.append(f'{{ user: "daemon-devices", password: "{daemon_password}", permissions: {{ publish: ["{shared_publish}"], subscribe: ["{shared_subscribe}"] }} }}')
+            # Keep network runtime principals separate from generic Core fixtures.
+            ffi_passwords = [secrets.token_hex(24) for _ in range(2)]
+            ffi_authority_password = secrets.token_hex(24)
+            for user in topology_users(f"skvoz.ffi.{token}", ffi_passwords, ffi_authority_password):
+                user['user'] = 'ffi-' + user['user']
+                mesh_users.append(json.dumps(user))
             mesh_authorization = ",\n".join(mesh_users)
             config = f'''server_name: "skvoz-testbench"
 port: 4222
@@ -307,8 +314,11 @@ authorization {{
                     "SKVOZ_DAEMON_PASSWORD": daemon_password,
                     "SKVOZ_NATS_RUN_TOKEN": token, "SKVOZ_NATS_CONTAINER": container, "SKVOZ_NATS_MONITOR": monitor,
                     "SKVOZ_NATS_BOOTSTRAP_NETWORK": bootstrap if args.network_profile else "",
+                    "SKVOZ_NATS_FFI_NODE_ID": str(EGRESS_ID),
+                    "SKVOZ_NATS_FFI_AUTHORITY_PASSWORD": ffi_authority_password,
                 }
                 env.update({f"SKVOZ_NATS_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(mesh_passwords)})
+                env.update({f"SKVOZ_NATS_FFI_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(ffi_passwords)})
                 if args.mode == "check":
                     command(cargo + ["test", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra,
                         "--", "--test-threads=1", "--nocapture"], env=env)
