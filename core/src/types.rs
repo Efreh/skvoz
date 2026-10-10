@@ -1,5 +1,5 @@
 /// Conservative scalar delivery receipt state, including Option alignment.
-pub const TRANSPORT_DELIVERY_STATE_BYTES: usize = 64;
+pub const TRANSPORT_DELIVERY_STATE_BYTES: usize = 512;
 
 use std::fmt;
 

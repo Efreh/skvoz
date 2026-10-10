@@ -3,6 +3,7 @@
 //! Broker permissions MUST bind sender, recipient and sender shard. A subject is
 //! not an identity proof without that provisioning contract. See the runtime guide.
 mod api;
+mod credit;
 mod diagnostics;
 pub use api::{
     Authentication, Counters, Lifecycle, Membership, PeerStatus, RuntimeConfig, RuntimeError,
@@ -26,6 +27,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc;
 
 pub const TRANSPORT_PACKET_BYTES: usize = wire::MAX_PACKET_BYTES + 24;
 const CONTROL_BYTES: usize = 77;
@@ -74,12 +76,48 @@ struct Incoming {
     lane: Option<usize>,
     control: bool,
 }
+enum MessageReceiver {
+    Subscription(async_nats::Subscriber),
+    Shared(mpsc::Receiver<async_nats::Message>),
+}
+impl Stream for MessageReceiver {
+    type Item = async_nats::Message;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Subscription(subscriber) => Pin::new(subscriber).poll_next(cx),
+            Self::Shared(receiver) => receiver.poll_recv(cx),
+        }
+    }
+}
 struct Connection {
     client: async_nats::Client,
-    data: async_nats::Subscriber,
-    control: Option<async_nats::Subscriber>,
+    data: MessageReceiver,
+    control: Option<MessageReceiver>,
+    data_sender: Option<mpsc::Sender<async_nats::Message>>,
+    control_sender: Option<mpsc::Sender<async_nats::Message>>,
+    sources: BTreeMap<PeerId, [async_nats::SubscriptionHandle; 2]>,
+    removing: Vec<[async_nats::SubscriptionHandle; 2]>,
+    retired: BTreeMap<PeerId, RetiredSource>,
+    processed_data: u64,
     latch: Arc<Latch>,
     dirty: bool,
+}
+struct RetiredSource {
+    outstanding: u64,
+    barrier: Option<u64>,
+}
+impl MessageReceiver {
+    fn queued(&self) -> usize {
+        match self {
+            Self::Shared(receiver) => receiver.len(),
+            Self::Subscription(_) => 0,
+        }
+    }
+}
+fn retire_source_handles<T>(sources: &mut BTreeMap<PeerId, T>, removing: &mut Vec<T>, id: PeerId) {
+    if let Some(handles) = sources.remove(&id) {
+        removing.push(handles);
+    }
 }
 #[derive(Clone, Copy)]
 struct Control {
@@ -93,7 +131,7 @@ struct Control {
 impl Control {
     fn encode(self) -> Vec<u8> {
         let mut b = Vec::with_capacity(CONTROL_BYTES);
-        b.extend_from_slice(b"SKC1");
+        b.extend_from_slice(b"SKC2");
         b.push(self.kind);
         for x in [self.sender, self.recipient, self.hello, self.token] {
             b.extend_from_slice(&x.to_be_bytes());
@@ -102,7 +140,7 @@ impl Control {
         b
     }
     fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != CONTROL_BYTES || &b[..4] != b"SKC1" || !(1..=6).contains(&b[4]) {
+        if b.len() != CONTROL_BYTES || &b[..4] != b"SKC2" || !(1..=10).contains(&b[4]) {
             return None;
         }
         let n = |i| u128::from_be_bytes(b[i..i + 16].try_into().unwrap());
@@ -133,6 +171,20 @@ struct Candidate {
 const BROKER_PENDING_BYTES: u64 = 4 * 1024 * 1024;
 const DATA_DELIVERY_BYTES: u64 = 3 * 1024 * 1024;
 const MSG_FRAMING_BYTES: usize = 516;
+const SOURCE_CONTROL_BYTES: u64 = 6 * (CONTROL_BYTES + MSG_FRAMING_BYTES) as u64;
+const ENVELOPE_WEIGHT: u64 = (TRANSPORT_PACKET_BYTES + MSG_FRAMING_BYTES) as u64;
+
+fn lane_credit_limit(sources: usize) -> Result<u64, RuntimeError> {
+    BROKER_PENDING_BYTES
+        .checked_sub(
+            (sources as u64)
+                .checked_mul(SOURCE_CONTROL_BYTES)
+                .ok_or(RuntimeError::Config)?,
+        )
+        .and_then(|n| n.checked_sub(ENVELOPE_WEIGHT))
+        .map(|n| n.min(DATA_DELIVERY_BYTES))
+        .ok_or(RuntimeError::Admission)
+}
 
 #[derive(Default)]
 struct DeliveryFlight {
@@ -141,13 +193,6 @@ struct DeliveryFlight {
     sequence: u64,
 }
 impl DeliveryFlight {
-    fn admits(&self, bytes: u64, limit: u64) -> Result<bool, RuntimeError> {
-        let next = self
-            .sent
-            .checked_add(bytes)
-            .ok_or(RuntimeError::IdentityExhausted)?;
-        Ok(next - self.acknowledged <= limit)
-    }
     fn acknowledge(&mut self, sequence: u64, bytes: u64) -> Result<(), RuntimeError> {
         if sequence < self.sequence || bytes < self.acknowledged || bytes > self.sent {
             return Err(RuntimeError::Protocol);
@@ -157,31 +202,6 @@ impl DeliveryFlight {
         Ok(())
     }
 }
-fn delivery_limits(config: &RuntimeConfig) -> Result<(u64, u64), RuntimeError> {
-    // Include both directions' bounded retry controls outside Core envelopes.
-    // Canonical 10s/250ms fits the 128KiB minimum. Longer/faster retry profiles
-    // derive a larger reserve or fail configuration, never silently overpromise.
-    let repeats = config
-        .peer_timeout
-        .as_nanos()
-        .checked_div(config.retry_initial.as_nanos())
-        .ok_or(RuntimeError::Config)?
-        .checked_add(2)
-        .ok_or(RuntimeError::Config)?;
-    let reserve = repeats
-        .checked_mul(2 * (77 + MSG_FRAMING_BYTES) as u128)
-        .and_then(|n| u64::try_from(n).ok())
-        .ok_or(RuntimeError::Config)?
-        .max(128 * 1024);
-    let total = BROKER_PENDING_BYTES
-        .checked_sub(reserve)
-        .ok_or(RuntimeError::Config)?;
-    let data = total
-        .checked_sub((TRANSPORT_PACKET_BYTES + MSG_FRAMING_BYTES) as u64)
-        .ok_or(RuntimeError::Config)?
-        .min(DATA_DELIVERY_BYTES);
-    Ok((data, total))
-}
 struct Session {
     generation: u128,
     token: u128,
@@ -190,9 +210,12 @@ struct Session {
     tx: u64,
     rx: u64,
     next_ping: Instant,
+    can_ping: bool,
+    proof_deadline: Instant,
     ping: Option<(u128, u64, Instant, u64)>,
     delivery: DeliveryFlight,
-    ping_due: Instant,
+    sender_credit: credit::Sender,
+    recipient_credit: credit::Recipient,
     pong: Option<(u128, u64)>,
     retiring: bool,
     proven: bool,
@@ -237,6 +260,31 @@ impl Peer {
         }
     }
 }
+fn peer_batch(
+    peers: &BTreeMap<PeerId, Peer>,
+    cursor: &mut Option<PeerId>,
+    maximum: usize,
+) -> Vec<PeerId> {
+    let mut ids = Vec::with_capacity(maximum.min(peers.len()));
+    if let Some(last) = *cursor {
+        ids.extend(
+            peers
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                .take(maximum)
+                .map(|(id, _)| *id),
+        );
+        ids.extend(
+            peers
+                .range(..=last)
+                .take(maximum - ids.len())
+                .map(|(id, _)| *id),
+        );
+    } else {
+        ids.extend(peers.keys().take(maximum).copied());
+    }
+    *cursor = ids.last().copied();
+    ids
+}
 /// One exclusive owner must drive turns and drain events. No stream is resumed.
 pub struct NatsRuntime {
     config: RuntimeConfig,
@@ -248,7 +296,10 @@ pub struct NatsRuntime {
     join: Option<Connection>,
     lanes: Vec<Option<Connection>>,
     peers: BTreeMap<PeerId, Peer>,
+    expected_peers: BTreeMap<PeerId, u128>,
     cursor: Option<PeerId>,
+    credit_cursor: Option<PeerId>,
+    credit_visit_cursor: Option<PeerId>,
     lane_cursor: usize,
     lifecycle: Lifecycle,
     last_error: Option<RuntimeError>,
@@ -259,11 +310,10 @@ pub struct NatsRuntime {
     retry_at: Instant,
     drain_started: Option<Instant>,
     transport_bound: usize,
-    delivery_limits: (u64, u64),
     #[cfg(feature = "fault-injection")]
     drop_next_data: bool,
     #[cfg(feature = "fault-injection")]
-    pause_next_data: bool,
+    pause_next_data: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(feature = "fault-injection")]
     ignore_next_pong: bool,
 }
@@ -291,7 +341,6 @@ impl NatsRuntime {
         limits: ManagerConfig,
     ) -> Result<Self, RuntimeError> {
         let transport_bound = config.validate_profile(limits)?;
-        let delivery_limits = delivery_limits(&config)?;
         let now = Instant::now();
         let mut node = Self {
             manager: Manager::new(limits)?,
@@ -301,7 +350,10 @@ impl NatsRuntime {
             join: None,
             lanes: (0..config.shards).map(|_| None).collect(),
             peers: BTreeMap::new(),
+            expected_peers: BTreeMap::new(),
             cursor: None,
+            credit_cursor: None,
+            credit_visit_cursor: None,
             lane_cursor: 0,
             lifecycle: Lifecycle::Connecting,
             last_error: None,
@@ -312,11 +364,10 @@ impl NatsRuntime {
             retry_at: now,
             drain_started: None,
             transport_bound,
-            delivery_limits,
             #[cfg(feature = "fault-injection")]
             drop_next_data: false,
             #[cfg(feature = "fault-injection")]
-            pause_next_data: false,
+            pause_next_data: None,
             #[cfg(feature = "fault-injection")]
             ignore_next_pong: false,
             config,
@@ -396,35 +447,22 @@ impl NatsRuntime {
         if client.max_payload() != TRANSPORT_PACKET_BYTES {
             return Err(RuntimeError::Config);
         }
-        let base = if let Some(s) = lane {
-            format!(
-                "{}.lane.{}.{:032x}.{s}",
-                self.config.namespace, self.config.id.0, self.epoch
+        let (data, control, data_sender, control_sender) = if lane.is_some() {
+            let (data_sender, data) = mpsc::channel(self.config.subscription_capacity);
+            let (control_sender, control) = mpsc::channel(self.config.subscription_capacity);
+            (
+                MessageReceiver::Shared(data),
+                Some(MessageReceiver::Shared(control)),
+                Some(data_sender),
+                Some(control_sender),
             )
         } else {
-            format!("{}.join.{}", self.config.namespace, self.config.id.0)
-        };
-        let subject = if lane.is_some() {
-            format!("{base}.data.*.*")
-        } else {
-            format!("{base}.*")
-        };
-        let data = tokio::time::timeout(self.config.io_timeout, client.subscribe(subject))
-            .await
-            .map_err(|_| RuntimeError::Timeout)?
-            .map_err(|_| RuntimeError::Transport)?;
-        let control = if lane.is_some() {
-            Some(
-                tokio::time::timeout(
-                    self.config.io_timeout,
-                    client.subscribe(format!("{base}.control.*.*")),
-                )
+            let subject = format!("{}.join.{}.*", self.config.namespace, self.config.id.0);
+            let data = tokio::time::timeout(self.config.io_timeout, client.subscribe(subject))
                 .await
                 .map_err(|_| RuntimeError::Timeout)?
-                .map_err(|_| RuntimeError::Transport)?,
-            )
-        } else {
-            None
+                .map_err(|_| RuntimeError::Transport)?;
+            (MessageReceiver::Subscription(data), None, None, None)
         };
         tokio::time::timeout(self.config.io_timeout, client.flush())
             .await
@@ -437,6 +475,12 @@ impl NatsRuntime {
             client,
             data,
             control,
+            data_sender,
+            control_sender,
+            sources: BTreeMap::new(),
+            removing: Vec::new(),
+            retired: BTreeMap::new(),
+            processed_data: 0,
             latch,
             dirty: false,
         })
@@ -448,12 +492,136 @@ impl NatsRuntime {
                 Membership::BrokerAuthorized => true,
             }
     }
+    async fn subscribe_source(&mut self, lane: usize, id: PeerId) -> Result<(), RuntimeError> {
+        // Complete retired UNSUB commands before registering the same source
+        // again or charging capacity for a newly admitted peer.
+        self.unsubscribe_sources().await?;
+        let source_count = self
+            .lanes
+            .iter()
+            .flatten()
+            .map(|connection| connection.sources.len() + connection.retired.len())
+            .sum::<usize>();
+        let outstanding = self.lane_outstanding(lane)?;
+        let connection = self.lanes[lane].as_mut().ok_or(RuntimeError::Transport)?;
+        if connection.sources.contains_key(&id) {
+            return Ok(());
+        }
+        if connection.retired.contains_key(&id)
+            || source_count >= self.limits.max_peers
+            || outstanding
+                > lane_credit_limit(connection.sources.len() + connection.retired.len() + 1)?
+        {
+            return Err(RuntimeError::Admission);
+        }
+        let mut guard = OutputGuard {
+            latch: connection.latch.clone(),
+            complete: false,
+        };
+        let base = format!(
+            "{}.lane.{}.{:032x}.{lane}",
+            self.config.namespace, self.config.id.0, self.epoch
+        );
+        let client = connection.client.clone();
+        let data_sender = connection.data_sender.as_ref().unwrap().clone();
+        let control_sender = connection.control_sender.as_ref().unwrap().clone();
+        let data = self
+            .with_lane_progress(
+                client.subscribe_into(format!("{base}.data.{}.*", id.0), data_sender),
+            )
+            .await?;
+        let control = self
+            .with_lane_progress(
+                client.subscribe_into(format!("{base}.control.{}.*", id.0), control_sender),
+            )
+            .await?;
+        self.with_lane_progress(client.broker_barrier()).await?;
+        let connection = self.lanes[lane].as_mut().ok_or(RuntimeError::Transport)?;
+        if connection.latch.get() != 0 {
+            return Err(if connection.latch.get() & 8 != 0 {
+                RuntimeError::Authorization
+            } else {
+                RuntimeError::Transport
+            });
+        }
+        let handles = [data, control];
+        connection.sources.insert(id, handles);
+        guard.complete = true;
+        Ok(())
+    }
+    async fn unsubscribe_sources(&mut self) -> Result<(), RuntimeError> {
+        for lane in 0..self.lanes.len() {
+            let Some(connection) = self.lanes[lane].as_ref() else {
+                continue;
+            };
+            if connection.removing.is_empty() {
+                continue;
+            }
+            let mut guard = OutputGuard {
+                latch: connection.latch.clone(),
+                complete: false,
+            };
+            let client = connection.client.clone();
+            while let Some(handles) = self.lanes[lane].as_mut().unwrap().removing.pop() {
+                for mut handle in handles {
+                    self.with_lane_progress(async move { handle.unsubscribe().await })
+                        .await?;
+                }
+            }
+            self.with_lane_progress(client.broker_barrier()).await?;
+            let connection = self.lanes[lane].as_mut().ok_or(RuntimeError::Transport)?;
+            if connection.latch.get() != 0 {
+                return Err(RuntimeError::Transport);
+            }
+            let barrier = connection
+                .processed_data
+                .checked_add(connection.data.queued() as u64)
+                .ok_or(RuntimeError::IdentityExhausted)?;
+            for source in connection.retired.values_mut() {
+                if source.barrier.is_none() {
+                    source.barrier = Some(barrier);
+                }
+            }
+            connection
+                .retired
+                .retain(|_, source| source.barrier.is_none_or(|n| n > connection.processed_data));
+            guard.complete = true;
+        }
+        Ok(())
+    }
+    fn lane_outstanding(&self, lane: usize) -> Result<u64, RuntimeError> {
+        let mut total = 0u64;
+        if let Some(connection) = &self.lanes[lane] {
+            for source in connection.retired.values() {
+                total = total
+                    .checked_add(source.outstanding)
+                    .ok_or(RuntimeError::IdentityExhausted)?;
+            }
+        }
+        for (id, peer) in &self.peers {
+            if shard(*id, self.config.shards) == lane
+                && let Some(session) = &peer.session
+            {
+                total = total
+                    .checked_add(session.recipient_credit.outstanding())
+                    .ok_or(RuntimeError::IdentityExhausted)?;
+            }
+        }
+        Ok(total)
+    }
     fn ensure_peer(&mut self, id: PeerId) -> Result<(), RuntimeError> {
         if !self.allowed(id) {
             return Err(RuntimeError::Authorization);
         }
         if !self.peers.contains_key(&id) {
-            if self.peers.len() >= self.limits.max_peers {
+            let retired_only = self
+                .lanes
+                .iter()
+                .flatten()
+                .flat_map(|c| c.retired.keys())
+                .filter(|id| !self.peers.contains_key(id))
+                .count();
+            if self.peers.len() + retired_only >= self.limits.max_peers {
                 return Err(RuntimeError::Admission);
             }
             self.peers.insert(id, Peer::new());
@@ -487,8 +655,70 @@ impl NatsRuntime {
             return Err(RuntimeError::Config);
         };
         ids.remove(&id);
+        self.expected_peers.remove(&id);
         self.terminate_peer(id);
         Ok(())
+    }
+    /// This runtime's incarnation, for a host's current admission lease.
+    pub fn epoch(&self) -> u128 {
+        self.epoch
+    }
+    /// Admit one peer, optionally requiring its exact current incarnation.
+    /// Changing an active incarnation requires explicit revocation first.
+    pub fn authorize_peer(
+        &mut self,
+        id: PeerId,
+        expected_epoch: Option<u128>,
+    ) -> Result<(), RuntimeError> {
+        if id == self.config.id || expected_epoch == Some(0) {
+            return Err(RuntimeError::Config);
+        }
+        if self
+            .peers
+            .get(&id)
+            .and_then(|p| p.session.as_ref())
+            .is_some_and(|s| {
+                !s.retiring && expected_epoch.is_some_and(|epoch| epoch != s.generation)
+            })
+        {
+            return Err(RuntimeError::Authorization);
+        }
+        let Membership::Allowlist(ids) = &mut self.config.membership else {
+            return Err(RuntimeError::Config);
+        };
+        if !ids.contains(&id) && ids.len() >= self.limits.max_peers {
+            return Err(RuntimeError::Admission);
+        }
+        ids.insert(id);
+        if let Some(epoch) = expected_epoch {
+            self.expected_peers.insert(id, epoch);
+        } else {
+            self.expected_peers.remove(&id);
+        }
+        Ok(())
+    }
+    fn retire_source(&mut self, id: PeerId) {
+        let outstanding = self
+            .peers
+            .get_mut(&id)
+            .and_then(|p| p.session.as_mut())
+            .map_or(0, |s| {
+                let outstanding = s.recipient_credit.outstanding();
+                s.recipient_credit = credit::Recipient::default();
+                outstanding
+            });
+        for connection in self.lanes.iter_mut().flatten() {
+            if connection.sources.contains_key(&id) {
+                connection.retired.insert(
+                    id,
+                    RetiredSource {
+                        outstanding,
+                        barrier: None,
+                    },
+                );
+            }
+            retire_source_handles(&mut connection.sources, &mut connection.removing, id);
+        }
     }
     pub fn terminate_peer(&mut self, id: PeerId) {
         self.retire(id);
@@ -498,6 +728,7 @@ impl NatsRuntime {
             p.candidate = None;
         }
         self.config.initiate.retain(|p| *p != id);
+        self.retire_source(id);
     }
     fn retire(&mut self, id: PeerId) {
         if let Some(p) = self.peers.get_mut(&id)
@@ -833,7 +1064,14 @@ impl NatsRuntime {
         Ok(())
     }
     fn handle_join(&mut self, id: PeerId, c: Control) -> Result<(), RuntimeError> {
-        if c.sender == 0 || c.hello == 0 || !self.allowed(id) {
+        if c.sender == 0
+            || c.hello == 0
+            || !self.allowed(id)
+            || self
+                .expected_peers
+                .get(&id)
+                .is_some_and(|epoch| *epoch != c.sender)
+        {
             return Ok(());
         }
         if let Err(e) = self.ensure_peer(id) {
@@ -981,6 +1219,15 @@ impl NatsRuntime {
         let Some(candidate) = self.peers[&id].candidate else {
             return Ok(());
         };
+        if !self.allowed(id)
+            || self
+                .expected_peers
+                .get(&id)
+                .is_some_and(|epoch| *epoch != candidate.generation)
+        {
+            self.peers.get_mut(&id).unwrap().candidate = None;
+            return Ok(());
+        }
         if candidate.expires <= Instant::now() {
             self.peers.get_mut(&id).unwrap().candidate = None;
             return Ok(());
@@ -998,9 +1245,17 @@ impl NatsRuntime {
                 self.manager.remove_peer(id)?;
                 self.counters.replacements += 1;
             }
+            if self.peers[&id].session.is_some() {
+                self.retire_source(id);
+            }
             let lane = shard(id, self.config.shards);
             if self.lanes[lane].is_none() {
                 self.lanes[lane] = Some(self.connection(Some(lane)).await?);
+            }
+            match self.subscribe_source(lane, id).await {
+                Ok(()) => {}
+                Err(RuntimeError::Admission) => return Ok(()),
+                Err(error) => return Err(error),
             }
             self.incarnation = self
                 .incarnation
@@ -1016,9 +1271,12 @@ impl NatsRuntime {
                 tx: 0,
                 rx: 0,
                 next_ping: Instant::now(),
+                can_ping: !candidate.responder,
+                proof_deadline: Instant::now() + self.config.peer_timeout,
                 ping: None,
                 delivery: DeliveryFlight::default(),
-                ping_due: Instant::now(),
+                sender_credit: credit::Sender::default(),
+                recipient_credit: credit::Recipient::default(),
                 pong: None,
                 retiring: false,
                 proven: false,
@@ -1087,6 +1345,18 @@ impl NatsRuntime {
         lane: Option<usize>,
         control: bool,
     ) -> Result<(), RuntimeError> {
+        if let Some(lane) = lane
+            && !control
+        {
+            let connection = self.lanes[lane].as_mut().ok_or(RuntimeError::Transport)?;
+            connection.processed_data = connection
+                .processed_data
+                .checked_add(1)
+                .ok_or(RuntimeError::IdentityExhausted)?;
+            connection
+                .retired
+                .retain(|_, source| source.barrier.is_none_or(|n| n > connection.processed_data));
+        }
         let Some(id) = self.sender(message.subject.as_str(), lane, control) else {
             self.counters.invalid_input += 1;
             return Ok(());
@@ -1108,7 +1378,10 @@ impl NatsRuntime {
                 return Ok(());
             }
             match c.kind {
-                5 if c.hello != 0 => s.pong = Some((c.hello, c.watermark)),
+                5 if c.hello != 0 => {
+                    s.pong = Some((c.hello, c.watermark));
+                    s.can_ping = true;
+                }
                 6 => {
                     #[cfg(feature = "fault-injection")]
                     if self.ignore_next_pong {
@@ -1122,12 +1395,30 @@ impl NatsRuntime {
                             self.manager.set_peer_output_enabled(id, true)?;
                         }
                         s.next_ping = if s.delivery.sent - s.delivery.acknowledged
-                            >= self.delivery_limits.0 / 2
+                            >= DATA_DELIVERY_BYTES / 2
                         {
                             Instant::now()
                         } else {
                             Instant::now() + self.config.heartbeat_interval
                         };
+                    }
+                }
+                7..=10 => {
+                    let result = match c.kind {
+                        7 => s.recipient_credit.request(
+                            c.hello,
+                            c.watermark,
+                            DATA_DELIVERY_BYTES,
+                            Instant::now(),
+                            self.config.peer_timeout,
+                        ),
+                        8 => s.sender_credit.grant(c.hello, c.watermark),
+                        9 => s.recipient_credit.returned(c.hello, c.watermark),
+                        _ => s.sender_credit.acknowledge(c.hello, c.watermark),
+                    };
+                    if let Err(error) = result {
+                        self.retire(id);
+                        self.last_error = Some(error);
                     }
                 }
                 _ => {}
@@ -1145,9 +1436,20 @@ impl NatsRuntime {
         if token != s.token {
             return Ok(());
         }
+        let weight = (message.payload.len() + MSG_FRAMING_BYTES) as u64;
+        if !s.recipient_credit.admits(weight) {
+            self.retire(id);
+            self.last_error = Some(RuntimeError::Protocol);
+            return Ok(());
+        }
         if s.rx.checked_add(1) != Some(seq) {
             eprintln!(
-                "Peer envelope sequence failure: peer={} received={} expected={:?}",
+                "Peer envelope sequence failure: time_ms={} id={} peer={} received={} expected={:?}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                self.config.id.0,
                 id.0,
                 seq,
                 s.rx.checked_add(1)
@@ -1180,13 +1482,9 @@ impl NatsRuntime {
             self.last_error = Some(RuntimeError::Protocol);
             return Ok(());
         }
-        self.peers
-            .get_mut(&id)
-            .unwrap()
-            .session
-            .as_mut()
-            .unwrap()
-            .rx = seq;
+        let session = self.peers.get_mut(&id).unwrap().session.as_mut().unwrap();
+        session.recipient_credit.apply(weight)?;
+        session.rx = seq;
         self.sync_manager_failures();
         Ok(())
     }
@@ -1197,38 +1495,39 @@ impl NatsRuntime {
             latches: Vec::new(),
             complete: false,
         };
+        for (&id, peer) in &mut self.peers {
+            if let Some(session) = &mut peer.session
+                && session.proven
+                && !session.retiring
+            {
+                let demand = self.manager.transport_demand(
+                    id,
+                    24 + MSG_FRAMING_BYTES,
+                    DATA_DELIVERY_BYTES as usize,
+                );
+                if session.sender_credit.request(
+                    demand as u64,
+                    Instant::now(),
+                    self.config.peer_timeout,
+                )? {
+                    count += 1;
+                }
+            }
+        }
         for _ in 0..self.config.max_outgoing_per_turn {
-            let mut exhausted = None;
-            let limits = self.delivery_limits;
             let peers = &mut self.peers;
             let frame = self
                 .manager
-                .poll_frames_with_budget(1, |key, size, data| {
-                    let Some(session) = peers.get_mut(&key.peer).and_then(|p| p.session.as_mut())
-                    else {
-                        return true;
-                    };
-                    let weight = (size + 24 + MSG_FRAMING_BYTES) as u64;
-                    match session
-                        .delivery
-                        .admits(weight, if data { limits.0 } else { limits.1 })
-                    {
-                        Ok(true) => true,
-                        Ok(false) => {
-                            session.next_ping = Instant::now();
-                            false
-                        }
-                        Err(_) => {
-                            exhausted = Some(key.peer);
-                            false
-                        }
-                    }
+                .poll_frames_with_budget(1, |key, size, _| {
+                    peers
+                        .get(&key.peer)
+                        .and_then(|p| p.session.as_ref())
+                        .is_some_and(|s| {
+                            s.sender_credit
+                                .admits((size + 24 + MSG_FRAMING_BYTES) as u64)
+                        })
                 })
                 .pop();
-            if let Some(id) = exhausted {
-                self.retire(id);
-                self.last_error = Some(RuntimeError::IdentityExhausted);
-            }
             let Some(frame) = frame else {
                 break;
             };
@@ -1250,8 +1549,10 @@ impl NatsRuntime {
             }
             s.tx = s.tx.checked_add(1).ok_or(RuntimeError::IdentityExhausted)?;
             #[cfg(feature = "fault-injection")]
-            if self.pause_next_data && matches!(frame.frame, crate::Frame::Data { .. }) {
-                self.pause_next_data = false;
+            if matches!(frame.frame, crate::Frame::Data { .. })
+                && let Some(extracted) = self.pause_next_data.take()
+            {
+                let _ = extracted.send(());
                 std::future::pending::<()>().await;
             }
             #[cfg(feature = "fault-injection")]
@@ -1263,12 +1564,13 @@ impl NatsRuntime {
             let size = wire::encoded_size(frame.key.stream_id, &frame.frame)
                 .map_err(|_| RuntimeError::Protocol)?;
             let weight = (size + 24 + MSG_FRAMING_BYTES) as u64;
+            s.sender_credit.consume(weight)?;
             s.delivery.sent = s
                 .delivery
                 .sent
                 .checked_add(weight)
                 .ok_or(RuntimeError::IdentityExhausted)?;
-            if s.delivery.sent - s.delivery.acknowledged >= self.delivery_limits.0 / 2 {
+            if s.delivery.sent - s.delivery.acknowledged >= DATA_DELIVERY_BYTES / 2 {
                 s.next_ping = Instant::now();
             }
             let mut bytes = Vec::with_capacity(24 + size);
@@ -1294,6 +1596,20 @@ impl NatsRuntime {
         }
         // Every extracted frame stays guarded until all touched socket flushes
         // complete; cancellation conservatively fails every touched shard.
+        for (&id, peer) in &mut self.peers {
+            if let Some(session) = &mut peer.session
+                && !session.retiring
+                && let Some(granted) = session.sender_credit.granted
+            {
+                let needed = self
+                    .manager
+                    .next_transport_weight(id, 24 + MSG_FRAMING_BYTES);
+                if needed.is_none_or(|n| granted - session.sender_credit.used < n as u64) {
+                    session.sender_credit.seal();
+                }
+            }
+        }
+        count += self.credit_work().await?;
         for c in self
             .lanes
             .iter()
@@ -1334,9 +1650,9 @@ impl NatsRuntime {
     // delivering the opposite direction. Drain directly into the authenticated
     // Manager; no additional raw-message queue or detached output task is used.
     // The absolute I/O timeout remains live even under continuous incoming work.
-    async fn with_lane_progress<F, E>(&mut self, operation: F) -> Result<(), RuntimeError>
+    async fn with_lane_progress<F, E, T>(&mut self, operation: F) -> Result<T, RuntimeError>
     where
-        F: Future<Output = Result<(), E>>,
+        F: Future<Output = Result<T, E>>,
     {
         // The ordinary turn already drains a bounded incoming batch. Poll the
         // operation first; only backpressured publication/flush needs extra
@@ -1361,13 +1677,54 @@ impl NatsRuntime {
     }
     #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
+    pub fn inspect_recipient_credit(&self, lane: usize) -> (u64, u64, usize) {
+        let connection = self.lanes[lane].as_ref().unwrap();
+        let sources = self
+            .peers
+            .iter()
+            .filter(|(id, peer)| {
+                shard(**id, self.config.shards) == lane
+                    && peer
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.recipient_credit.outstanding() > 0)
+            })
+            .count();
+        (
+            self.lane_outstanding(lane).unwrap(),
+            lane_credit_limit(connection.sources.len() + connection.retired.len()).unwrap(),
+            sources,
+        )
+    }
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn inspect_source_retirement(&self, lane: usize, id: PeerId) -> (usize, u64, bool) {
+        let connection = self.lanes[lane].as_ref().unwrap();
+        let retired = connection.retired.get(&id);
+        let outstanding = retired.map_or_else(
+            || {
+                self.peers
+                    .get(&id)
+                    .and_then(|p| p.session.as_ref())
+                    .map_or(0, |s| s.recipient_credit.outstanding())
+            },
+            |s| s.outstanding,
+        );
+        (connection.data.queued(), outstanding, retired.is_some())
+    }
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
     pub fn inject_drop_next_data_after_extraction(&mut self) {
         self.drop_next_data = true;
     }
     #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
-    pub fn inject_pause_next_data_after_extraction(&mut self) {
-        self.pause_next_data = true;
+    pub fn inject_pause_next_data_after_extraction(
+        &mut self,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (extracted, observed) = tokio::sync::oneshot::channel();
+        self.pause_next_data = Some(extracted);
+        observed
     }
     #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
@@ -1376,28 +1733,153 @@ impl NatsRuntime {
     }
     #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
+    pub fn inspect_pending_lane_proof(&self, id: PeerId) -> Option<(u128, u64)> {
+        let session = self.peers.get(&id)?.session.as_ref()?;
+        if session.proven || session.retiring {
+            return None;
+        }
+        session
+            .ping
+            .map(|(nonce, watermark, _, _)| (nonce, watermark))
+    }
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
+    pub fn inspect_lane_pong_injection_pending(&self) -> bool {
+        self.ignore_next_pong
+    }
+    #[cfg(feature = "fault-injection")]
+    #[doc(hidden)]
     pub fn inject_expired_credit_freeze(&mut self, peer: PeerId) {
         self.manager.expire_credit_freeze(peer);
     }
     fn rotating_peers(&mut self) -> Vec<PeerId> {
-        let max = self.config.max_outgoing_per_turn;
-        let mut ids: Vec<_> = self
-            .cursor
-            .map(|id| {
-                self.peers
-                    .range((std::ops::Bound::Excluded(id), std::ops::Bound::Unbounded))
-                    .take(max)
-                    .map(|(id, _)| *id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if ids.len() < max {
-            ids.extend(self.peers.keys().take(max - ids.len()).copied());
+        peer_batch(
+            &self.peers,
+            &mut self.cursor,
+            self.config.max_outgoing_per_turn,
+        )
+    }
+    async fn credit_work(&mut self) -> Result<usize, RuntimeError> {
+        let mut ids: Vec<_> = self.peers.keys().copied().collect();
+        if let Some(cursor) = self.credit_cursor {
+            let index = ids.partition_point(|id| *id <= cursor);
+            ids.rotate_left(index);
         }
-        ids.sort();
-        ids.dedup();
-        self.cursor = ids.last().copied();
-        ids
+        for &id in &ids {
+            let Some(s) = self.peers[&id].session.as_ref().filter(|s| !s.retiring) else {
+                continue;
+            };
+            if s.recipient_credit.deadline.is_some() && s.recipient_credit.granted.is_none() {
+                let lane = shard(id, self.config.shards);
+                let connection = self.lanes[lane].as_ref().ok_or(RuntimeError::Transport)?;
+                let limit = lane_credit_limit(connection.sources.len() + connection.retired.len())?;
+                let free = limit
+                    .checked_sub(self.lane_outstanding(lane)?)
+                    .ok_or(RuntimeError::Protocol)?;
+                let demand = s.recipient_credit.demand;
+                if free >= demand.min(ENVELOPE_WEIGHT) {
+                    self.peers
+                        .get_mut(&id)
+                        .unwrap()
+                        .session
+                        .as_mut()
+                        .unwrap()
+                        .recipient_credit
+                        .reserve(free.min(demand))?;
+                    self.credit_cursor = Some(id);
+                }
+            }
+        }
+        let mut count = 0;
+        for id in peer_batch(
+            &self.peers,
+            &mut self.credit_visit_cursor,
+            self.config.max_outgoing_per_turn,
+        ) {
+            let Some(session) = self.peers[&id].session.as_ref().filter(|s| !s.retiring) else {
+                continue;
+            };
+            let now = Instant::now();
+            if session.sender_credit.deadline.is_some_and(|n| now >= n)
+                || session.recipient_credit.deadline.is_some_and(|n| now >= n)
+            {
+                self.retire(id);
+                self.counters.peer_timeouts += 1;
+                continue;
+            }
+            let tx = &session.sender_credit;
+            let send = if tx.deadline.is_some() && !tx.published && tx.granted.is_none() {
+                Some((7, tx.round, tx.demand))
+            } else if tx.sealed && !tx.published {
+                Some((9, tx.round, tx.used))
+            } else {
+                None
+            };
+            if let Some((kind, hello, watermark)) = send {
+                let s = self.peers[&id].session.as_ref().unwrap();
+                self.send_control(
+                    id,
+                    Control {
+                        kind,
+                        sender: self.epoch,
+                        recipient: s.generation,
+                        hello,
+                        token: s.token,
+                        watermark,
+                    },
+                    true,
+                )
+                .await?;
+                self.peers
+                    .get_mut(&id)
+                    .unwrap()
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .sender_credit
+                    .published = true;
+                count += 1;
+            }
+            let s = self.peers[&id].session.as_ref().unwrap();
+            let rx = &s.recipient_credit;
+            let send = if rx.complete() {
+                Some((10, rx.round, rx.applied))
+            } else {
+                rx.granted
+                    .filter(|_| !rx.published)
+                    .map(|bytes| (8, rx.round, bytes))
+            };
+            if let Some((kind, hello, watermark)) = send {
+                self.send_control(
+                    id,
+                    Control {
+                        kind,
+                        sender: self.epoch,
+                        recipient: s.generation,
+                        hello,
+                        token: s.token,
+                        watermark,
+                    },
+                    true,
+                )
+                .await?;
+                let rx = &mut self
+                    .peers
+                    .get_mut(&id)
+                    .unwrap()
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .recipient_credit;
+                if kind == 10 {
+                    rx.acknowledge();
+                } else {
+                    rx.published = true;
+                }
+                count += 1;
+            }
+        }
+        Ok(count)
     }
     async fn control_work(&mut self) -> Result<usize, RuntimeError> {
         let now = Instant::now();
@@ -1451,7 +1933,9 @@ impl NatsRuntime {
                 }
             }
             let timeout = self.peers[&id].session.as_ref().is_some_and(|s| {
-                !s.retiring && s.ping.is_some_and(|(_, _, deadline, _)| deadline <= now)
+                !s.retiring
+                    && ((!s.proven && now >= s.proof_deadline)
+                        || s.ping.is_some_and(|(_, _, deadline, _)| deadline <= now))
             });
             if timeout {
                 let session = self.peers[&id].session.as_ref().unwrap();
@@ -1497,41 +1981,9 @@ impl NatsRuntime {
                     .pong = None;
                 count += 1;
             }
-            let repeat = self.peers[&id].session.as_ref().and_then(|s| {
-                if !s.retiring && s.ping_due <= now {
-                    s.ping
-                } else {
-                    None
-                }
+            let ping = self.peers[&id].session.as_ref().is_some_and(|s| {
+                !s.retiring && s.can_ping && s.ping.is_none() && s.next_ping <= now
             });
-            if let Some((nonce, watermark, _, _)) = repeat {
-                let s = self.peers[&id].session.as_ref().unwrap();
-                self.send_control(
-                    id,
-                    Control {
-                        kind: 5,
-                        sender: self.epoch,
-                        recipient: s.generation,
-                        hello: nonce,
-                        token: s.token,
-                        watermark,
-                    },
-                    true,
-                )
-                .await?;
-                self.peers
-                    .get_mut(&id)
-                    .unwrap()
-                    .session
-                    .as_mut()
-                    .unwrap()
-                    .ping_due = now + self.config.retry_initial;
-                count += 1;
-            }
-            let ping = self.peers[&id]
-                .session
-                .as_ref()
-                .is_some_and(|s| !s.retiring && s.ping.is_none() && s.next_ping <= now);
             if ping {
                 let nonce = random()?;
                 let s = self.peers[&id].session.as_ref().unwrap();
@@ -1561,13 +2013,6 @@ impl NatsRuntime {
                     now + self.config.peer_timeout,
                     self.peers[&id].session.as_ref().unwrap().delivery.sent,
                 ));
-                self.peers
-                    .get_mut(&id)
-                    .unwrap()
-                    .session
-                    .as_mut()
-                    .unwrap()
-                    .ping_due = now + self.config.retry_initial;
                 count += 1;
             }
             let remove = self.peers[&id].session.as_ref().is_none_or(|s| s.retiring)
@@ -1579,6 +2024,7 @@ impl NatsRuntime {
                 if self.manager.peer_streams(id).is_some() {
                     self.manager.remove_peer(id)?;
                 }
+                self.retire_source(id);
                 self.peers.remove(&id);
                 if self.config.initiate.contains(&id) {
                     self.join_peer(id)?;
@@ -1720,7 +2166,73 @@ impl NatsRuntime {
     where
         F: Future<Output = ()>,
     {
+        // One absolute work bound includes registration, publication and flush.
+        // A host deadline must wake idle waiting, never cancel an extracted
+        // output batch. If the complete turn expires, fence the whole transport
+        // before exposing its terminal events or returning to the host.
+        let profile_turn = self.diagnostics.enabled.then(Instant::now);
+        let mut progress =
+            match tokio::time::timeout(self.config.io_timeout, self.active_turn()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.transport_lost();
+                    self.last_error = Some(RuntimeError::Timeout);
+                    return Err(RuntimeError::Timeout);
+                }
+            };
         let mut wake = std::pin::pin!(wake);
+        let measured = self.diagnostics.enabled;
+        if progress == 0 && !wait.is_zero() && self.lifecycle == Lifecycle::Ready {
+            let profile_idle = measured.then(Instant::now);
+            if measured {
+                self.diagnostics.idle_count = self.diagnostics.idle_count.saturating_add(1);
+            }
+            let timeout = wait
+                .min(self.config.heartbeat_interval)
+                .min(self.config.retry_initial);
+            if let Ok(incoming) = tokio::time::timeout(
+                timeout,
+                std::future::poll_fn(|cx| match self.poll_incoming(cx) {
+                    Poll::Ready(incoming) => Poll::Ready(incoming),
+                    Poll::Pending => wake.as_mut().poll(cx).map(|()| None),
+                }),
+            )
+            .await
+            {
+                if let Some(incoming) = incoming {
+                    let id = if incoming.lane.is_none() {
+                        self.sender(incoming.message.subject.as_str(), None, true)
+                    } else {
+                        None
+                    };
+                    self.handle_message(incoming.message, incoming.lane, incoming.control)?;
+                    progress += 1;
+                    if let Some(id) = id
+                        && self.peers.contains_key(&id)
+                    {
+                        match tokio::time::timeout(self.config.io_timeout, self.promote(id)).await {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                self.transport_lost();
+                                self.last_error = Some(RuntimeError::Timeout);
+                                return Err(RuntimeError::Timeout);
+                            }
+                        }
+                    }
+                }
+                self.apply_failures();
+            }
+            if let Some(start) = profile_idle {
+                self.diagnostics.idle_us =
+                    self.diagnostics.idle_us.saturating_add(elapsed_us(start));
+            }
+        }
+        if let Some(start) = profile_turn {
+            self.diagnostics.turn_us = self.diagnostics.turn_us.saturating_add(elapsed_us(start));
+        }
+        Ok(progress)
+    }
+    async fn active_turn(&mut self) -> Result<usize, RuntimeError> {
         self.apply_failures();
         if self.lifecycle == Lifecycle::Recovering {
             self.recover().await?;
@@ -1729,8 +2241,8 @@ impl NatsRuntime {
         if self.lifecycle != Lifecycle::Ready {
             return Ok(0);
         }
+        self.unsubscribe_sources().await?;
         let measured = self.diagnostics.enabled;
-        let profile_turn = measured.then(Instant::now);
         if measured {
             self.diagnostics.turns = self.diagnostics.turns.saturating_add(1);
         }
@@ -1789,49 +2301,6 @@ impl NatsRuntime {
         self.apply_failures();
         if measured {
             self.diagnostics.progress = self.diagnostics.progress.saturating_add(progress as u64);
-        }
-        if progress == 0 && !wait.is_zero() {
-            let profile_idle = measured.then(Instant::now);
-            if measured {
-                self.diagnostics.idle_count = self.diagnostics.idle_count.saturating_add(1);
-            }
-            let timeout = wait
-                .min(self.config.heartbeat_interval)
-                .min(self.config.retry_initial);
-            if let Ok(incoming) = tokio::time::timeout(
-                timeout,
-                std::future::poll_fn(|cx| match self.poll_incoming(cx) {
-                    Poll::Ready(incoming) => Poll::Ready(incoming),
-                    Poll::Pending => wake.as_mut().poll(cx).map(|()| None),
-                }),
-            )
-            .await
-            {
-                if let Some(incoming) = incoming {
-                    let id = if incoming.lane.is_none() {
-                        self.sender(incoming.message.subject.as_str(), None, true)
-                    } else {
-                        None
-                    };
-                    // No await between owning the arrival and handling its bytes.
-                    self.handle_message(incoming.message, incoming.lane, incoming.control)?;
-                    progress += 1;
-                    if let Some(id) = id
-                        && self.peers.contains_key(&id)
-                    {
-                        self.promote(id).await?;
-                    }
-                }
-                self.apply_failures();
-            }
-            // Includes handling the incoming arrival, matching the complete idle branch.
-            if let Some(start) = profile_idle {
-                self.diagnostics.idle_us =
-                    self.diagnostics.idle_us.saturating_add(elapsed_us(start));
-            }
-        }
-        if let Some(start) = profile_turn {
-            self.diagnostics.turn_us = self.diagnostics.turn_us.saturating_add(elapsed_us(start));
         }
         Ok(progress)
     }
@@ -1909,6 +2378,28 @@ impl NatsRuntime {
 mod tests {
     use super::*;
     #[test]
+    fn terminal_source_retirement_preserves_bound_and_allows_reuse_after_cleanup() {
+        let mut sources = BTreeMap::from([(PeerId(1), [10, 11]), (PeerId(2), [20, 21])]);
+        let mut removing = Vec::new();
+        retire_source_handles(&mut sources, &mut removing, PeerId(1));
+        retire_source_handles(&mut sources, &mut removing, PeerId(1));
+        assert_eq!(sources.len() + removing.len(), 2);
+        assert_eq!(sources.get(&PeerId(2)), Some(&[20, 21]));
+        assert!(!sources.contains_key(&PeerId(1)));
+        assert_eq!(removing.pop(), Some([10, 11]));
+        assert!(removing.is_empty());
+        // Completed unsubscribe frees one row for a distinct new peer. A
+        // same-ID incarnation replacement retains its existing source row.
+        sources.insert(PeerId(3), [30, 31]);
+        assert_eq!(sources.len() + removing.len(), 2);
+        assert_eq!(sources.get(&PeerId(2)), Some(&[20, 21]));
+        retire_source_handles(&mut sources, &mut removing, PeerId(3));
+        assert_eq!(removing.pop(), Some([30, 31]));
+        sources.insert(PeerId(3), [32, 33]);
+        assert_eq!(sources.get(&PeerId(3)), Some(&[32, 33]));
+        assert_eq!(sources.len() + removing.len(), 2);
+    }
+    #[test]
     fn delivery_flight_acknowledges_only_authenticated_snapshot_prefix() {
         let now = Instant::now();
         let mut session = Session {
@@ -1919,13 +2410,16 @@ mod tests {
             tx: 9,
             rx: 0,
             next_ping: now,
+            can_ping: true,
+            proof_deadline: now,
             ping: Some((40, 7, now, 100)),
             delivery: DeliveryFlight {
                 sent: 400,
                 acknowledged: 0,
                 sequence: 0,
             },
-            ping_due: now,
+            sender_credit: credit::Sender::default(),
+            recipient_credit: credit::Recipient::default(),
             pong: None,
             retiring: false,
             proven: true,
@@ -1990,72 +2484,56 @@ mod tests {
         ));
     }
     #[test]
-    fn delivery_flight_bounds_weight_control_headroom_and_checked_counters() {
-        let mut flight = DeliveryFlight::default();
-        let packet = crate::Frame::Data {
-            offset: 0,
-            bytes: vec![1; 16384].into(),
-        };
-        let weight = (wire::encoded_size(2, &packet).unwrap() + 24 + MSG_FRAMING_BYTES) as u64;
-        assert_eq!(weight, 16384 + 28 + 24 + 516);
-        while flight.admits(weight, DATA_DELIVERY_BYTES).unwrap() {
-            flight.sent += weight;
-        }
-        assert!(!flight.admits(weight, DATA_DELIVERY_BYTES).unwrap());
-        let cancel = crate::Frame::Close {
-            reason: CloseReason::Cancelled,
-        };
-        let control = (wire::encoded_size(2, &cancel).unwrap() + 24 + MSG_FRAMING_BYTES) as u64;
+    fn recipient_flight_counts_all_sources_and_preserves_the_current_profile() {
+        assert_eq!(lane_credit_limit(128).unwrap(), 3 << 20);
+        let now = Instant::now();
+        let mut first = credit::Recipient::default();
+        let mut second = credit::Recipient::default();
+        let limit = lane_credit_limit(2).unwrap();
+        first
+            .request(1, limit, limit, now, Duration::from_secs(10))
+            .unwrap();
+        second
+            .request(1, limit, limit, now, Duration::from_secs(10))
+            .unwrap();
+        first.reserve(limit - 1024).unwrap();
+        second.reserve(limit - first.outstanding()).unwrap();
+        assert_eq!(first.outstanding() + second.outstanding(), limit);
+        first.returned(1, 512).unwrap();
+        assert!(!first.complete());
+        assert_eq!(first.outstanding() + second.outstanding(), limit);
+        first.apply(512).unwrap();
+        assert!(first.complete());
+        first.acknowledge();
+        assert_eq!(second.outstanding(), 1024);
+        assert!(lane_credit_limit(usize::MAX).is_err());
         assert!(
-            flight
-                .admits(control, BROKER_PENDING_BYTES - 128 * 1024)
-                .unwrap()
-        );
-        assert!(
-            std::mem::size_of::<DeliveryFlight>() + std::mem::size_of::<u64>()
+            std::mem::size_of::<credit::Sender>()
+                + std::mem::size_of::<credit::Recipient>()
+                + std::mem::size_of::<DeliveryFlight>()
+                + std::mem::size_of::<RetiredSource>()
+                + std::mem::size_of::<Option<(u128, u64, Instant, u64)>>()
+                + 64
                 <= crate::TRANSPORT_DELIVERY_STATE_BYTES
         );
-        flight.sent = u64::MAX;
-        assert!(matches!(
-            flight.admits(1, u64::MAX),
-            Err(RuntimeError::IdentityExhausted)
-        ));
     }
     #[test]
-    fn delivery_reserve_derives_retry_headroom_or_rejects_unsafe_profiles() {
-        let mut config = RuntimeConfig::new(
-            "tls://localhost:4222",
-            Trust::System,
-            Authentication {
-                username: "test".into(),
-                password: "test".into(),
-            },
-            "delivery.test",
-            PeerId(1),
-            Membership::BrokerAuthorized,
-        );
-        config.peer_timeout = Duration::from_secs(10);
-        config.retry_initial = Duration::from_millis(250);
-        assert_eq!(
-            delivery_limits(&config).unwrap(),
-            (3 << 20, (4 << 20) - (128 << 10))
-        );
-        config.peer_timeout = Duration::from_secs(60);
-        config.retry_initial = Duration::from_millis(100);
-        let (data, total) = delivery_limits(&config).unwrap();
-        assert_eq!(total, (4 << 20) - 602 * 2 * (77 + 516));
-        assert!(data < total);
-        config.peer_timeout = Duration::from_secs(86400);
-        config.retry_initial = Duration::from_millis(1);
-        assert!(matches!(
-            delivery_limits(&config),
-            Err(RuntimeError::Config)
-        ));
-        config.retry_initial = Duration::ZERO;
-        assert!(matches!(
-            delivery_limits(&config),
-            Err(RuntimeError::Config)
-        ));
+    fn control_and_credit_visitation_reach_every_peer_with_independent_cursors() {
+        let peers: BTreeMap<_, _> = (0..128).map(|id| (PeerId(id), Peer::new())).collect();
+        let (mut control, mut credit) = (Some(PeerId(7)), Some(PeerId(71)));
+        let (mut controls, mut credits) = (BTreeMap::new(), BTreeMap::new());
+        for _ in 0..8 {
+            for id in peer_batch(&peers, &mut control, 32) {
+                *controls.entry(id).or_insert(0) += 1;
+            }
+            for id in peer_batch(&peers, &mut credit, 32) {
+                *credits.entry(id).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(controls.len(), 128);
+        assert_eq!(credits.len(), 128);
+        assert!(controls.values().all(|n| *n == 2));
+        assert!(credits.values().all(|n| *n == 2));
     }
     #[test]
     fn control_is_exact_bounded_and_versioned() {
@@ -2077,9 +2555,12 @@ mod tests {
         b.push(0);
         assert!(Control::decode(&b).is_none());
         b.pop();
-        b[4] = 7;
+        b[4] = 11;
         assert!(Control::decode(&b).is_none());
         b[4] = 1;
+        b[..4].copy_from_slice(b"SKC1");
+        assert!(Control::decode(&b).is_none());
+        b[..4].copy_from_slice(b"SKC2");
         b[0] = 0;
         assert!(Control::decode(&b).is_none());
     }

@@ -21,8 +21,9 @@ Runner запускает независимые release daemons, Python accepto
 binary clients через NATS с закреплённым образом и TLS и временными CA/паролями/ACL. Нужны
 Linux, Rust1.92+, Python3.9+, Ruby3.4+, Docker/OpenSSL. Для cached dependencies/image
 добавьте `--offline`. `check` включает этот же сценарий после остальных проверок.
-Dependencies и image digest закреплены в Cargo.lock и runner; IPCv1 отличается
-от experimental network wire/control v1.
+Dependencies и image digest закреплены в Cargo.lock и runner. IPCv1 — отдельный
+локальный протокол; актуальные DATA/control форматы Core описаны в
+[сетевом framing](wire.md) и [контракте NatsRuntime](nats-runtime.md).
 
 Для собственного NATS provisioner создаёт profile JSON. Храните его в отдельном
 private runtime directory вне checkout, например созданном `mktemp -d`; mode0700

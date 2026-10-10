@@ -1,7 +1,7 @@
 # Динамический NATS runtime
 
 `skvoz_core::runtime::NatsRuntime` — опциональный runtime одной универсальной
-Core library 4.0.1. Он добавляет authenticated join, смену peer session, проверку
+Core library 4.1.0. Он добавляет authenticated join, смену peer session, проверку
 живости и восстановление транспорта для новых byte streams. Включается feature
 `nats`; HTTP/SOCKS parsing, DNS, сокеты, GUI и выдача credentials принадлежат host.
 Статический [NatsNode](../core/src/nats.rs) используется простым TCP relay
@@ -99,6 +99,8 @@ bytes плюс runtime envelope 24 bytes. Runtime отвергает и мень
 | Прервать только ожидание idle-транспорта по готовности внешнего I/O | `turn_with_wake(wait, wake).await` |
 | Прочитать локальный профиль / проверенные лимиты удалённого потока | `limits()` / `peer_limits(key)` |
 | Получить состояние / подробные данные о буферах | `status()` / `resources()` |
+| Прочитать локальное поколение runtime | `epoch()` |
+| Допустить peer с ожидаемым поколением | `authorize_peer(peer, expected_epoch)` |
 | Завершить peer / отозвать его локальное разрешение | `terminate_peer(peer)` / `revoke_peer(peer)` |
 | Завершить работу runtime | `shutdown().await` |
 
@@ -128,6 +130,14 @@ progress; обработка внешнего I/O остаётся обязан�
 Host должен ожидать завершения всего turn. Внешний `select` с отменой активного
 turn может потерять владение уже извлечёнными output frames и завершить транспорт.
 
+Активная часть turn имеет один абсолютный предел `io_timeout`: в него входят
+регистрация подписок, публикации и flush. При истечении срока runtime завершает
+текущее транспортное поколение до возврата `RuntimeError::Timeout`; прикладные
+данные извлечённых кадров не повторяются в новом сеансе. Штатное ожидание idle
+учитывается отдельно и может длиться дольше `io_timeout`, сохраняя здоровый
+транспорт. Готовность host или ближайший срок маршрута прерывают только это
+ожидание; начатая активная часть завершается в своём ограниченном сроке.
+
 `join_peer` идемпотентен для pending flight. Для уже ready peer прямой Core API
 начинает новую negotiation: подтверждённая pair session replacement закрывает
 старые streams. Host не должен считать повторный `join_peer` harmless connect.
@@ -142,6 +152,15 @@ Broker permissions должны связывать sender PeerId, recipient Peer
 разрешает новые broker-authorized identities в пределах `ManagerConfig.max_peers`,
 включая pending joins. Это явный контракт доверия к provisioning брокера;
 пересоздавать сервер для нового разрешённого клиента не требуется.
+
+В профиле `Allowlist` host может добавлять разрешённый peer через
+`authorize_peer(peer, Some(epoch))`. Runtime принимает JOIN только этого
+поколения удалённого Core. Замена активного поколения требует сначала явного
+отзыва; вызов с другим ожидаемым epoch возвращает ошибку. `None` задаёт обычное
+разрешение ID без ограничения поколения. API отклоняет собственный PeerId,
+нулевой ожидаемый epoch и превышение `max_peers`; для `BrokerAuthorized`
+динамическая выдача разрешения не применяется. `revoke_peer` удаляет также
+ожидаемое поколение. Проверка дополняет брокерные ACL и не выдаёт credentials.
 
 Темы NATS:
 
@@ -169,10 +188,12 @@ session; runtime не заменяет credential revocation.
 
 ## Присоединение, замена и готовность
 
-Control v1 — ровно 77 bytes: `SKC1`, kind u8, sender generation u128, recipient
-generation u128, initiator nonce u128, pair token/challenge u128, watermark u64;
-числа big-endian. Это отдельный экспериментальный envelope; stream wire v2 и
-его [fixtures](../core/tests/fixtures/README.md) сохраняются.
+Control v2 — ровно 77 bytes: `SKC2`, kind u8, sender generation u128, recipient
+generation u128, nonce/round u128, pair token/challenge u128, watermark u64;
+числа big-endian. Kinds1…6 задают JOIN и PING/PONG; kinds7…10 — REQUEST, GRANT,
+RETURN и RETURN_ACK общей ёмкости доставки. `SKC1` не поддерживается. Это
+отдельный transport envelope; stream wire v2 и его
+[fixtures](../core/tests/fixtures/README.md) сохраняются.
 
 Node generation, initiator nonce и responder challenge генерируются OS randomness.
 HELLO инициирует CHALLENGE; CONFIRM связывает обе generations и оба challenges;
@@ -190,11 +211,17 @@ terminal events и ждёт их drain. Затем снимает старую M
 sequence проверяются на overflow. Ранее выданные buffers остаются у host.
 
 `async-nats::Client.flush()` завершает локальную запись socket buffers; это не
-broker PONG и не доказательство установленной subscription. После negotiation
-peer остаётся неготовым до matching nonce PONG на новой lane. DATA SUB создаётся
-до CONTROL SUB на той же connection; успешный lane roundtrip подтверждает путь.
-Первый потерянный warmup PING/PONG повторяется без продления исходного deadline.
-`peer_ready` и `open` требуют этого доказательства.
+broker PONG и не доказательство установленной subscription. DATA SUB создаётся
+до CONTROL SUB на той же connection; отдельный `broker_barrier()` ждёт PONG на
+свой broker PING. Responder устанавливает подписки перед READY, инициатор —
+после READY. Затем инициатор отправляет первый lane PING; responder начинает
+свою проверку только после этого сообщения. Успешный lane roundtrip подтверждает
+путь между peer, включая распространение интереса через leaf. После negotiation
+peer остаётся неготовым до собственного matching nonce PONG на новой lane.
+PING/PONG на установленной lane публикуются однократно; отсутствие ответа
+завершает peer в пределах исходного deadline. `peer_ready` и `open` требуют
+этого доказательства. JOIN flights имеют собственные ограниченные retries на
+отдельном соединении.
 
 Доказательство готовности локально: одна сторона может уже видеть ready,
 пока другая ещё ждёт своего PONG. Полученный authenticated OPEN и действующий
@@ -207,23 +234,39 @@ sequenceDiagram
     participant A as Runtime A
     participant N as TLS NATS
     participant B as Runtime B
-    A->>N: HELLO generation A, nonce A
-    N->>B: Authenticated sender A
-    B->>N: CHALLENGE generation B, nonce A, token B
+    A->>N: HELLO: поколение A, nonce A
+    N->>B: Проверенный отправитель A
+    B->>N: CHALLENGE: поколение B, nonce A, token B
     N->>A: CHALLENGE
-    A->>N: Install DATA and CONTROL subscriptions
-    A->>N: CONFIRM both generations and nonces
+    A->>N: CONFIRM: оба поколения и nonce
     N->>B: CONFIRM
-    B->>B: Drain old streams, install lane, register pair
+    B->>B: Завершить старые потоки, установить pair
+    B->>N: Подписки DATA и CONTROL, затем broker PING
+    N-->>B: Broker PONG подтверждает подписки
     B->>N: READY
     N->>A: READY
-    A->>N: Lane PING nonce, dispatched watermark
-    N->>B: Lane PING
-    B->>N: Matching lane PONG after input applied
-    N->>A: Matching lane PONG
-    Note over A,B: Peer ready only after its own matching lane proof
-    A->>N: First OPEN / DATA
+    A->>N: Подписки DATA и CONTROL, затем broker PING
+    N-->>A: Broker PONG подтверждает подписки
+    A->>N: PING lane: nonce и watermark отправки
+    N->>B: PING lane
+    B->>N: Соответствующий PONG после обработки входа
+    N->>A: Соответствующий PONG lane
+    B->>N: Собственный PING lane
+    N->>A: PING lane
+    A->>N: Соответствующий PONG после обработки входа
+    N->>B: Соответствующий PONG lane
+    Note over A,B: Готовность peer требует собственного подтверждения lane
+    A->>N: REQUEST: уже готовые байты для отправки
+    N->>B: REQUEST
+    B->>N: GRANT: разрешённые байты общей lane
+    N->>A: GRANT
+    A->>N: OPEN / DATA в пределах разрешения
     N->>B: OPEN / DATA
+    A->>N: RETURN: завершить выдачу, сообщить использованные байты
+    N->>B: RETURN
+    B->>B: Применить весь указанный префикс DATA
+    B->>N: RETURN_ACK: остаток освобождён
+    N->>A: RETURN_ACK
 ```
 
 Host обязан регулярно вызывать `turn` и `poll_events`. Если terminal events не
@@ -248,7 +291,9 @@ Missing PONG завершает peer после configured deadline. Наблю�
 heartbeat interval, peer timeout, bounded peer visitation и host driving/I/O delay.
 Runtime не исполняется сам без host turns. Peer slots обслуживаются bounded
 rotation; driver не сканирует все idle streams. Manager сохраняет indexed opening
-deadlines. Heartbeats повторяют исходный nonce/watermark до исходного deadline.
+deadlines. На установленной lane каждый PING/PONG публикуется однократно.
+Потеря управляющего сообщения может завершить peer даже после восстановления
+leaf: получение подтверждения нельзя заменять предположением о доставке.
 
 Global join-transport loss переводит `Ready -> Recovering`: старый Manager
 остаётся terminal, events дренируются, затем создаются новый Manager и generation.
@@ -265,11 +310,25 @@ Transport/Protocol и безопасные Manager errors.
 
 ## Очереди, изоляция и состояние
 
-Одна join connection и до `shards` lazy lane connections, по DATA и CONTROL
-subscription на lane. Default shards8, допустимо1..32; отсутствуют connection/task
-на каждый stream. Клиент к server PeerId0 использует только shard0, сервер —
-не больше eight lanes данного профиля. CONTROL имеет собственную queue, join —
-отдельный входной budget. Incoming shards вращаются после каждого message.
+Одна join connection и до `shards` lazy lane connections. На каждой lane есть
+две общие ограниченные очереди: DATA и CONTROL. Для каждого допущенного peer
+runtime регистрирует два отдельных subscription SID с точным sender PeerId;
+они направляют сообщения в эти общие очереди. Дополнительные очереди, соединения
+или задачи на peer/stream не создаются. Такой subject позволяет NATS leaf
+передавать subscription interest при публикационных правах, ограниченных
+собственным sender PeerId ноды. Регистрация и flush завершаются до готовности
+session. При удалении peer runtime снимает обе source subscriptions, ждёт
+отдельный broker PING/PONG barrier и обрабатывает зафиксированный префикс общей
+DATA queue. Только затем освобождаются неизвестные остатки разрешений и source
+slot. Обычный `Client.flush()` остаётся локальным socket flush и не заменяет
+этот barrier. Во время ожидания runtime продолжает обрабатывать входящие
+сообщения; ошибка или deadline barrier завершает соответствующую lane.
+
+Default shards8, допустимо1..32. Клиент к server PeerId0 использует только
+shard0, сервер — не больше восьми lanes данного профиля. CONTROL имеет
+собственную queue, join — отдельный входной budget. Incoming shards вращаются
+после каждого message. Активные, снимаемые и ожидающие обработки старой очереди
+source slots в сумме ограничены `max_peers`.
 
 SlowConsumer/ошибка lane завершает peers этой shard. Другие shards сохраняют
 прогресс; isolation внутри одной shard не обещается. Контрольный flood,
@@ -277,26 +336,43 @@ credential-authorized unlimited publish или broker-global saturation треб
 операционных rate/account limits. Broker `max_pending`/`write_deadline` ограничивают
 его очереди. Повышение queue capacity не заменяет loss detection и admission.
 
-Перед извлечением frames из Manager runtime ограничивает неподтверждённую
-доставку отдельно от credit фактического потребления. Для одной session DATA
-занимает не более 3 МиБ с учётом envelope и консервативного NATS framing;
-управляющим frames доступен дополнительный headroom внутри 4 МиБ. Из этого
-общего предела резервируется минимум 128 КиБ для retry/heartbeat controls;
-длительные или частые retries увеличивают резерв, а небезопасный профиль
-отклоняется при запуске. Это соответствует broker `max_pending: 4194304`;
-меньший broker limit требует согласованного transport contract.
+Перед извлечением frames из Manager runtime получает разрешение получателя на
+доставку отдельно от credit фактического потребления. Все sources одной
+recipient lane делят общий flight не более 3 МиБ с учётом envelope и
+консервативного NATS framing. Внутри broker `max_pending: 4194304` дополнительно
+резервируются3558 bytes на каждый допущенный или снимаемый source
+(`6 × (77 + 516)`, шесть control records) и один максимальный envelope. Если этот резерв требует
+больше места, доступный общий flight уменьшается до выдачи новых разрешений.
+Добавление source не сокращает уже выданные разрешения; при нехватке backing
+admission отклоняется. Меньший broker limit требует согласованного transport
+contract.
 
-При заполнении половины DATA flight runtime отправляет lane PING. Matching
-PONG освобождает только подтверждённый префикс отправленных bytes; более поздние
-публикации остаются учтёнными. Broker flush сам по себе не освобождает этот
-flight. Закрытый gate оставляет DATA в Core и допускает доступные управляющие
-frames и работу других peers. Подтверждение доставки не возвращает receive
-credit: для него по-прежнему необходимо фактическое потребление host.
+REQUEST сообщает объём уже готовых frames; получатель выдаёт конечный GRANT
+из свободной общей ёмкости. Активный sender может использовать доступную
+ёмкость, idle peers не резервируют долю для будущих данных. Запросы обслуживаются
+с вращением; постоянного деления на максимальное число peers нет. Все Core
+frames на DATA subject, включая управляющие, расходуют выданные framed bytes.
+Без достаточного разрешения frame остаётся в Manager.
 
-Этот предел относится к одной producer→recipient session. Сумма публикаций
-независимых клиентов в общую серверную lane не получает общей квоты этим
-механизмом; при её перегрузке действуют описанные выше обнаружение потери и
-изоляция shard. Ограничение памяти flight не является лимитом байтов в секунду.
+В каждой паре и направлении действует не более одной выдачи. Перед RETURN
+sender закрывает её для дальнейшей отправки и сообщает использованный объём.
+Поздний или повторный GRANT не открывает закрытую выдачу. Получатель возвращает
+использованную ёмкость по мере применения входящих frames, а неиспользованный
+остаток — только после обработки всего указанного в RETURN префикса. CONTROL
+может прийти раньше DATA, поэтому получение RETURN само по себе недостаточно.
+Следующая выдача начинается после соответствующего RETURN_ACK. Epoch, token,
+round и счётчики проверяются; переполнение и невозможные переходы отклоняются.
+
+REQUEST/GRANT/RETURN/RETURN_ACK на установленной lane публикуются однократно.
+У выдачи собственный абсолютный `peer_timeout`; успешный heartbeat не продлевает
+ожидание потерянного ответа. Неопределённый остаток сохраняется до подтверждённого
+снятия source и обработки старой очереди либо завершения lane. Ни локальный
+flush, ни восстановление leaf не освобождают его автоматически. Потеря
+подтверждения завершает peer без повторной отправки прикладных данных.
+
+Подтверждение доставки не возвращает Core receive credit: для него по-прежнему
+необходимо фактическое потребление host. Flight ограничивает одновременно
+находящиеся в пути bytes, а не байты в секунду.
 
 DATA output публикуется bounded batch и flush выполняется на затронутые
 connections. Cancellation guard действует для всех extracted frames до завершения
@@ -307,7 +383,7 @@ lane input без новой очереди/task; immutable envelope сохра�
 budget, оставаясь ограниченным output batch и I/O deadline. Initial peer grants
 не извлекаются до matching PONG readiness. Manager freeze failure также
 завершает runtime session, даже если следующего DATA нет.
-Retryable heartbeat/control batches также имеют отдельные конечные slots.
+Handshake flights и established control records имеют отдельные конечные slots.
 
 `RuntimeConfig::new` задаёт capacities128 DATA/CONTROL,128 join,16 commands,
 64 inbound messages на каждый DATA/CONTROL pass и32 output frames/turn.
@@ -331,9 +407,10 @@ payload bytes, пять групп размеров DATA (`<1500`, `1500…8191`
 `validate_profile` учитывает queued messages и четыре дополнительных слота на
 соединение: одну pending decoded Message, парсер и одну временную Message.
 Обеспеченная граница —
-`(join_capacity + 2*shards*subscription_capacity + (shards+1)*client_capacity + 4*(shards+1)) * (65588+1024) + max_peers*64`.
-Последнее слагаемое обеспечивает состояние delivery flight и snapshot bytes
-незавершённого PING каждого peer.
+`(join_capacity + 2*shards*subscription_capacity + (shards+1)*client_capacity + 4*(shards+1)) * (65588+1024) + max_peers*(512+2*1024)`.
+Последнее слагаемое обеспечивает конечное состояние разрешений отправителя и
+получателя, delivery flight, незавершённого PING и карантина снимаемой подписки,
+а также метаданные двух exact-source подписок каждого peer.
 Парсер ограничен `2*(65588+516)` байтами capacity; тело каждого queued payload
 имеет собственный буфер точной длины. Fixed body maximum 65588 действует до
 первого INFO, при TLS upgrade и reconnect, независимо от broker max_payload.

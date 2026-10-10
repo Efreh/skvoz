@@ -473,6 +473,11 @@ impl IncrementalUnix {
         self.writing.is_some()
     }
 
+    /// An accepted first byte arms the existing bounded receive deadline.
+    pub fn read_pending(&self) -> bool {
+        self.reading.is_some()
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         self.reading
             .as_ref()

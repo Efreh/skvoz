@@ -219,7 +219,13 @@ def holder(path):
     time.sleep(60)
 
 
-def qualify(root, directory, env, args):
+def qualify(root, directory, env, args, *, stop_broker=None, start_broker=None):
+    # An embedding runner may own a local broker process instead of Docker.
+    if (stop_broker is None) != (start_broker is None):
+        raise ValueError('Both broker lifecycle callbacks are required')
+    if stop_broker is None:
+        stop_broker = lambda: subprocess.run(['docker', 'stop', '--time', '1', env['SKVOZ_NATS_CONTAINER']], check=True, stdout=subprocess.DEVNULL)
+        start_broker = lambda: subprocess.run(['docker', 'start', env['SKVOZ_NATS_CONTAINER']], check=True, stdout=subprocess.DEVNULL)
     binary = root / 'target' / 'release' / 'skvoz-core-daemon'
     daemons = []
     clients = []
@@ -494,11 +500,11 @@ def qualify(root, directory, env, args):
         report['checks'].append('foreign host SIGKILL + daemon SIGKILL/stale path/generation-safe new streams')
         # Real broker stop/start: old streams terminate, IPC remains, only new streams recover.
         before_loss = exchange(c2, b'before-broker-loss', half_close=False)
-        subprocess.run(['docker', 'stop', '--time', '1', env['SKVOZ_NATS_CONTAINER']], check=True, stdout=subprocess.DEVNULL)
+        stop_broker()
         wait_until(lambda: c2.status()[0] == 2)
         assert_clean(c2)
         assert c2.request(5, before_loss, b'old-broker')[0] == 4
-        subprocess.run(['docker', 'start', env['SKVOZ_NATS_CONTAINER']], check=True, stdout=subprocess.DEVNULL)
+        start_broker()
         wait_until(lambda: c2.request(11, payload=struct.pack('!Q', 0))[3] == b'\1', seconds=30)
         exchange(c2, b'new-stream-after-broker')
         report['checks'].append('real broker restart terminal cleanup/new-stream-only recovery')

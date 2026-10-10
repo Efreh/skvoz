@@ -4,6 +4,7 @@ use skvoz_core::{Event, ManagerConfig, PeerId, PeerLimits, SendOutcome};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -191,7 +192,7 @@ mod profile_tests {
             match case {
                 0 => invalid.stream.receive_window = 16384,
                 1 => invalid.stream.max_frame = 1,
-                2 => invalid.max_peers = 2,
+                2 => invalid.max_peers = 9,
                 3 => invalid.max_streams = canonical.max_streams + 1,
                 4 => invalid.send_budget_per_peer = CONTROL_MAX + 7,
                 5 => invalid.receive_budget_per_peer = 65536,
@@ -387,8 +388,36 @@ pub struct NetworkEngine {
     dynamic: Option<(Vec<u8>, u16, u8)>,
     reservations: BTreeMap<RuntimeKey, PendingReservation>,
     reserved_config: Option<(RuntimeKey, SessionConfig, Instant)>,
+    admission: Option<Arc<Mutex<crate::routing::Egress>>>,
 }
 impl NetworkEngine {
+    pub(crate) fn set_admission(&mut self, table: Arc<Mutex<crate::routing::Egress>>) {
+        self.admission = Some(table);
+    }
+    pub(crate) fn route_live(&self, key: RuntimeKey, ip: bool) -> bool {
+        if ip {
+            self.sessions.get(&key.stream.peer).is_some_and(|session| session.control == key) || self.reservations.contains_key(&key) || self.backend.iter().any(|event| matches!(event, BackendEvent::Retire{key:owned,..}|BackendEvent::Reserve{key:owned,..}|BackendEvent::Activate{key:owned,..} if *owned==key))
+        } else {
+            self.tcp.contains(&key) || self.runtime.snapshot(key).is_some()
+        }
+    }
+    pub(crate) fn close_owned(&mut self, key: RuntimeKey) {
+        if let Some(session) = self
+            .sessions
+            .get(&key.stream.peer)
+            .filter(|s| s.control == key)
+            .map(|s| s.id.clone())
+        {
+            let _ = self.close_session(&session);
+        } else if let Some(reservation) = self.reservations.get_mut(&key) {
+            reservation.deadline = Instant::now();
+        } else {
+            // Keep the exact TCP registry key until Core's Closed/Rejected
+            // event is harvested into the native backend. Removing it here
+            // would misclassify that event and strand the actor's socket.
+            self.request_tcp_close(key);
+        }
+    }
     pub fn new(
         runtime: NatsRuntime,
         role: EngineRole,
@@ -439,6 +468,7 @@ impl NetworkEngine {
             dynamic: None,
             reservations: BTreeMap::new(),
             reserved_config: None,
+            admission: None,
         })
     }
     #[cfg(feature = "portable-runtime")]
@@ -548,18 +578,46 @@ impl NetworkEngine {
         host: String,
         port: u16,
     ) -> Result<RuntimeKey, NetworkError> {
+        self.open_tcp_admission(peer, host, port, None)
+    }
+    pub fn open_tcp_assigned(
+        &mut self,
+        assignment: &crate::routing::Assignment,
+        host: String,
+        port: u16,
+    ) -> Result<RuntimeKey, NetworkError> {
+        self.open_tcp_admission(
+            PeerId(assignment.owner),
+            host,
+            port,
+            Some(assignment.admission()),
+        )
+    }
+    fn open_tcp_admission(
+        &mut self,
+        peer: PeerId,
+        host: String,
+        port: u16,
+        admission: Option<crate::routing::Admission>,
+    ) -> Result<RuntimeKey, NetworkError> {
         if !self.tcp_enabled || !matches!(self.role, EngineRole::Client) {
             return Err(NetworkError::InvalidState);
         }
-        let key = self.runtime.open(
-            peer,
-            &Metadata::Tcp {
+        let target = Metadata::Tcp {
+            v: crate::NETWORK_VERSION,
+            host,
+            port,
+        };
+        let metadata = if let Some(admission) = admission {
+            Metadata::Assigned {
                 v: crate::NETWORK_VERSION,
-                host,
-                port,
+                admission,
+                target: Box::new(target),
             }
-            .encode()?,
-        )?;
+        } else {
+            target
+        };
+        let key = self.runtime.open(peer, &metadata.encode()?)?;
         self.tcp.insert(key);
         Ok(key)
     }
@@ -583,6 +641,9 @@ impl NetworkEngine {
     }
     pub fn close_tcp(&mut self, key: RuntimeKey) {
         self.tcp.remove(&key);
+        self.request_tcp_close(key);
+    }
+    fn request_tcp_close(&mut self, key: RuntimeKey) {
         // Core retains the finite slot and its metadata until paced cancellation.
         self.tcp_closing.retain(|pending| {
             self.runtime
@@ -795,6 +856,34 @@ impl NetworkEngine {
         max_mtu: u16,
         channels: u8,
     ) -> Result<RuntimeKey, NetworkError> {
+        self.open_ip_admission(peer, families, family_policy, max_mtu, channels, None)
+    }
+    pub fn open_ip_assigned(
+        &mut self,
+        assignment: &crate::routing::Assignment,
+        families: Vec<u8>,
+        family_policy: FamilyPolicy,
+        max_mtu: u16,
+        channels: u8,
+    ) -> Result<RuntimeKey, NetworkError> {
+        self.open_ip_admission(
+            PeerId(assignment.owner),
+            families,
+            family_policy,
+            max_mtu,
+            channels,
+            Some(assignment.admission()),
+        )
+    }
+    fn open_ip_admission(
+        &mut self,
+        peer: PeerId,
+        families: Vec<u8>,
+        family_policy: FamilyPolicy,
+        max_mtu: u16,
+        channels: u8,
+        admission: Option<crate::routing::Admission>,
+    ) -> Result<RuntimeKey, NetworkError> {
         if !matches!(self.role, EngineRole::Client)
             || self.sessions.contains_key(&peer)
             || self.sessions.len() >= self.config.ip_sessions
@@ -809,7 +898,16 @@ impl NetworkEngine {
             max_mtu,
             channels,
         };
-        let encoded = m.encode()?;
+        let encoded = if let Some(admission) = admission {
+            Metadata::Assigned {
+                v: crate::NETWORK_VERSION,
+                admission,
+                target: Box::new(m),
+            }
+            .encode()?
+        } else {
+            m.encode()?
+        };
         self.reserve_ip(peer, channels)?;
         let key = match self.runtime.open(peer, &encoded) {
             Ok(k) => k,
@@ -844,8 +942,10 @@ impl NetworkEngine {
     }
     fn reject(&mut self, key: RuntimeKey, kind: &str, error: &str) -> Result<(), NetworkError> {
         self.counters.rejected_opens = self.counters.rejected_opens.saturating_add(1);
-        let bytes = serde_json::to_vec(&serde_json::json!({"v":4,"type":kind,"error":error}))
-            .map_err(|_| NetworkError::InvalidMetadata)?;
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"v":crate::NETWORK_VERSION,"type":kind,"error":error}),
+        )
+        .map_err(|_| NetworkError::InvalidMetadata)?;
         self.runtime.reject(key, &bytes)?;
         Ok(())
     }
@@ -864,12 +964,53 @@ impl NetworkEngine {
                 );
             }
         };
+        let m = match m {
+            Metadata::Assigned {
+                admission, target, ..
+            } => {
+                let Some(table) = self.admission.clone() else {
+                    return self.reject(key, Metadata::request_type(metadata), "forbidden");
+                };
+                let Some(peer) = self.runtime.peer_status(key.stream.peer) else {
+                    return self.reject(key, Metadata::request_type(metadata), "forbidden");
+                };
+                let accepted = table
+                    .lock()
+                    .map_err(|_| NetworkError::InvalidState)?
+                    .consume(
+                        key,
+                        &crate::routing::epoch(peer.generation),
+                        &admission,
+                        &target,
+                        Instant::now(),
+                    )
+                    .is_ok();
+                if !accepted {
+                    return self.reject(key, Metadata::request_type(metadata), "forbidden");
+                }
+                *target
+            }
+            Metadata::Tcp { .. } if self.admission.is_some() => {
+                return self.reject(key, "tcp", "forbidden");
+            }
+            Metadata::IpSession { .. }
+                if self.admission.is_some()
+                    && self
+                        .reserved_config
+                        .as_ref()
+                        .is_none_or(|(reserved, _, _)| *reserved != key) =>
+            {
+                return self.reject(key, "ip-session", "forbidden");
+            }
+            other => other,
+        };
         if (matches!(&m, Metadata::IpSession { .. } | Metadata::IpData { .. }) || self.tcp_enabled)
             && !compatible_peer_profile(self.runtime.peer_limits(key))
         {
             return self.reject(key, Metadata::request_type(metadata), "invalid_request");
         }
         match m {
+            Metadata::Assigned { .. } => return self.reject(key, "assigned", "forbidden"),
             Metadata::IpSession {
                 families,
                 family_policy,

@@ -1,5 +1,5 @@
 {
-  "v": 1,
+  "v": 2,
   "role": "client",
   "core": {
     "url": "tls://127.0.0.1:1",
@@ -11,12 +11,8 @@
     "namespace": "network_fixture",
     "peer_id": "1",
     "membership": "allowlist",
-    "allowed_peers": [
-      "0"
-    ],
-    "initiate": [
-      "0"
-    ]
+    "allowed_peers": [],
+    "initiate": []
   },
   "network": {
     "families": [
@@ -53,5 +49,9 @@
       "packet_io_timeout_ms": 1000
     }
   },
-  "server": null
+  "server": null,
+  "routing": {
+    "egress": false,
+    "authority": null
+  }
 }

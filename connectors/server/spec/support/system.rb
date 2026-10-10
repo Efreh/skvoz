@@ -2,6 +2,7 @@
 require 'fileutils'
 require 'find'
 require 'json'
+require 'net/http'
 require 'open3'
 require 'openssl'
 require 'pathname'
@@ -244,18 +245,52 @@ module ServerSystem
     raw&.close unless raw&.closed?
   end
 
+  # Exercise the LEAFNODE-only principal using the pinned ordinary NATS server,
+  # rather than a STANDARD CONNECT which rejects even a valid node credential.
+  def leaf_credentials_work(join)
+    Dir.mktmpdir('skvoz-leaf-auth-') do |root|
+      monitor = free_port
+      path, log = File.join(root, 'probe.json'), File.join(root, 'probe.log')
+      remote = Skvoz::Server::NodeJoin.new(join).remote(ca_path: File.join(root, 'ca.pem'))
+      private_json(path, { 'server_name' => "leaf-auth-#{SecureRandom.hex(8)}", 'host' => '127.0.0.1', 'port' => free_port,
+        'http' => "127.0.0.1:#{monitor}", 'accounts' => { 'APP' => {} },
+        'max_payload' => 65588, 'max_pending' => 4194304, 'leafnodes' => { 'compression' => 'off', 'remotes' => [remote] } })
+      output = File.open(log, File::WRONLY | File::CREAT | File::EXCL, 0o600)
+      pid = Process.spawn(NATS, '--config', path, out: output, err: output)
+      output.close
+      http = Net::HTTP.new('127.0.0.1', monitor, nil)
+      http.open_timeout = http.read_timeout = 0.5
+      deadline = monotonic + 3
+      loop do
+        return false if File.read(log).match?(/Authorization Violation/i)
+        raise IOError, 'Native leaf credential probe exited' if process_dead(pid)
+        begin
+          return true if JSON.parse(http.get('/leafz').body).fetch('leafnodes') == 1
+        rescue SystemCallError, Net::ReadTimeout, Net::OpenTimeout, EOFError
+          # The finite startup interval includes native monitor availability.
+        end
+        return false if File.read(log).match?(/Authorization Violation/i)
+        raise Timeout::Error, 'Native leaf authentication outcome unavailable' if monotonic >= deadline
+        sleep 0.02
+      end
+    ensure
+      output&.close unless output&.closed?
+      terminate(pid, timeout: 3) if pid
+    end
+  end
+
   class Server
     attr_reader :directory, :state, :config, :value, :port, :monitor, :process, :log, :cli
     def initialize(directory, overrides: {}, nats: NATS, allow: [])
       @directory = Pathname.new(directory)
       @cli = [RbConfig.ruby, COMPONENT.join('bin/skvoz-server').to_s]
       @state, @config, @log = %w[server-state server.json server.log].map { |name| @directory.join(name) }
-      selected = overrides.values_at('port', 'monitor_port')
+      selected = overrides.values_at('port', 'monitor_port', 'leaf_port')
       excluded = selected.compact + [overrides.dig('tls', 'challenge_port')].compact
       available = ServerSystem.free_ports(selected.count(nil), except: excluded)
-      @port, @monitor = selected.map { |port| port || available.shift }
+      @port, @monitor, leaf_port = selected.map { |port| port || available.shift }
       @value = { 'state_dir' => @state.to_s, 'address' => 'localhost', 'bind' => '127.0.0.1', 'port' => @port,
-                 'monitor_port' => @monitor, 'nats_binary' => nats.to_s, 'runtime_binary' => RUNTIME, 'allow' => allow, 'network' => {},
+                 'monitor_port' => @monitor, 'leaf_port' => leaf_port, 'nats_binary' => nats.to_s, 'runtime_binary' => RUNTIME, 'allow' => allow, 'network' => {},
                  'tls' => { 'mode' => 'provided', 'certificate' => @directory.join('server.pem').to_s,
                             'key' => @directory.join('server.key').to_s, 'ca' => @directory.join('ca.pem').to_s } }.merge(overrides)
       ServerSystem.private_json(@config, @value)
@@ -277,7 +312,13 @@ module ServerSystem
     end
 
     def command(operation, login = nil, password = nil)
-      argv = @cli + (operation == 'health' ? ['health'] : ['user', operation])
+      argv = @cli + if operation == 'health'
+          ['health']
+        elsif operation.start_with?('node-')
+          ['node', operation.delete_prefix('node-')]
+        else
+          ['user', operation]
+        end
       argv << login if login
       argv += ['--state', @state.to_s]
       argv << '--password-stdin' if password
@@ -314,10 +355,10 @@ module ServerSystem
       limits = Skvoz::Server::NetworkConfiguration::LIMITS.merge('ip_sessions' => 1, 'core_streams' => 512,
         'lease_identities' => 1, 'core_receive_bytes' => 33554432, 'core_send_bytes' => 2097152,
         'runtime_buffer_bytes' => 100663296, 'runtime_buffer_records' => 16384)
-      ServerSystem.private_json(@profile, { v: 1, role: 'client', server: nil,
+      ServerSystem.private_json(@profile, { v: 2, role: 'client', server: nil, routing: { egress: false, authority: nil },
         core: { url: "tls://127.0.0.1:#{bundle.fetch('port')}", tls_server_name: bundle.fetch('address'),
           trust: 'managed_ca', ca_file: ca.to_s, username: bundle.fetch('username'), password: bundle.fetch('password'),
-          namespace: bundle.fetch('namespace'), peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: ['0'], initiate: ['0'] },
+          namespace: bundle.fetch('namespace'), peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: [], initiate: [] },
         network: { families: [4], max_mtu: 1400, channels: 1, limits: } })
       @output = File.open(@log, 'ab')
       start
@@ -332,7 +373,7 @@ module ServerSystem
       @process = Process.spawn(RUNTIME, '--config', @profile.to_s, '--control-fd', '3', 3 => child, out: @output, err: @output)
       child.close
       @path = RuntimeClient.new(owner)
-      hello, = @path.request('HELLO', { api: 1, network: 4 })
+      hello, = @path.request('HELLO', { api: 1, network: 5 })
       raise IOError, 'Runtime HELLO rejected' if hello['error']
       ServerSystem.wait_until do
         raise IOError, "Device startup failed: #{@log.read}" if ServerSystem.process_dead(@process)
@@ -346,6 +387,16 @@ module ServerSystem
     def restart
       stop
       start
+    end
+
+    # Credential removal intentionally terminates this admitted incarnation.
+    # Assert that outcome before cleanup instead of sending IPC to a dead child.
+    def wait_for_termination(timeout: 9)
+      ServerSystem.wait_until(timeout:) { ServerSystem.process_dead(@process) }
+      @path&.close
+      ServerSystem.terminate(@process, timeout: 8)
+      @process = nil
+      @path = nil
     end
 
     def stop

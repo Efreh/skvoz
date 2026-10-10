@@ -1,14 +1,18 @@
 # Общий сетевой модуль
 
-`skvoz-network` 0.4.2 содержит переносимые сетевые состояния и общий Linux/Android runtime,
+`skvoz-network` 0.5.0 содержит переносимые сетевые состояния и общий Linux/Android runtime,
 который использует один [Core/NatsRuntime](../docs/nats-runtime.md). Core
-передаёт непрозрачные байты; сетевой модуль проверяет network v4, управляет
+передаёт непрозрачные байты; сетевой модуль проверяет network v5, управляет
 TCP-потоками и полными IPv4/IPv6-пакетами. Локальный контракт, строгая
 конфигурация и команды описаны в [руководстве runtime](../docs/network-runtime.md).
 
 `RuntimeHandle` и `skvoz-network-runtime` используют один actor. Локальный
 HELLO не ждёт подключения NATS. Клиент выбирает взаимоисключающие режимы
 `proxy` и `ip`; сервер принимает оба сетевых профиля через тот же Core.
+Адресное управление route1 назначает один подтверждённый выход для нового
+TCP/VPN-сеанса. Standalone совмещает управление и выход; разнесённая схема
+использует те же библиотеку и образ. Lease, admission, поколения и конечные
+управляющие бюджеты описаны в [общем контракте](../docs/network-runtime.md#назначение-выхода-и-владение-сеансом).
 HTTP/CONNECT/SOCKS5 CONNECT разбираются внутри Rust; payload не передаётся
 через управляющий JSON. OPEN_TCP возвращает owned Unix FD после удалённого
 ACCEPT. Остаток частичного SEND сохраняется, кредит принимаемых TCP-байтов
@@ -38,8 +42,8 @@ FFI не создаёт второй engine или собственную оче
 `portable-runtime` включает тот же actor для Linux и Android; `linux-runtime`
 сохраняет Linux CLI host. Android допускает только client role без helper,
 получает проверенный owned TUN FD от [мобильного клиента](../docs/android-client.md).
-Общий enrollment2 используется Ubuntu и Android; host lifecycle/trusted anchor
-storage остаются ответственностью платформы. Wire/API/component versions сохранены.
+Общий enrollment3 используется Ubuntu и Android; host lifecycle/trusted anchor
+storage остаются ответственностью платформы. Core wire2, API1 и ABI1 сохранены; network5 и StartupConfig2 проверяются явно.
 
 Из корня репозитория:
 

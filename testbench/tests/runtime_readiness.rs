@@ -1,7 +1,9 @@
 #![cfg(feature = "real-nats")]
 //! Real transport regression for bounded, cancel-safe idle input readiness.
 use skvoz_core::{Event, ManagerConfig, PeerId, SendOutcome, runtime::NatsRuntime};
-use skvoz_network::{Accept, EngineConfig, EngineRole, Metadata, NetworkEngine, NetworkError};
+use skvoz_network::{
+    Accept, EngineConfig, EngineRole, Metadata, NETWORK_VERSION, NetworkEngine, NetworkError,
+};
 use skvoz_testbench::runtime_scenarios as r;
 use std::time::{Duration, Instant};
 
@@ -133,7 +135,7 @@ async fn network_initiator_rejects_unoffered_or_incomplete_required_config() {
                         .accept(
                             event.key,
                             &Accept::IpSession {
-                                v: 4,
+                                v: NETWORK_VERSION,
                                 session: grant.session.clone(),
                             }
                             .encode()
@@ -260,24 +262,42 @@ async fn delayed_data_wakes_idle_turn_and_pending_wait_cancellation_loses_nothin
     assert_eq!(client.limits().stream, ManagerConfig::default().stream);
     quiet(&mut client, &mut server).await;
     let started = Instant::now();
-    let (progress, ()) = tokio::join!(server.turn(Duration::from_millis(400)), async {
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert_eq!(
-            client.send(local, b"delayed data").unwrap(),
-            SendOutcome::Accepted(12)
-        );
-        client.turn(Duration::ZERO).await.unwrap();
-    });
-    assert!(
-        progress.unwrap() > 0,
-        "idle turn did not process the arriving frame"
+    let (events, ()) = tokio::join!(
+        async {
+            loop {
+                assert!(started.elapsed() < Duration::from_millis(300));
+                let progress = server.turn(Duration::from_millis(400)).await.unwrap();
+                let events = server.poll_events(256);
+                if events.iter().any(|event| {
+                    event.key == remote
+                        && matches!(&event.event, Event::Data { offset: 0, bytes }
+                        if bytes.as_ref() == b"delayed data")
+                }) {
+                    assert!(progress > 0, "idle turn did not process the arriving DATA");
+                    break events;
+                }
+                // A transport credit REQUEST is also a legitimate idle wake.
+                // Its GRANT precedes publication of the application DATA.
+            }
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let before = client.status().counters.data_frames_published;
+            assert_eq!(
+                client.send(local, b"delayed data").unwrap(),
+                SendOutcome::Accepted(12)
+            );
+            while client.status().counters.data_frames_published == before {
+                assert!(started.elapsed() < Duration::from_millis(300));
+                client.turn(Duration::from_millis(1)).await.unwrap();
+            }
+        }
     );
     assert!(
         started.elapsed() < Duration::from_millis(300),
         "idle turn waited for its timer despite incoming DATA: {:?}",
         started.elapsed()
     );
-    let events = server.poll_events(256);
     assert!(events.iter().any(|event| event.key == remote
         && matches!(&event.event,Event::Data {offset:0,bytes} if bytes.as_ref()==b"delayed data")));
     assert_eq!(
@@ -307,6 +327,7 @@ async fn delayed_data_wakes_idle_turn_and_pending_wait_cancellation_loses_nothin
             Instant::now() < deadline,
             "cancelled wait lost an incoming frame"
         );
+        client.turn(Duration::ZERO).await.unwrap();
         server.turn(Duration::from_millis(50)).await.unwrap();
         if server.poll_events(256).into_iter().any(|event|event.key==remote&&matches!(event.event,Event::Data{offset:12,bytes} if bytes.as_ref()==b"after cancellation")){break;}
     }
@@ -352,6 +373,18 @@ async fn host_wake_ends_only_idle_wait_and_preserves_subsequent_nats_data() {
     let (local, remote) = r::handshake(&mut client, &mut server).await.unwrap();
     quiet(&mut client, &mut server).await;
 
+    // Valid profiles may have an idle cadence longer than the active I/O
+    // deadline. Waiting for no traffic must not fence a healthy transport.
+    let epoch = server.generation();
+    let idle_started = Instant::now();
+    assert_eq!(server.turn(Duration::from_millis(900)).await.unwrap(), 0);
+    assert!(idle_started.elapsed() >= Duration::from_millis(800));
+    assert_eq!(server.generation(), epoch);
+    assert_eq!(
+        server.status().lifecycle,
+        skvoz_core::runtime::Lifecycle::Ready
+    );
+
     let started = Instant::now();
     assert_eq!(
         server
@@ -391,6 +424,7 @@ async fn host_wake_ends_only_idle_wait_and_preserves_subsequent_nats_data() {
     let mut received = 0;
     while received == 0 {
         assert!(Instant::now() < deadline, "host wake lost incoming DATA");
+        client.turn(Duration::ZERO).await.unwrap();
         server
             .turn_with_wake(Duration::from_millis(50), async {})
             .await
@@ -452,7 +486,7 @@ async fn network_admission_rejects_incompatible_remote_window_and_frame() {
             .open(
                 PeerId(0),
                 &Metadata::IpSession {
-                    v: 4,
+                    v: NETWORK_VERSION,
                     families: vec![4],
                     family_policy: skvoz_network::FamilyPolicy::RequireAll,
                     max_mtu: 1500,
@@ -482,7 +516,7 @@ async fn network_admission_rejects_incompatible_remote_window_and_frame() {
         let reason: serde_json::Value = serde_json::from_slice(&rejection).unwrap();
         assert_eq!(
             reason,
-            serde_json::json!({"v":4,"type":"ip-session","error":"invalid_request"})
+            serde_json::json!({"v":NETWORK_VERSION,"type":"ip-session","error":"invalid_request"})
         );
         assert!(engine.sessions().is_empty());
         assert_eq!(engine.resources().streams, 0);
@@ -530,7 +564,7 @@ async fn network_initiator_closes_incompatible_accept_before_readiness() {
                     .accept(
                         event.key,
                         &Accept::IpSession {
-                            v: 4,
+                            v: NETWORK_VERSION,
                             session: "0123456789abcdef0123456789abcdef"
                                 .to_owned()
                                 .try_into()
@@ -565,21 +599,43 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
         profile.peer_timeout = Duration::from_secs(10);
         profile.retry_initial = Duration::from_millis(250);
     }
+    let namespace = server_config.namespace.clone();
     let mut server = NatsRuntime::connect(server_config, config.core_limits(true))
         .await
         .unwrap();
     let mut client = NatsRuntime::connect(client_config, config.core_limits(false))
         .await
         .unwrap();
+    server.inject_ignore_next_lane_pong();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !client.peer_ready(PeerId(0)) {
+    while !client.peer_ready(PeerId(0)) || server.inspect_lane_pong_injection_pending() {
         assert!(Instant::now() < deadline, "asymmetric proof setup deadline");
         client.turn(Duration::from_millis(1)).await.unwrap();
-        // Keep only server's reciprocal proof pending; client may prove its lane.
-        server.inject_ignore_next_lane_pong();
+        // Arm once and observe the original PONG being discarded before any
+        // delayed response is injected; the client may prove its own lane.
         server.turn(Duration::from_millis(1)).await.unwrap();
     }
     assert!(!server.peer_ready(PeerId(1)));
+    // The proof PING is published once. Retain its actual response fields so
+    // this fixture can deliver that delayed PONG after observing pending setup.
+    let (nonce, watermark) = server.inspect_pending_lane_proof(PeerId(1)).unwrap();
+    let peer = server.peer_status(PeerId(1)).unwrap();
+    let delayed_subject = format!(
+        "{namespace}.lane.0.{:032x}.1.control.1.{:032x}",
+        server.generation(),
+        client.generation()
+    );
+    let mut delayed_pong = b"SKC2".to_vec();
+    delayed_pong.push(6);
+    for value in [
+        client.generation(),
+        server.generation(),
+        nonce,
+        peer.pair_token,
+    ] {
+        delayed_pong.extend_from_slice(&value.to_be_bytes());
+    }
+    delayed_pong.extend_from_slice(&watermark.to_be_bytes());
     let grant: SessionConfig = serde_json::from_value(serde_json::json!({
         "session":"0123456789abcdef0123456789abcdef", "families":[4],
         "source_grants":["192.0.2.10/32"], "routes":["0.0.0.0/0"],
@@ -600,7 +656,7 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
         .open(
             PeerId(0),
             &Metadata::IpSession {
-                v: 4,
+                v: NETWORK_VERSION,
                 families: vec![4],
                 family_policy: skvoz_network::FamilyPolicy::RequireAll,
                 max_mtu: 1500,
@@ -616,6 +672,7 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
     let mut ready_sent = false;
     let mut active = false;
     let mut retained_pending_proof = false;
+    let mut delayed_proof = Some((delayed_subject, delayed_pong));
     let deadline = Instant::now() + Duration::from_secs(4);
     while !active {
         assert!(Instant::now() < deadline, "reciprocal proof lost IP setup");
@@ -626,6 +683,9 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
             assert_eq!(engine.sessions()[0].state, SessionState::Preparing);
             assert!(engine.poll_packet().is_none());
             assert_eq!(engine.counters().closed_sessions, 0);
+            if let Some((subject, pong)) = delayed_proof.take() {
+                client.inject_subject(subject, pong).await.unwrap();
+            }
         }
         for observed in client.poll_events(32) {
             match observed.event {
@@ -640,7 +700,7 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
                                         .open(
                                             PeerId(0),
                                             &Metadata::IpData {
-                                                v: 4,
+                                                v: NETWORK_VERSION,
                                                 session: config.session.clone(),
                                                 channel: 0,
                                             }

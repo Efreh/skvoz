@@ -135,6 +135,11 @@ module Skvoz
         nil
       end
 
+      def await_exit(deadline)
+        Async::Task.current.sleep(0.02) while alive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        !alive?
+      end
+
       def stop(deadline)
         signal('TERM')
         Async::Task.current.sleep(0.02) while alive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline - 0.25

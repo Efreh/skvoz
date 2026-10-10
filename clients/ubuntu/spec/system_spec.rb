@@ -35,7 +35,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
       end
       @echo = ServerSystem::Target.new { |socket| ServerSystem.after_fin(socket) }
       @echo6 = ServerSystem::Target.new(host: '::1') { |socket| ServerSystem.after_fin(socket) }
-      @server = ServerSystem::Server.new(@directory, allow: [{ 'cidr' => '127.0.0.0/8', 'protocols' => [6], 'ports' => [@target.port, @tls_target.port, @echo.port] }, { 'cidr' => '::1/128', 'protocols' => [6], 'ports' => [@target.port, @tls_target.port, @echo.port, @echo6.port] }],
+      @server = ServerSystem::Server.new(@directory, allow: [{ 'cidr' => '127.0.0.0/8', 'protocols' => [6], 'ports' => [@target.port, @tls_target.port, @echo.port].uniq }, { 'cidr' => '::1/128', 'protocols' => [6], 'ports' => [@target.port, @tls_target.port, @echo.port, @echo6.port].uniq }],
                               overrides: { 'devices_per_user' => 4, 'max_identities' => 16 })
       @server.command('add', 'shared', 'process-test-password')
       @server.command('add', 'other', 'process-other-password')
@@ -307,7 +307,7 @@ RSpec.describe 'Native Ubuntu application through real TLS NATS', integration: t
       listener.close
     end
     fake = @directory.join('delayed-core')
-    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-network-runtime 0.4.2 network=4 api=1 core=4.0.1'; else exec sleep 60; fi\n")
+    fake.write("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'skvoz-network-runtime 0.5.0 network=5 api=1 core=4.1.0'; else exec sleep 60; fi\n")
     fake.chmod(0o700)
     parent = UbuntuSystem::Application.new(@directory.join('crash'), @server, runtime: fake.to_s, wait_ready: false)
     @applications << parent

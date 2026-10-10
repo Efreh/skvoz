@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import time
+import threading
 import traceback
 
 HERE = Path('/fixture')
@@ -19,17 +20,90 @@ DROP = ['setpriv', '--reuid=10001', '--regid=10001', '--clear-groups', '--no-new
 NARROW = ['setpriv', '--no-new-privs', '--bounding-set=-all,+net_admin', '--inh-caps=-all', '--ambient-caps=-all']
 
 
+def as_uid(uid, operation):
+    """Create private fixture files as their actual owner, without CHOWN."""
+    if not uid:
+        return operation()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setgroups([])
+            os.setgid(pwd.getpwuid(uid).pw_gid)
+            os.setuid(uid)
+            operation()
+            os._exit(0)
+        except BaseException:
+            traceback.print_exc()
+            os._exit(1)
+    _, status = os.waitpid(pid, 0)
+    assert status == 0, 'scoped owner creation failed'
+
+
+def owned_directory(path, uid, mode=0o700):
+    if path.exists() and path.stat().st_uid != uid:
+        # Package installation may leave this isolated runtime directory root-owned.
+        # Recreate only an empty directory; never add CHOWN or override access.
+        assert path.stat().st_uid == os.getuid() and not path.is_symlink()
+        path.rmdir()
+    parent = path.parent
+    original = parent.stat().st_mode & 0o7777
+    parent.chmod(0o733)
+    try:
+        as_uid(uid, lambda: path.mkdir(mode=mode, exist_ok=True))
+        assert path.stat().st_uid == uid
+    finally:
+        parent.chmod(original)
+
+
 def private(path, value, uid=0):
-    path.write_text(json.dumps(value))
-    path.chmod(0o600)
-    if uid:
-        os.chown(path, uid, uid)
+    def write():
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+    as_uid(uid, write)
+
+
+def owned_listener(root, uid):
+    """Prepare the systemd-equivalent listener before any helper admission."""
+    endpoint = root / 'control.sock'
+    endpoint.unlink(missing_ok=True)
+    parent, child = socket.socketpair()
+    # Only this isolated setup phase is writable by the fixture app. Restore
+    # the root directory boundary before the product validates the listener.
+    root.chmod(0o733)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            parent.close()
+            os.setgroups([]); os.setgid(uid); os.setuid(uid)
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(endpoint)); endpoint.chmod(0o600); listener.listen(1)
+            child.sendmsg([b'L'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                   array.array('i', [listener.fileno()]))])
+            os._exit(0)
+        except BaseException:
+            traceback.print_exc(); os._exit(1)
+    child.close()
+    try:
+        marker, controls, flags, _ = parent.recvmsg(1, socket.CMSG_SPACE(4))
+        _, status = os.waitpid(pid, 0)
+        assert status == 0 and marker == b'L' and not flags & socket.MSG_CTRUNC
+        assert len(controls) == 1 and controls[0][:2] == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+        descriptors = array.array('i'); descriptors.frombytes(controls[0][2])
+        assert len(descriptors) == 1
+        return socket.socket(fileno=descriptors[0])
+    finally:
+        parent.close(); root.chmod(0o711)
 
 
 class Channel:
     def __init__(self, sock):
         self.sock, self.id, self.events = sock, 0, []
-        sock.settimeout(20)
+        sock.settimeout(None)
+        self.condition = threading.Condition()
+        self.calls = threading.Lock()
+        self.pending, self.reply, self.failure = False, None, None
+        self.reader = threading.Thread(target=self.receive, daemon=True)
+        self.reader.start()
 
     def read(self):
         fds = []
@@ -53,46 +127,78 @@ class Channel:
         assert value['fd_count'] == len(fds)
         return value, fds
 
+    def receive(self):
+        try:
+            while True:
+                value, fds = self.read()
+                with self.condition:
+                    if 'event' in value:
+                        assert not fds
+                        if value['event'] != 'STATS':
+                            assert len(self.events) < 128
+                            self.events.append(value)
+                    else:
+                        assert self.pending and value['id'] == self.id and self.reply is None
+                        self.reply = (value, fds)
+                    self.condition.notify_all()
+        except BaseException as error:
+            with self.condition:
+                self.failure = error
+                self.condition.notify_all()
+
+    def healthy(self):
+        if self.failure:
+            raise self.failure
+
     def call(self, op, args=None, fd=None):
-        self.id += 1
-        body = json.dumps({'v':1, 'id':self.id, 'op':op, 'args':args or {}, 'fd_count':int(fd is not None)}).encode()
-        frame = struct.pack('!I', len(body)) + body
-        if fd is None:
-            self.sock.sendall(frame)
-        else:
-            rights = array.array('i', [fd])
-            sent = self.sock.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
-            self.sock.sendall(frame[sent:])
-        while True:
-            result, fds = self.read()
-            if 'event' in result:
-                assert not fds and len(self.events) < 128
-                self.events.append(result)
-                continue
-            assert result['id'] == self.id
+        with self.calls:
+            with self.condition:
+                self.healthy()
+                self.id += 1
+                self.pending = True
+            body = json.dumps({'v':1, 'id':self.id, 'op':op, 'args':args or {}, 'fd_count':int(fd is not None)}).encode()
+            frame = struct.pack('!I', len(body)) + body
+            if fd is None:
+                self.sock.sendall(frame)
+            else:
+                rights = array.array('i', [fd])
+                sent = self.sock.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+                self.sock.sendall(frame[sent:])
+            until = time.monotonic() + 20
+            with self.condition:
+                while self.reply is None:
+                    self.healthy()
+                    remaining = until - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(op)
+                    self.condition.wait(remaining)
+                (result, fds), self.reply, self.pending = self.reply, None, False
             if result.get('error'):
+                for descriptor in fds:
+                    os.close(descriptor)
                 raise RuntimeError(op + ': ' + result['error'])
             return result['result'], fds
 
     def event(self, name, handle=None):
         until = time.monotonic() + 25
-        while time.monotonic() < until:
-            index = 0
-            while index < len(self.events):
-                value = self.events[index]
-                if value['event'] == name and (handle is None or value['data'].get('handle') == handle):
-                    return self.events.pop(index)['data']
-                if value['event'] == 'CLOSED':
-                    self.events.pop(index)
-                    if handle is not None and value['data']['handle'] == handle:
-                        raise RuntimeError(value['data'].get('error') or 'closed')
-                    continue
-                index += 1
-            value, fds = self.read()
-            assert not fds and 'event' in value
-            if value['event'] != 'STATS':
-                self.events.append(value)
-        raise TimeoutError(name)
+        with self.condition:
+            while True:
+                index = 0
+                while index < len(self.events):
+                    value = self.events[index]
+                    if value['event'] == name and (handle is None or value['data'].get('handle') == handle):
+                        return self.events.pop(index)['data']
+                    if value['event'] == 'CLOSED':
+                        self.events.pop(index)
+                        if handle is not None and value['data']['handle'] == handle:
+                            raise RuntimeError(value['data'].get('error') or 'closed')
+                        continue
+                    index += 1
+                self.healthy()
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(name)
+                self.condition.wait(remaining)
 
 
 def child(argv, descriptors, log):
@@ -111,7 +217,7 @@ def spawn_runtime(helper=None):
     proc = child((DROP if os.getuid() == 0 else []) + argv, descriptors, 'runtime.log')
     right.close()
     channel = Channel(left)
-    channel.call('HELLO', {'api':1, 'network':4})
+    channel.call('HELLO', {'api':1, 'network':5})
     while channel.event('RUNTIME_STATE')['state'] != 'ready':
         if proc.poll() is not None:
             raise RuntimeError('runtime exited')
@@ -125,7 +231,7 @@ def client_helper():
     peer = socket.socket(socket.AF_UNIX)
     peer.connect('/run/skvoz-network-helper/10001/control.sock')
     channel = Channel(peer)
-    channel.call('HELLO', {'api':1, 'network':4})
+    channel.call('HELLO', {'api':1, 'network':5})
     recovered, _ = channel.call('RECOVER')
     return channel, recovered
 
@@ -218,19 +324,17 @@ def serve(role):
 def bootstrap(role):
     RUN.mkdir(exist_ok=True)
     RUN.chmod(0o755)
-    (RUN/'owner').mkdir(mode=0o700, exist_ok=True)
-    if role != 'server':
-        os.chown(RUN/'owner', 10001, 10001)
+    owned_directory(RUN/'owner', 0 if role == 'server' else 10001)
     master = json.loads((HERE / 'master.json').read_text())
-    (RUN/'profile').mkdir(mode=0o700, exist_ok=True)
-    os.chown(RUN/'profile',0,0)
-    if (RUN/'profile'/'runtime.json').exists(): os.chown(RUN/'profile'/'runtime.json',0,0,follow_symlinks=False)
+    owned_directory(RUN/'profile', 10001)
     private(RUN/'profile'/'runtime.json', master['runtime'], 10001)
-    os.chown(RUN/'profile', 10001, 10001)
-    if (RUN/'runtime.log').exists(): os.chown(RUN/'runtime.log',0,0,follow_symlinks=False)
-    (RUN / 'runtime.log').touch(mode=0o600)
-    if role != 'server':
-        os.chown(RUN / 'runtime.log', 10001, 10001)
+    # Logs follow the same actual owner as the fixture host; no CHOWN needed.
+    original = RUN.stat().st_mode & 0o7777
+    RUN.chmod(0o733)
+    try:
+        as_uid(0 if role == 'server' else 10001, lambda: (RUN/'runtime.log').touch(mode=0o600))
+    finally:
+        RUN.chmod(original)
     if role == 'server':
         Path(master['helper']['state_dir']).mkdir(mode=0o700, exist_ok=True)
         private(RUN / 'helper.json', master['helper'])
@@ -247,21 +351,24 @@ def bootstrap(role):
             time.sleep(.3)
             subprocess.Popen(['/usr/lib/polkit-1/polkitd', '--no-debug'], stdout=open(RUN/'polkit.log','wb'), stderr=subprocess.STDOUT)
             resolve = pwd.getpwnam('systemd-resolve')
-            Path('/run/systemd/resolve').mkdir(mode=0o755,parents=True,exist_ok=True)
-            os.chown('/run/systemd/resolve',resolve.pw_uid,resolve.pw_gid)
+            Path('/run/systemd').mkdir(mode=0o755, exist_ok=True)
+            directory = Path('/run/systemd/resolve')
+            if directory.exists() and directory.stat().st_uid == 0:
+                # Discard only the package-created stub in this disposable image;
+                # real resolved recreates it under its scoped runtime owner.
+                stub = directory/'stub-resolv.conf'
+                if stub.exists():
+                    assert set(directory.iterdir()) == {stub} and not stub.is_symlink()
+                    assert stub.is_file() and stub.stat().st_uid == 0 and stub.stat().st_size <= 4096
+                    stub.unlink()
+            owned_directory(directory, resolve.pw_uid, 0o755)
             subprocess.Popen(['setpriv',f'--reuid={resolve.pw_uid}',f'--regid={resolve.pw_gid}','--clear-groups','--no-new-privs','--bounding-set=-all,+net_raw,+net_bind_service,+setpcap','--inh-caps=+net_raw,+net_bind_service,+setpcap','--ambient-caps=+net_raw,+net_bind_service,+setpcap','/usr/lib/systemd/systemd-resolved'], stdout=open(RUN/'resolved.log','wb'), stderr=subprocess.STDOUT)
             time.sleep(1)
         root = Path('/run/skvoz-network-helper/10001')
         root.parent.mkdir(exist_ok=True)
         root.parent.chmod(0o711)
         root.mkdir(mode=0o711, exist_ok=True)
-        endpoint = root / 'control.sock'
-        endpoint.unlink(missing_ok=True)
-        listener = socket.socket(socket.AF_UNIX)
-        listener.bind(str(endpoint))
-        endpoint.chmod(0o600)
-        os.chown(endpoint, 10001, 10001)
-        listener.listen(1)
+        listener = owned_listener(root, 10001)
         pid = os.fork()
         if pid == 0:
             os.dup2(listener.fileno(), 3)

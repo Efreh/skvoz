@@ -12,19 +12,20 @@ RSpec.describe Skvoz::Server::Enrollment do
           task.sleep(0.05)
           File.write(File.join(directory, 'committed.json'), JSON.generate(login:, device:))
           applied << device
-          { v: 2, peer_id: 2 }
+          { v: 3, peer_id: 2 }
         end
         replies = []
         enrollment.define_singleton_method(:respond) { |*reply| replies << reply }
         enrollment.instance_variable_set(:@ready, true)
         enrollment.instance_variable_get(:@queue).concat([
-          ['shared', 'reply', JSON.generate(v: 2, device: 'a' * 32)],
-          ['shared', 'reply', JSON.generate(v: 2, device: 'b' * 32)]
+          ['shared', 'reply', JSON.generate(v: 3, device: 'a' * 32)],
+          ['shared', 'reply', JSON.generate(v: 3, device: 'b' * 32)]
         ])
         worker = task.async { enrollment.send(:worker) }
         enrollment.instance_variable_set(:@worker, worker)
         enrollment.instance_variable_get(:@tasks) << worker
-        task.sleep(0.001) until entered
+        task.with_timeout(1) { task.sleep(0.001) until entered }
+        expect(entered).to be(true)
         enrollment.stop(graceful: true)
         expect(JSON.parse(File.read(File.join(directory, 'committed.json')))).to include('device' => 'a' * 32)
         expect(applied).to eq(['a' * 32])

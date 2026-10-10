@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-ubuntu-client"
-version = "4.0.2"
+version = "5.0.0"
 description = "Native Ubuntu client for the shared SKVOZ network runtime"
 edition.workspace = true
 rust-version.workspace = true

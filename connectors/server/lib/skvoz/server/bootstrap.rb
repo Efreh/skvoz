@@ -23,8 +23,10 @@ module Skvoz
         raise Error, 'Root bootstrap required' unless Process.euid.zero?
         policy = NetworkConfiguration.new(config).inventory!(config)
         value = Marshal.load(Marshal.dump(config.value))
-        value['network']['server_addresses'] = policy.server['server_addresses']
-        value['network']['management_endpoints'] = policy.server['management_endpoints']
+        if config.egress?
+          value['network']['server_addresses'] = policy.server['server_addresses']
+          value['network']['management_endpoints'] = policy.server['management_endpoints']
+        end
         # No CHOWN capability: the application creates its own private files.
         pid = fork do
           Process.groups = []

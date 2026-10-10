@@ -116,6 +116,7 @@ async fn growing_duplex_credit_keeps_subscription_64_drained_during_output() {
         mut node: NatsRuntime,
         key: skvoz_core::runtime::RuntimeKey,
         byte: u8,
+        completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> NatsRuntime {
         const SIZE: usize = 4 << 20;
         let payload = vec![byte; SIZE];
@@ -123,8 +124,9 @@ async fn growing_duplex_credit_keeps_subscription_64_drained_during_output() {
         let mut received = 0;
         let initial_window = node.peer_limits(key).unwrap().receive_window as u64;
         let mut largest_flight = 0;
+        let mut finished = false;
         let started = Instant::now();
-        while sent < SIZE || received < SIZE {
+        while completed.load(std::sync::atomic::Ordering::SeqCst) != 2 {
             assert!(
                 started.elapsed() < Duration::from_secs(15),
                 "{:?}",
@@ -151,6 +153,10 @@ async fn growing_duplex_credit_keeps_subscription_64_drained_during_output() {
                     _ => {}
                 }
             }
+            if !finished && sent == SIZE && received == SIZE {
+                finished = true;
+                completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         assert_eq!(received, SIZE);
         assert!(
@@ -165,9 +171,12 @@ async fn growing_duplex_credit_keeps_subscription_64_drained_during_output() {
         );
         node
     }
+    // Accepted send bytes may still need recipient credit and owner turns.
+    // Keep both owners running until both have consumed the complete transfer.
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mut client, mut server) = tokio::join!(
-        transfer(client, local, 0x40),
-        transfer(server, remote, 0x41)
+        transfer(client, local, 0x40, completed.clone()),
+        transfer(server, remote, 0x41, completed)
     );
     // Warm bidirectional credit also measures the peer RTT before a fresh flow
     // waits in its owner's queue. No acknowledgement precedes actual consumption.
@@ -952,7 +961,7 @@ async fn same_epoch_pair_rejoin_rejects_old_keys_data_and_control_replay() {
         .await
         .unwrap();
     for kind in [1u8, 3, 4, 6] {
-        let mut c = b"SKC1".to_vec();
+        let mut c = b"SKC2".to_vec();
         c.push(kind);
         for n in [
             epoch,
@@ -975,7 +984,7 @@ async fn same_epoch_pair_rejoin_rejects_old_keys_data_and_control_replay() {
     }
     // Replay READY in its original responder -> initiator direction, carrying
     // the actual retired handshake nonce/token rather than an invented nonce.
-    let mut ready = b"SKC1".to_vec();
+    let mut ready = b"SKC2".to_vec();
     ready.push(4);
     for n in [
         server.generation(),
@@ -1006,18 +1015,84 @@ async fn same_epoch_pair_rejoin_rejects_old_keys_data_and_control_replay() {
     server.shutdown().await.unwrap();
 }
 #[tokio::test]
+async fn absolute_turn_expiry_fences_extracted_output_before_returning() {
+    let mut server = r::node(0, "turn_expiry").await.unwrap();
+    let mut client = r::node(1, "turn_expiry").await.unwrap();
+    r::joined(&mut client, &mut server, 1).await.unwrap();
+    let (old, _) = r::handshake(&mut client, &mut server).await.unwrap();
+    client.send(old, b"bounded extracted output").unwrap();
+    let mut extracted = client.inject_pause_next_data_after_extraction();
+    let started = Instant::now();
+    let outcome = loop {
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let (outcome, remote) = tokio::join!(
+            client.turn_with_wake(Duration::ZERO, async {}),
+            server.turn(Duration::from_millis(1))
+        );
+        remote.unwrap();
+        match extracted.try_recv() {
+            Ok(()) => break outcome,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                outcome.unwrap();
+            }
+            Err(error) => panic!("DATA extraction observation failed: {error}"),
+        }
+    };
+    assert_eq!(outcome, Err(skvoz_core::runtime::RuntimeError::Timeout));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        client.status().lifecycle,
+        skvoz_core::runtime::Lifecycle::Recovering
+    );
+    let events = client.poll_events(256);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.key == old
+                && matches!(
+                    e.event,
+                    Event::Closed {
+                        reason: CloseReason::TransportLost
+                    }
+                ))
+            .count(),
+        1
+    );
+    assert_eq!(client.resources().streams, 0);
+    assert!(!client.peer_ready(PeerId(0)));
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
+}
+#[tokio::test]
 async fn cancelled_extracted_output_fails_shard_then_fresh_pair_opens() {
-    use futures_util::FutureExt;
     let mut server = r::node(0, "cancel_output").await.unwrap();
     let mut client = r::node(1, "cancel_output").await.unwrap();
     r::joined(&mut client, &mut server, 1).await.unwrap();
     let (old, _) = r::handshake(&mut client, &mut server).await.unwrap();
     let epoch = client.generation();
     client.send(old, b"cancel after extraction").unwrap();
-    client.inject_pause_next_data_after_extraction();
-    let mut pending = Box::pin(client.turn(Duration::ZERO));
-    assert!(pending.as_mut().now_or_never().is_none());
-    drop(pending);
+    let mut extracted = client.inject_pause_next_data_after_extraction();
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let mut pending = Box::pin(client.turn(Duration::ZERO));
+        let outcome = tokio::select! {
+            biased;
+            observed = &mut extracted => {
+                observed.unwrap();
+                None
+            }
+            outcome = &mut pending => Some(outcome),
+        };
+        // Only cancel after observing extraction; earlier Pending work may be
+        // publishing the credit request or receiving its remote grant.
+        drop(pending);
+        match outcome {
+            None => break,
+            Some(outcome) => outcome.unwrap(),
+        };
+        server.turn(Duration::from_millis(1)).await.unwrap();
+    }
     let events = client.poll_events(256);
     assert_eq!(
         events
@@ -1056,7 +1131,7 @@ async fn cancelled_extracted_output_fails_shard_then_fresh_pair_opens() {
     server.shutdown().await.unwrap();
 }
 #[tokio::test]
-async fn injected_lost_lane_warmup_pong_retries_before_peer_ready() {
+async fn lost_single_lane_proof_fences_pair_before_fresh_join() {
     let mut server = r::node(0, "warmup").await.unwrap();
     let mut client = r::node(1, "warmup").await.unwrap();
     client.inject_ignore_next_lane_pong();
@@ -1066,13 +1141,13 @@ async fn injected_lost_lane_warmup_pong_retries_before_peer_ready() {
         Err(RuntimeError::PeerUnavailable)
     );
     r::joined(&mut client, &mut server, 1).await.unwrap();
-    assert_eq!(client.status().counters.peer_timeouts, 0);
+    assert!(client.status().counters.peer_timeouts >= 1);
     let (key, _) = r::handshake(&mut client, &mut server).await.unwrap();
     r::bytes(
         &mut client,
         &mut server,
         key,
-        b"first OPEN only after actual lane proof",
+        b"fresh OPEN only after actual lane proof",
     )
     .await
     .unwrap();

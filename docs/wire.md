@@ -1,6 +1,6 @@
 # NATS packet v2
 
-Core 4.0.1 использует wire 2; другие версии отвергаются. Одна публикация
+Core 4.1.0 использует wire 2; другие версии отвергаются. Одна публикация
 содержит один packet без padding. Все целые unsigned, big-endian. Максимум
 65 564 байта. Header: `SKVZ` (4 байта), version=2 (u8), kind (u8),
 reserved=0 (u16), stream_id (u64).

@@ -76,7 +76,7 @@ RSpec.describe 'System fixture port allocation' do
       server.command('add', 'shared', 'process-test-password')
       app = UbuntuSystem::Application.new(directory.join('client'), server)
       expect(app.ready).to include('ready' => true)
-      expect([server.port, server.monitor, app.http, app.socks].uniq.length).to eq(4)
+      expect([server.port, server.monitor, server.value.fetch('leaf_port'), app.http, app.socks].uniq.length).to eq(5)
       payload = "port-reuse\0\xff".b
       socket = nil
       Timeout.timeout(15) do

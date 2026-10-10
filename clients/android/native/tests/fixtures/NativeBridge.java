@@ -26,6 +26,9 @@ public final class NativeBridge {
             if (result != null && result.contains("\"state\":\"ready\"")) runtimeReady = true;
             if (result != null && result.contains("\"id\":" + id + ",")) {
                 if (!result.contains("\"error\":null")) throw new AssertionError("Native API rejected request");
+                if (id == 1 && (!result.matches(".*\"api\":1[,}].*") ||
+                    !result.matches(".*\"network\":5[,}].*") || !result.contains("\"role\":\"client\"")))
+                    throw new AssertionError("Native HELLO did not confirm the current client contract");
                 return;
             }
         }
@@ -40,9 +43,9 @@ public final class NativeBridge {
                 bridge.runtimeReady = false;
                 long handle = bridge.start(config);
                 try {
-                    bridge.request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}", -1);
+                    bridge.request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}", -1);
                     bridge.response(handle, 1);
-                    long deadline = System.nanoTime() + 10_000_000_000L;
+                    long deadline = System.nanoTime() + 20_000_000_000L;
                     while (!bridge.runtimeReady && System.nanoTime() < deadline) {
                         String event = bridge.poll(handle);
                         if (event != null && event.contains("\"state\":\"ready\"")) bridge.runtimeReady = true;
@@ -99,9 +102,11 @@ public final class NativeBridge {
                 bridge.runtimeReady = false;
                 long handle = bridge.start(config);
                 if (bridge.liveHandles() != 1) throw new AssertionError("Missing runtime owner");
-                bridge.request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}", -1);
+                bridge.request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}", -1);
                 bridge.response(handle, 1);
-                long readyDeadline = System.nanoTime() + 5_000_000_000L;
+                // A fresh incarnation waits for the previous device lease's
+                // 6s freshness + 3s cleanup fence; observe actual READY.
+                long readyDeadline = System.nanoTime() + 20_000_000_000L;
                 while (!bridge.runtimeReady && System.nanoTime() < readyDeadline) {
                     String event = bridge.poll(handle);
                     if (event != null && event.contains("\"state\":\"ready\"")) bridge.runtimeReady = true;
@@ -158,7 +163,7 @@ public final class NativeBridge {
         try {
             try { bridge.start(config); throw new AssertionError("Two runtimes accepted"); }
             catch (RuntimeException expected) { }
-            bridge.request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}", -1);
+            bridge.request(handle, "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}", -1);
             bridge.response(handle, 1);
             long deadline = System.nanoTime() + 20_000_000_000L;
             boolean ready = bridge.runtimeReady;

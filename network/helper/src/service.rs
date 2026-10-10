@@ -286,7 +286,7 @@ impl<S: Store, K: Kernel> Service<S, K> {
                     return Err(HelperError::InvalidState);
                 }
                 self.hello = true;
-                nofd(json!({"api":1,"network":4,"role":self.config.role}))
+                nofd(json!({"api":1,"network":5,"role":self.config.role}))
             }
             HelperOperation::PrepareServer => {
                 if self.config.role != Role::Server || self.journal.prepared {

@@ -405,6 +405,9 @@ pub(crate) enum Command {
     Flush {
         observer: oneshot::Sender<()>,
     },
+    BrokerBarrier {
+        observer: oneshot::Sender<()>,
+    },
     Drain {
         sid: Option<u64>,
     },
@@ -477,6 +480,9 @@ pub(crate) struct ConnectionHandler {
     ping_interval: Interval,
     should_reconnect: bool,
     flush_observers: Vec<oneshot::Sender<()>>,
+    barrier: Option<(u64, oneshot::Sender<()>)>,
+    sent_ping_sequence: u64,
+    received_pong_sequence: u64,
     is_draining: bool,
     drain_pings: VecDeque<u64>,
     subscription_backpressure_timeout: Option<Duration>,
@@ -504,6 +510,9 @@ impl ConnectionHandler {
             ping_interval,
             should_reconnect: false,
             flush_observers: Vec::new(),
+            barrier: None,
+            sent_ping_sequence: 0,
+            received_pong_sequence: 0,
             is_draining: false,
             drain_pings: VecDeque::new(),
             subscription_backpressure_timeout,
@@ -541,7 +550,9 @@ impl ConnectionHandler {
 
                     Poll::Ready(ExitReason::Disconnected(None))
                 } else {
-                    self.handler.connection.enqueue_write_op(&ClientOp::Ping);
+                    if !self.handler.enqueue_ping() {
+                        return Poll::Ready(ExitReason::Disconnected(None));
+                    }
 
                     Poll::Pending
                 }
@@ -728,7 +739,10 @@ impl ConnectionHandler {
                     // command channels even if the bounded event queue is full.
                     self.pending_delivery = None;
                     self.subscriptions.clear();
-                    self.connector.events_tx.try_send(Event::SlowConsumer(sid)).ok();
+                    self.connector
+                        .events_tx
+                        .try_send(Event::SlowConsumer(sid))
+                        .ok();
                     self.connector.state_tx.send(State::Disconnected).ok();
                     break;
                 }
@@ -761,18 +775,28 @@ impl ConnectionHandler {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
                 let mut pending = self.pending_delivery.take().unwrap();
-                if pending.sender.send_item(pending.message.take().unwrap()).is_ok() {
+                if pending
+                    .sender
+                    .send_item(pending.message.take().unwrap())
+                    .is_ok()
+                {
                     self.record_delivery(pending.sid);
                 } else {
                     self.subscriptions.remove(&pending.sid);
-                    self.connection.enqueue_write_op(&ClientOp::Unsubscribe { sid: pending.sid, max: None });
+                    self.connection.enqueue_write_op(&ClientOp::Unsubscribe {
+                        sid: pending.sid,
+                        max: None,
+                    });
                 }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(_)) => {
                 let pending = self.pending_delivery.take().unwrap();
                 self.subscriptions.remove(&pending.sid);
-                self.connection.enqueue_write_op(&ClientOp::Unsubscribe { sid: pending.sid, max: None });
+                self.connection.enqueue_write_op(&ClientOp::Unsubscribe {
+                    sid: pending.sid,
+                    max: None,
+                });
                 Poll::Ready(Ok(()))
             }
         }
@@ -781,7 +805,10 @@ impl ConnectionHandler {
     fn record_delivery(&mut self, sid: u64) {
         if let Some(subscription) = self.subscriptions.get_mut(&sid) {
             subscription.delivered += 1;
-            if subscription.max.is_some_and(|max| subscription.delivered >= max) {
+            if subscription
+                .max
+                .is_some_and(|max| subscription.delivered >= max)
+            {
                 self.subscriptions.remove(&sid);
             }
         }
@@ -798,6 +825,15 @@ impl ConnectionHandler {
             ServerOp::Pong => {
                 debug!("received PONG");
                 self.pending_pings = self.pending_pings.saturating_sub(1);
+                if self.received_pong_sequence < self.sent_ping_sequence {
+                    self.received_pong_sequence += 1;
+                    if self.barrier.as_ref().is_some_and(|(target, _)| {
+                        *target == self.received_pong_sequence
+                    }) {
+                        let (_, observer) = self.barrier.take().unwrap();
+                        let _ = observer.send(());
+                    }
+                }
             }
             ServerOp::Error(error) => {
                 debug!("received ERROR: {:?}", error);
@@ -853,7 +889,9 @@ impl ConnectionHandler {
                                 self.pending_delivery = Some(PendingDelivery {
                                     sid,
                                     message: Some(message),
-                                    sender: tokio_util::sync::PollSender::new(subscription.sender.clone()),
+                                    sender: tokio_util::sync::PollSender::new(
+                                        subscription.sender.clone(),
+                                    ),
                                     deadline: Box::pin(tokio::time::sleep(timeout)),
                                 });
                                 return;
@@ -931,13 +969,25 @@ impl ConnectionHandler {
                         .enqueue_write_op(&ClientOp::Unsubscribe { sid, max });
                 }
                 if !self.subscriptions.contains_key(&sid)
-                    && self.pending_delivery.as_ref().is_some_and(|pending| pending.sid == sid)
+                    && self
+                        .pending_delivery
+                        .as_ref()
+                        .is_some_and(|pending| pending.sid == sid)
                 {
                     self.pending_delivery = None;
                 }
             }
             Command::Flush { observer } => {
                 self.flush_observers.push(observer);
+            }
+            Command::BrokerBarrier { observer } => {
+                if self.barrier.is_none() {
+                    if self.enqueue_ping() {
+                        self.barrier = Some((self.sent_ping_sequence, observer));
+                    } else {
+                        self.should_reconnect = true;
+                    }
+                }
             }
             Command::Drain { sid } => {
                 let mut drain_sub = |sid: u64| {
@@ -958,7 +1008,9 @@ impl ConnectionHandler {
                         drain_sub(sid);
                     }
                 }
-                self.connection.enqueue_write_op(&ClientOp::Ping);
+                if !self.enqueue_ping() {
+                    self.should_reconnect = true;
+                }
             }
             Command::Subscribe {
                 sid,
@@ -1077,10 +1129,22 @@ impl ConnectionHandler {
     async fn handle_disconnect(&mut self) -> Result<(), ConnectError> {
         self.pending_delivery = None;
         self.pending_pings = 0;
+        self.barrier.take();
+        self.sent_ping_sequence = 0;
+        self.received_pong_sequence = 0;
         self.connector.events_tx.try_send(Event::Disconnected).ok();
         self.connector.state_tx.send(State::Disconnected).ok();
 
         self.handle_reconnect().await
+    }
+
+    fn enqueue_ping(&mut self) -> bool {
+        let Some(next) = self.sent_ping_sequence.checked_add(1) else {
+            return false;
+        };
+        self.sent_ping_sequence = next;
+        self.connection.enqueue_write_op(&ClientOp::Ping);
+        true
     }
 
     async fn handle_reconnect(&mut self) -> Result<(), ConnectError> {
@@ -1220,9 +1284,13 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             connection = Some(connection_ok);
         }
         let connection = connection.unwrap();
-        let mut connection_handler =
-            ConnectionHandler::new(connection, connector, info_sender, ping_period,
-                options.subscription_backpressure_timeout);
+        let mut connection_handler = ConnectionHandler::new(
+            connection,
+            connector,
+            info_sender,
+            ping_period,
+            options.subscription_backpressure_timeout,
+        );
         connection_handler.process(&mut receiver).await
     });
 
@@ -1371,19 +1439,60 @@ impl From<io::Error> for ConnectError {
     }
 }
 
-/// Retrieves messages from given `subscription` created by [Client::subscribe].
-///
-/// Implements [futures_util::stream::Stream] for ergonomic async message processing.
-///
-/// # Examples
-/// ```
-/// # #[tokio::main]
-/// # async fn main() ->  Result<(), async_nats::Error> {
-/// let mut nc = async_nats::connect("demo.nats.io").await?;
-/// # nc.publish("test", "data".into()).await?;
-/// # Ok(())
-/// # }
-/// ```
+/// Owned registration created by [Client::subscribe_into].
+/// Dropping it unsubscribes its subject without closing the shared receiver.
+#[derive(Debug)]
+pub struct SubscriptionHandle {
+    sid: u64,
+    sender: mpsc::Sender<Command>,
+    registered: bool,
+}
+
+impl SubscriptionHandle {
+    fn new(sid: u64, sender: mpsc::Sender<Command>) -> Self {
+        Self {
+            sid,
+            sender,
+            registered: true,
+        }
+    }
+
+    /// Stop this subscription without closing its shared receiver.
+    pub async fn unsubscribe(&mut self) -> Result<(), UnsubscribeError> {
+        if self.registered {
+            self.sender
+                .send(Command::Unsubscribe {
+                    sid: self.sid,
+                    max: None,
+                })
+                .await?;
+            self.registered = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        let command = Command::Unsubscribe {
+            sid: self.sid,
+            max: None,
+        };
+        if let Err(mpsc::error::TrySendError::Full(command)) = self.sender.try_send(command) {
+            let sender = self.sender.clone();
+            // Same reliable full-queue fallback as Subscriber's existing Drop.
+            tokio::spawn(async move {
+                sender.send(command).await.ok();
+            });
+        }
+    }
+}
+
+/// Receives messages from a subscription created by [Client::subscribe].
+/// Implements [futures_util::stream::Stream] for async message processing.
 #[derive(Debug)]
 pub struct Subscriber {
     sid: u64,
@@ -1938,6 +2047,184 @@ use crate::message::OutboundMessage;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+
+    fn shared_subscription_client(capacity: usize) -> (Client, mpsc::Receiver<Command>) {
+        let (_, info) = tokio::sync::watch::channel(None);
+        let (_, state) = tokio::sync::watch::channel(connection::State::Connected);
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            Client::new(
+                info,
+                state,
+                sender,
+                2,
+                "fixture".into(),
+                None,
+                Arc::new(AtomicUsize::new(65588)),
+                Arc::new(Statistics::default()),
+                false,
+            ),
+            receiver,
+        )
+    }
+
+    fn shared_message(subject: &'static str) -> Message {
+        Message {
+            subject: subject.into(),
+            payload: Bytes::from_static(b"bounded"),
+            reply: None,
+            headers: None,
+            status: None,
+            description: None,
+            length: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_subscriptions_have_one_aggregate_queue_and_independent_cleanup() {
+        let (client, mut commands) = shared_subscription_client(4);
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut first = client
+            .subscribe_into("lane.data.1.*", sender.clone())
+            .await
+            .unwrap();
+        let second = client
+            .subscribe_into("lane.data.2.*", sender.clone())
+            .await
+            .unwrap();
+        let Command::Subscribe {
+            sid: first_sid,
+            sender: first_delivery,
+            subject,
+            ..
+        } = commands.recv().await.unwrap()
+        else {
+            panic!("first registration absent");
+        };
+        assert_eq!(subject.as_str(), "lane.data.1.*");
+        let Command::Subscribe {
+            sid: second_sid,
+            sender: second_delivery,
+            ..
+        } = commands.recv().await.unwrap()
+        else {
+            panic!("second registration absent");
+        };
+        assert_ne!(first_sid, second_sid);
+        first_delivery
+            .try_send(shared_message("lane.data.1.a"))
+            .unwrap();
+        second_delivery
+            .try_send(shared_message("lane.data.2.b"))
+            .unwrap();
+        assert!(matches!(
+            first_delivery.try_send(shared_message("lane.data.1.c")),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert_eq!(receiver.len(), 2);
+        assert_eq!(
+            receiver.recv().await.unwrap().subject.as_str(),
+            "lane.data.1.a"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap().subject.as_str(),
+            "lane.data.2.b"
+        );
+        first.unsubscribe().await.unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(Command::Unsubscribe { sid, max: None }) if sid == first_sid)
+        );
+        first.unsubscribe().await.unwrap();
+        drop(first);
+        assert!(commands.try_recv().is_err());
+        assert!(!receiver.is_closed());
+        second_delivery
+            .try_send(shared_message("lane.data.2.c"))
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await.unwrap().subject.as_str(),
+            "lane.data.2.c"
+        );
+        drop(second);
+        assert!(
+            matches!(commands.recv().await, Some(Command::Unsubscribe { sid, max: None }) if sid == second_sid)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_on_full_command_queue_retains_unsubscribe_owner() {
+        let (client, mut commands) = shared_subscription_client(1);
+        let (observer, _) = oneshot::channel();
+        client
+            .sender
+            .send(Command::Flush { observer })
+            .await
+            .unwrap();
+        let (sender, _receiver) = mpsc::channel(2);
+        assert!(client
+            .subscribe_into("lane.data.1.*", sender)
+            .now_or_never()
+            .is_none());
+        assert!(matches!(commands.recv().await, Some(Command::Flush { .. })));
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::Unsubscribe { sid: 1, max: None })
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_unsubscribe_and_drop_cleanup_even_with_full_command_queue() {
+        let (client, mut commands) = shared_subscription_client(1);
+        let (sender, _receiver) = mpsc::channel(2);
+        let mut handle = client
+            .subscribe_into("lane.data.1.*", sender)
+            .await
+            .unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::Subscribe { sid: 1, .. })
+        ));
+        let (observer, _) = oneshot::channel();
+        client
+            .sender
+            .send(Command::Flush { observer })
+            .await
+            .unwrap();
+        assert!(handle.unsubscribe().now_or_never().is_none());
+        drop(handle);
+        assert!(matches!(commands.recv().await, Some(Command::Flush { .. })));
+        assert!(matches!(
+            commands.recv().await,
+            Some(Command::Unsubscribe { sid: 1, max: None })
+        ));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn shared_registration_rejects_invalid_subject_or_closed_receiver_without_enqueue() {
+        let (client, mut commands) = shared_subscription_client(2);
+        let (sender, receiver) = mpsc::channel(2);
+        assert_eq!(
+            client
+                .subscribe_into("invalid subject", sender.clone())
+                .await
+                .unwrap_err()
+                .kind(),
+            client::SubscribeErrorKind::InvalidSubject
+        );
+        drop(receiver);
+        assert_eq!(
+            client
+                .subscribe_into("valid.subject", sender)
+                .await
+                .unwrap_err()
+                .kind(),
+            client::SubscribeErrorKind::Other
+        );
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn server_address_ipv6() {

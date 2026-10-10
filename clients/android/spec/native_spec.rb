@@ -32,7 +32,7 @@ RSpec.describe 'Embedded Android JNI host on the Linux JVM', integration: true d
       server = ServerSystem::Server.new(directory, allow: [{ 'cidr' => '127.0.0.0/8', 'protocols' => [6], 'ports' => [target.port, http_target.port] }])
       server.command('add', 'android', 'process-test-password')
       fixture = Pathname.new(__dir__).join('../native/tests/fixtures/NativeBridge.java')
-      capture('javac', '-d', directory, fixture).then { |_, error, status| expect(status.success?).to be(true), error }
+      capture('javac', '-d', directory, fixture, timeout: 60).then { |_, error, status| expect(status.success?).to be(true), error }
       profile = { host: 'localhost', port: server.port, username: 'android', password: 'process-test-password', ca_file: directory.join('ca.pem').to_s, device: SecureRandom.hex(16) }
       path = directory.join('profile.json'); private_json(path, profile)
       native = ENV.fetch('SKVOZ_ANDROID_NATIVE', ServerSystem::ROOT.join('target/release').to_s)
@@ -85,11 +85,13 @@ RSpec.describe 'Embedded Android JNI host on the Linux JVM', integration: true d
       stdout, stderr, status = capture('java', '-Xmx128m', "-Djava.library.path=#{native}", '-cp', directory, 'org.skvoz.android.NativeBridge', pending_path, 'cancel', path, timeout: 30)
       expect(status.success?).to be(true), stderr
       expect(stdout).to include('CANCELLED_RECONNECTED')
-      stdout, stderr, status = capture('java', '-Xmx128m', "-Djava.library.path=#{native}", '-cp', directory, 'org.skvoz.android.NativeBridge', path, 'closure', timeout: 40)
+      stdout, stderr, status = capture('java', '-Xmx128m', "-Djava.library.path=#{native}", '-cp', directory, 'org.skvoz.android.NativeBridge', path, 'closure', timeout: 70)
       expect(status.success?).to be(true), stderr
       expect(stdout).to include('CLOSED_RECOVERABLE_REPLACED_HANDLES0_DIAGNOSTICS_RESET_BOUNDED')
       warn stdout.strip
-      stdout, stderr, status = capture('java', '-Xmx128m', "-Djava.library.path=#{native}", '-cp', directory, 'org.skvoz.android.NativeBridge', path, 'cycles', timeout: 90)
+      # Fifty fresh incarnations may each wait for the prior device's 9s fence.
+      # The Java owner still checks READY, closure, handles and final FD count.
+      stdout, stderr, status = capture('java', '-Xmx128m', "-Djava.library.path=#{native}", '-cp', directory, 'org.skvoz.android.NativeBridge', path, 'cycles', timeout: 600)
       expect(status.success?).to be(true), stderr
       expect(stdout).to include('CYCLES50_HANDLES0_FD=')
       warn stdout.strip

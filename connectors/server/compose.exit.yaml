@@ -1,0 +1,9 @@
+services:
+  server:
+    environment:
+      SKVOZ_COMPONENTS: egress
+      SKVOZ_UPSTREAM: /run/skvoz/join.json
+      SKVOZ_ADDRESS: localhost
+    ports: !reset []
+    volumes:
+      - ./join:/run/skvoz:ro

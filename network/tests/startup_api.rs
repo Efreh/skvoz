@@ -8,8 +8,9 @@ fn shared_runtime_profiles_bound_aggregate_server_input_without_growing_queues()
     assert_eq!(runtime.max_incoming_per_turn, 32);
     assert_eq!(runtime.max_outgoing_per_turn, 32);
     client.role = Role::Server;
-    client.core.peer_id = "0".into();
-    client.core.membership = "broker_authorized".into();
+    client.core.peer_id = ((1u64 << 63) + 8).to_string();
+    client.core.membership = "allowlist".into();
+    client.routing.egress = true;
     client.core.allowed_peers.clear();
     client.core.initiate.clear();
     client.network.limits = Limits::canonical(Role::Server);
@@ -116,11 +117,11 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     let config = StartupConfig::parse_json(CLIENT).unwrap();
     assert_eq!(
         config.network.limits.transport_reservation(Role::Client),
-        13322464
+        13_322_400 + 8 * 2048 + 8 * 512
     );
     assert_eq!(
         Limits::canonical(Role::Server).transport_reservation(Role::Server),
-        82340624
+        82_332_432 + 128 * 2048 + 128 * 512
     );
     let value: Value = serde_json::from_slice(CLIENT).unwrap();
     for (parent, key) in [
@@ -139,7 +140,8 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     }
     let duplicate = String::from_utf8(CLIENT.to_vec())
         .unwrap()
-        .replace("\"v\": 1", "\"v\": 1, \"v\": 1");
+        .replace("\"v\": 2", "\"v\": 2, \"v\": 2");
+    assert_ne!(duplicate.as_bytes(), CLIENT);
     assert!(StartupConfig::parse_json(duplicate.as_bytes()).is_err());
     let mut bad = value.clone();
     bad["core"]["ipc_path"] = json!("unused.sock");
@@ -373,4 +375,32 @@ fn events_have_exact_typed_data_and_allow_independent_local_session_handle() {
     value["fd_count"] = json!(1);
     assert!(Event::parse_json(&serde_json::to_vec(&value).unwrap()).is_err());
     assert!(Event::parse_json(br#"{"v":1,"seq":1,"event":"ACTIVE","data":{"handle":"0123456789abcdef0123456789abcdef","handle":"0123456789abcdef0123456789abcdef"},"fd_count":0}"#).is_err());
+}
+
+#[test]
+fn current_status_requires_bounded_routing_and_strict_complete_counters() {
+    let value = json!({"lifecycle":"ready", "mode":"server", "session":null,
+        "routing":{"control_ready":true,"eligible_exits":2},
+        "counters":Counters::default()});
+    let status: RuntimeStatus = arguments(&value).unwrap();
+    status.validate().unwrap();
+    for field in ["routing", "session", "counters"] {
+        let mut bad = value.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        assert!(arguments::<RuntimeStatus>(&bad).is_err());
+    }
+    let mut bad = value.clone();
+    bad["routing"]["eligible_exits"] = json!(9);
+    assert!(
+        arguments::<RuntimeStatus>(&bad)
+            .unwrap()
+            .validate()
+            .is_err()
+    );
+    bad = value.clone();
+    bad["routing"]["legacy"] = json!(false);
+    assert!(arguments::<RuntimeStatus>(&bad).is_err());
+    bad = value;
+    bad["counters"].as_object_mut().unwrap().remove("tcp_open");
+    assert!(arguments::<RuntimeStatus>(&bad).is_err());
 }

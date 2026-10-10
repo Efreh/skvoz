@@ -22,7 +22,7 @@ fn main() {
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == ["--version"] {
-        println!("skvoz-network-helper 0.4.0 api=1 network=4");
+        println!("skvoz-network-helper 0.5.0 api=1 network=5");
         return Ok(());
     }
     if args == ["--help"] {
@@ -88,7 +88,7 @@ fn run() -> Result<()> {
         let fd = adopt_inherited(number)?;
         set_nonblocking(fd.as_fd())?;
         let channel = IncrementalUnix::from_owned_fd(fd)?;
-        let hello_deadline = Instant::now() + Duration::from_secs(5);
+        let hello_deadline = Instant::now() + control_loop::SERVER_STARTUP_WINDOW;
         let store = SecureStateDir::open(&config.state_dir)?;
         let mut service = Service::new(config, store, LinuxKernel::default())?;
         control_loop::serve(&mut service, channel, Role::Server, None, hello_deadline)

@@ -16,6 +16,31 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Root bootstrap may prepare BCrypt/TLS before the runtime owns this socket.
+// The issuer has at most600s, its supervisor30s and host preparation30s.
+pub const SERVER_STARTUP_WINDOW: Duration = Duration::from_secs(660);
+
+struct StartupGate {
+    absolute: Instant,
+    hello: Option<Instant>,
+}
+impl StartupGate {
+    fn new(role: Role, absolute: Instant) -> Self {
+        Self {
+            absolute,
+            hello: (role == Role::Client).then_some(absolute),
+        }
+    }
+    fn observe_input(&mut self, now: Instant, input: bool) {
+        if input && self.hello.is_none() {
+            self.hello = Some((now + Duration::from_secs(5)).min(self.absolute));
+        }
+    }
+    fn deadline(&self) -> Instant {
+        self.hello.unwrap_or(self.absolute)
+    }
+}
+
 /// Credentials on an inherited socketpair identify its root creator; they do
 /// not track later UID changes. A client connection instead identifies the
 /// actual app process and is reauthorized independently from JSON arguments.
@@ -24,18 +49,19 @@ pub fn serve<S: Store, K: Kernel>(
     mut channel: IncrementalUnix,
     role: Role,
     expected_uid: Option<u32>,
-    hello_deadline: Instant,
+    startup_deadline: Instant,
 ) -> Result<()> {
     let peer = channel.peer_credentials()?;
     if role == Role::Server && peer.uid != 0 || expected_uid.is_some_and(|uid| peer.uid != uid) {
         return Err(HelperError::Forbidden);
     }
     let mut hello = false;
+    let mut startup = StartupGate::new(role, startup_deadline);
     let mut stopping = false;
     let result = (|| {
         loop {
             let now = Instant::now();
-            if !hello && now >= hello_deadline {
+            if !hello && now >= startup.deadline() {
                 return Err(HelperError::InvalidState);
             }
             channel.check_deadlines()?;
@@ -56,6 +82,7 @@ pub fn serve<S: Store, K: Kernel>(
                     }
                     Err(e) => return Err(e.into()),
                 };
+                startup.observe_input(Instant::now(), frame.is_some() || channel.read_pending());
                 if let Some(frame) = frame {
                     if frame.fd.is_some() {
                         return Err(HelperError::InvalidRequest);
@@ -67,7 +94,7 @@ pub fn serve<S: Store, K: Kernel>(
                             return Err(HelperError::InvalidRequest);
                         }
                         if role == Role::Client {
-                            authorize(&peer, hello_deadline, channel.as_fd())?;
+                            authorize(&peer, startup.deadline(), channel.as_fd())?;
                         }
                     }
                     let reply = service.handle(&request, Some(channel.as_fd()));
@@ -100,14 +127,15 @@ pub fn serve<S: Store, K: Kernel>(
                     channel.queue_frame(body, fd)?;
                 }
             }
+            let owner_deadline = if hello {
+                now + Duration::from_millis(100)
+            } else {
+                startup.deadline()
+            };
             let deadline = channel
                 .next_deadline()
-                .unwrap_or(now + Duration::from_millis(100))
-                .min(if hello {
-                    now + Duration::from_millis(100)
-                } else {
-                    hello_deadline
-                });
+                .unwrap_or(owner_deadline)
+                .min(owner_deadline);
             match skvoz_network_native::wait_interest(
                 channel.as_fd(),
                 !channel.write_pending(),
@@ -187,4 +215,33 @@ fn process_subject(pid: i32, uid: u32) -> Result<String> {
         return Err(HelperError::Forbidden);
     }
     Ok(format!("{pid},{ticks},{uid}"))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_server_preparation_arms_hello_once_at_input_with_absolute_ceiling() {
+        let start = Instant::now();
+        let absolute = start + SERVER_STARTUP_WINDOW;
+        let mut gate = StartupGate::new(Role::Server, absolute);
+        gate.observe_input(start + Duration::from_secs(8), false);
+        assert_eq!(gate.deadline(), absolute);
+        gate.observe_input(start + Duration::from_secs(8), true);
+        assert_eq!(gate.deadline(), start + Duration::from_secs(13));
+        gate.observe_input(start + Duration::from_secs(12), true);
+        assert_eq!(gate.deadline(), start + Duration::from_secs(13));
+        let mut late = StartupGate::new(Role::Server, absolute);
+        late.observe_input(absolute - Duration::from_secs(1), true);
+        assert_eq!(late.deadline(), absolute);
+    }
+
+    #[test]
+    fn client_activation_never_extends_its_original_five_second_deadline() {
+        let start = Instant::now();
+        let mut gate = StartupGate::new(Role::Client, start + Duration::from_secs(5));
+        gate.observe_input(start + Duration::from_secs(4), true);
+        assert_eq!(gate.deadline(), start + Duration::from_secs(5));
+    }
 }

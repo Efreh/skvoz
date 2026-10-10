@@ -12,7 +12,7 @@ COPY daemon daemon
 COPY network network
 COPY connectors/tcp connectors/tcp
 COPY testbench testbench
-RUN cargo build --release --locked -p skvoz-daemon -p skvoz-network --features skvoz-network/linux-runtime -p skvoz-network-helper
+RUN CARGO_BUILD_JOBS=1 cargo build --release --locked -p skvoz-daemon -p skvoz-network --features skvoz-network/linux-runtime -p skvoz-network-helper
 
 FROM nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4 AS broker
 FROM ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199 AS acme-test
@@ -63,7 +63,6 @@ RUN ln -s /opt/skvoz/server/bin/skvoz-server /usr/local/bin/skvoz-server
 ENV BUNDLE_GEMFILE=/opt/skvoz/server/Gemfile SKVOZ_STATE_DIR=/var/lib/skvoz
 USER 0:0
 EXPOSE 4222 8080
-VOLUME ["/var/lib/skvoz", "/var/lib/skvoz-network"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 CMD ["skvoz-server", "health", "--state", "/var/lib/skvoz"]
 ENTRYPOINT ["skvoz-server"]
 CMD ["serve"]

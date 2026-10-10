@@ -6,6 +6,8 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+from network_topology import users as topology_users
+from fixture_resources import docker_limits
 
 
 def qualify(root, settings, certificates, mode='capacity'):
@@ -23,6 +25,8 @@ def qualify(root, settings, certificates, mode='capacity'):
             pub = ['tcp_capacity.join.*.0','tcp_capacity.lane.*.*.0.*.0.*'] if peer == 0 else [f'tcp_capacity.join.0.{peer}',f'tcp_capacity.lane.0.*.{peer%8}.*.{peer}.*']
             sub = ['tcp_capacity.join.0.*','tcp_capacity.lane.0.*.*.*.*.*'] if peer == 0 else [f'tcp_capacity.join.{peer}.*',f'tcp_capacity.lane.{peer}.*.*.*.*.*']
             users.append({'user':f'p{peer}', 'password':secrets.token_hex(24), 'permissions':{'publish':pub,'subscribe':sub}})
+        if not settings.tcp_capacity_baseline_binary:
+            users = topology_users('tcp_capacity', [user['password'] for user in users], secrets.token_hex(24))
         nats = {'port':4222, 'http_port':8222, 'max_payload':65588, 'max_pending':4194304,
             'tls':{'cert_file':'/work/server.pem','key_file':'/work/server.key','ca_file':'/work/ca.pem','handshake_first':False},
             'authorization':{'users':users}}
@@ -34,7 +38,8 @@ def qualify(root, settings, certificates, mode='capacity'):
             fixture = settings.tcp_capacity_baseline_profile
         assert fixture and fixture.is_file() and binary.is_file()
         args = ['docker','run','--rm','--name',name,'--pull=never','--network','none','--user',f'{os.getuid()}:{os.getgid()}',
-            '--cap-drop','ALL','--security-opt','no-new-privileges:true','--memory','1g','--cpus','2','--pids-limit','512','--ulimit','nofile=8192:8192',
+            '--cap-drop','ALL','--security-opt','no-new-privileges:true',
+            *docker_limits(root),
             '--mount',f'type=bind,src={directory.resolve()},dst=/work',
             '--mount',f'type=bind,src={binary.resolve()},dst=/runtime,readonly',
             '--mount',f'type=bind,src={root.resolve()}/testbench,dst=/tests,readonly',

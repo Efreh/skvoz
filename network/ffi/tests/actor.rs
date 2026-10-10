@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 const CONFIG: &[u8] = include_bytes!("../../tests/fixtures/client-startup.json");
 const HELLO: &[u8] =
-    b"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}";
+    b"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}";
 
 struct Owner(u64);
 impl Owner {
@@ -100,6 +100,7 @@ fn hello_remains_responsive_without_a_broker_and_small_buffer_retains_message() 
         if message.get("id").and_then(|id| id.as_u64()) == Some(1) {
             assert!(message["error"].is_null());
             assert_eq!(message["result"]["api"], 1);
+            assert_eq!(message["result"]["network"], 5);
             found = true;
             break;
         }

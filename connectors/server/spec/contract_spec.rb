@@ -95,16 +95,68 @@ RSpec.describe 'Server network and durable identity contract' do
       expect(next_id).to be > another
       candidate = state.candidate; candidate['tls'] = { 'certificate' => 'unused.pem', 'key' => 'unused.key' }; state.commit(candidate)
       profile = state.profile(Skvoz::Server::NetworkConfiguration.new(config))
-      expect(profile).to include('v' => 1, 'role' => 'server')
-      expect(profile.fetch('core')).to include('peer_id' => '0', 'membership' => 'broker_authorized', 'ca_file' => nil, 'tls_server_name' => 'example.org')
-      expect(state.nats_config).to include('skvoz.enroll.v2.')
-      expect(state.export('new', next_id, 'long enough password')).to include('v' => 2,
-        'network_runtime' => { 'network' => 4, 'api' => 1, 'version' => '0.4.2', 'core' => '4.0.1' })
+      expect(profile).to include('v' => 2, 'role' => 'server')
+      expect(profile.fetch('core')).to include('peer_id' => ((1 << 63) + 8).to_s, 'membership' => 'allowlist', 'ca_file' => nil, 'tls_server_name' => 'example.org')
+      expect(state.nats_config).to include('skvoz.enroll.v3.')
+      expect(state.export('new', next_id, 'long enough password')).to include('v' => 3,
+        'network_runtime' => { 'network' => 5, 'api' => 1, 'version' => '0.5.0', 'core' => '4.1.0' })
       state.close
       reopened = Skvoz::Server::State.new(config)
       expect(reopened.value['next_id']).to eq(5)
       expect(reopened.value['users']['new']['assigned']).to eq([next_id])
       reopened.close
+    end
+  end
+
+  it 'keeps control-only configuration independent of egress inventory and DATA credentials' do
+    Dir.mktmpdir do |root|
+      config = Skvoz::Server::Configuration.new(value.merge('components' => ['control'], 'state_dir' => File.join(root, 'entry')))
+      policy = Skvoz::Server::NetworkConfiguration.new(config)
+      expect(policy.network.fetch('families')).to eq([])
+      expect(policy.server).to be_nil
+      expect(Socket).not_to receive(:ip_address_list)
+      expect(policy.inventory!(config)).to eq(policy)
+      state = Skvoz::Server::State.new(config)
+      candidate = state.candidate
+      candidate['tls'] = { 'certificate' => 'certificate.pem', 'key' => 'key.pem' }
+      state.commit(candidate)
+      profile = state.profile(policy)
+      expect(profile.fetch('routing')).to include('egress' => false)
+      expect(profile.dig('routing', 'authority', 'registry', 'nodes')).to eq([])
+      expect(profile.dig('core', 'peer_id')).to eq('0')
+      users = JSON.parse(state.nats_config).dig('accounts', 'APP', 'users')
+      expect(users.length).to eq(1)
+      expect(users.first.fetch('permissions').values.flatten.grep(/\.lane\.|\.join\./)).to be_empty
+      state.close
+    end
+  end
+
+  it 'burns node IDs, retains identity during rotation and rejects another join over an existing egress state' do
+    Dir.mktmpdir do |root|
+      control = Skvoz::Server::Configuration.new(value.merge('components' => ['control'], 'state_dir' => File.join(root, 'entry')))
+      entry = Skvoz::Server::State.new(control)
+      candidate = entry.candidate
+      candidate['tls'] = { 'certificate' => 'certificate.pem', 'key' => 'key.pem' }
+      entry.commit(candidate)
+      candidate, first = entry.mutate_node('node-add'); entry.commit(candidate)
+      candidate, rotated = entry.mutate_node('node-rotate', first.fetch('identity')); entry.commit(candidate)
+      expect(rotated.values_at('identity', 'node_id')).to eq(first.values_at('identity', 'node_id'))
+      expect(rotated.fetch('password')).not_to eq(first.fetch('password'))
+      join = File.join(root, 'join.json')
+      File.write(join, JSON.generate(first)); File.chmod(0o600, join)
+      input = { 'components' => ['egress'], 'upstream' => join, 'state_dir' => File.join(root, 'exit'), 'network' => {} }
+      exit_config = Skvoz::Server::Configuration.new(input)
+      egress = Skvoz::Server::State.new(exit_config)
+      expect(egress.value).not_to have_key('users')
+      egress.close
+      File.write(join, JSON.generate(rotated)); File.chmod(0o600, join)
+      egress = Skvoz::Server::State.new(Skvoz::Server::Configuration.new(input)); egress.close
+      candidate, = entry.mutate_node('node-revoke', first.fetch('identity')); entry.commit(candidate)
+      candidate, second = entry.mutate_node('node-add'); entry.commit(candidate)
+      expect(second.fetch('node_id')).to be > first.fetch('node_id')
+      File.write(join, JSON.generate(second)); File.chmod(0o600, join)
+      expect { Skvoz::Server::State.new(Skvoz::Server::Configuration.new(input)) }.to raise_error(Skvoz::Server::Error, 'Join identity differs from persistent node state')
+      entry.close
     end
   end
 end

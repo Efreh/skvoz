@@ -8,6 +8,7 @@ pub mod enrollment;
 pub mod local_api;
 mod packet;
 pub mod policy;
+pub mod routing;
 pub use codec::*;
 pub use engine::*;
 pub use packet::*;

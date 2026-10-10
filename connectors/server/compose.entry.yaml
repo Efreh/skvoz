@@ -1,0 +1,14 @@
+services:
+  server:
+    environment:
+      SKVOZ_COMPONENTS: control
+    ports:
+      - "7422:7422"
+    volumes: !override
+      - state:/var/lib/skvoz
+    devices: !reset []
+    sysctls: !reset {}
+    cap_add: !override
+      - SETUID
+      - SETGID
+      - SETPCAP

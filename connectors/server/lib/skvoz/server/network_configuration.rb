@@ -22,6 +22,11 @@ module Skvoz
       attr_reader :network, :server
 
       def initialize(config)
+        unless config.egress?
+          @network = { 'families' => [], 'max_mtu' => 1500, 'channels' => 1, 'limits' => LIMITS }
+          @server = nil
+          return
+        end
         input = config['network']
         raise Error, 'Invalid network configuration' unless input.is_a?(Hash) && (input.keys - DEFAULTS.keys).empty?
         value = DEFAULTS.merge(input)
@@ -69,6 +74,7 @@ module Skvoz
       def ip? = !@network.fetch('families').empty?
 
       def inventory!(config)
+        return self unless config.egress?
         addresses = Socket.ip_address_list.filter_map do |entry|
           next unless entry.ipv4? || entry.ipv6?
           address = entry.ip_address.split('%', 2).first

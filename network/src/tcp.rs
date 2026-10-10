@@ -658,7 +658,7 @@ mod tests {
         assert!(
             connection
                 .event(Event::Rejected {
-                    reason: br#"{"v":4,"type":"tcp","error":"forbidden"}"#
+                    reason: br#"{"v":5,"type":"tcp","error":"forbidden"}"#
                         .to_vec()
                         .into_boxed_slice(),
                 })

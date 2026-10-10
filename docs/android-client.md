@@ -1,9 +1,15 @@
 # Клиент Android
 
-«Соединение SKVOZ» 1.3.0 — клиент Android API31+ с двумя режимами: **Прокси**
-и **ВПН**. APK включает Kotlin/Compose/Material3 и ту же Rust-библиотеку Core4.0.1
-с общим network runtime0.4.2. Application ID — `org.skvoz.android`;
+«Соединение SKVOZ» 2.0.0 — клиент Android API31+ с двумя режимами: **Прокси**
+и **ВПН**. APK включает Kotlin/Compose/Material3 и ту же Rust-библиотеку Core4.1.0
+с общим network runtime0.5.0. Application ID — `org.skvoz.android`;
 ABI — `arm64-v8a` и `x86_64`. Сервер остаётся общим для любых совместимых клиентов.
+
+Текущий профиль требует enrollment3, network5, route1 и локальный API1.
+В [схеме с отдельными выходами](server-connector.md#вход-и-отдельные-выходные-ноды)
+клиент подключается к входу; общий runtime назначает один выход для нового
+proxy-потока или VPN-сеанса. Отказ владельца завершает сеанс, открытый TCP/NAT
+не переносится.
 
 Исходники, crossbuild двух ABI и Linux JVM/JNI transport checks доступны.
 Работа `VpnService`, маршрутизация приложений, фон, Android Keystore и поведение
@@ -249,8 +255,8 @@ UID/GID10001, caps0 и no-new-privileges, как [сервер](server-connector
 ## Android Releases
 
 Собственный workflow проверяет pull requests без signing Secrets. Успешные
-main/master builds и точный tag `android-v1.3.0` публикуют официальный signed APK
-и SHA256SUMS; main/master получают `android-v1.3.0-build.<run_number>`. APK versionCode
+main/master builds и точный tag `android-v2.0.0` публикуют официальный signed APK
+и SHA256SUMS; main/master получают `android-v2.0.0-build.<run_number>`. APK versionCode
 равен1000000+номер выполнения Android workflow; повторное выполнение сохраняет
 тот же code. Не сбрасывайте workflow counter при выпуске обновлений.
 

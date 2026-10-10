@@ -5,11 +5,14 @@ require 'json'
 require 'uri'
 require_relative 'process'
 require_relative 'network_configuration'
+require_relative 'node_join'
 
 module Skvoz
   module Server
     class Configuration
-      DEFAULTS = { 'v' => 3, 'state_dir' => '/var/lib/skvoz', 'address' => nil, 'port' => 4222, 'advertised_port' => nil, 'bind' => '0.0.0.0',
+      DEFAULTS = { 'v' => 4, 'components' => %w[control egress].freeze, 'upstream' => nil,
+                   'leaf_port' => 7422, 'advertised_leaf_port' => nil, 'leaf_bind' => '0.0.0.0',
+                   'state_dir' => '/var/lib/skvoz', 'address' => nil, 'port' => 4222, 'advertised_port' => nil, 'bind' => '0.0.0.0',
                    'namespace' => 'skvoz.application', 'runtime_binary' => 'skvoz-network-runtime', 'helper_binary' => 'skvoz-network-helper', 'nats_binary' => 'nats-server',
                    'monitor_port' => 8222, 'admin_timeout' => 5, 'stop_timeout' => 8,
                    'max_identities' => 128, 'devices_per_user' => 8,
@@ -22,6 +25,18 @@ module Skvoz
       def initialize(value)
         raise Error, 'Invalid server configuration' unless value.is_a?(Hash) && (value.keys - DEFAULTS.keys).empty?
         @value = DEFAULTS.merge(value)
+        raise Error, 'Invalid server composition' unless [%w[control], %w[egress], %w[control egress]].include?(@value['components'])
+        if control?
+          raise Error, 'Upstream is only supported by an egress-only node' unless @value['upstream'].nil?
+        else
+          path = @value['upstream']
+          raise Error, 'Egress node requires a private join file' unless path.is_a?(String) && path.start_with?('/') && !path.include?("\0")
+          @join = NodeJoin.read(path)
+          @value['namespace'] = @join.value['namespace']
+          @value['address'] ||= 'localhost'
+          @value['bind'] = '127.0.0.1' unless value.key?('bind')
+          @value['tls'] = { 'mode' => 'local' }
+        end
         %w[state_dir runtime_binary helper_binary nats_binary namespace bind].each do |key|
           item = @value[key]
           raise Error, 'Invalid server configuration string' unless item.is_a?(String) && item.bytesize.between?(1, 4096) && !item.include?("\0")
@@ -35,7 +50,7 @@ module Skvoz
         rescue IPAddr::InvalidAddressError
           raise Error, 'Invalid server address' if address.match?(/\A[\d.]+\z/) || !address.split('.').all? { |label| label.match?(/\A[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\z/) }
         end
-        raise Error, 'Unsupported server configuration version' unless @value['v'].is_a?(Integer) && @value['v'] == 3
+        raise Error, 'Unsupported server configuration version' unless @value['v'].is_a?(Integer) && @value['v'] == 4
         bind = IPAddr.new(@value['bind'])
         raise Error, 'Bind must accept the internal IPv4 loopback dial' unless bind.ipv4? && (bind.to_i.zero? || bind.to_s == '127.0.0.1')
         { 'port' => 1..65_535, 'advertised_port' => 1..65_535, 'monitor_port' => 1..65_535, 'max_identities' => 1..128,
@@ -44,15 +59,21 @@ module Skvoz
         end
         raise Error, 'Identity allocation exceeds configured budget' if @value['devices_per_user'] > @value['max_identities']
         raise Error, 'Port settings conflict' if @value['port'] == @value['monitor_port']
+        @value['advertised_leaf_port'] ||= @value['leaf_port']
+        raise Error, 'Invalid leaf endpoint' unless %w[leaf_port advertised_leaf_port].all? { |key| @value[key].is_a?(Integer) && (1..65535).cover?(@value[key]) } && ![@value['port'], @value['monitor_port']].include?(@value['leaf_port'])
+        raise Error, 'Invalid leaf bind' unless @value['leaf_bind'].is_a?(String) && IPAddr.new(@value['leaf_bind']).ipv4?
         raise Error, 'Invalid namespace' unless @value['namespace'].match?(/\A[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*\z/) && @value['namespace'].bytesize <= 256
         raise Error, 'Invalid policy configuration' unless @value['allow'].is_a?(Array) && @value['deny'].is_a?(Array) && @value['allow'].length + @value['deny'].length <= 128
-        NetworkConfiguration.new(self)
+        NetworkConfiguration.new(self) if egress?
         validate_tls
       rescue IPAddr::InvalidAddressError, KeyError, TypeError, URI::InvalidURIError
         raise Error, 'Invalid server configuration'
       end
 
       def [](key) = @value.fetch(key)
+      def control? = @value['components'].include?('control')
+      def egress? = @value['components'].include?('egress')
+      def join = @join
 
       def tls
         { 'mode' => 'acme', 'directory' => 'https://acme-v02.api.letsencrypt.org/directory', 'challenge_host' => '0.0.0.0',
@@ -66,6 +87,7 @@ module Skvoz
         keys = %w[mode directory challenge_host challenge_port challenge_public_port renewal_interval order_timeout email terms_agreed issuer_ca certificate_ca certificate key ca]
         raise Error, 'Invalid TLS configuration' unless options.is_a?(Hash) && (options.keys - keys).empty?
         mode = options.fetch('mode', 'acme')
+        return if mode == 'local' && !control?
         raise Error, 'Unsupported TLS mode' unless %w[acme provided].include?(mode)
         %w[issuer_ca certificate_ca certificate key ca].each do |key|
           next unless options.key?(key)
@@ -95,6 +117,9 @@ module Skvoz
     class State
       LOGIN = /\A[a-zA-Z0-9_-]{1,64}\z/
       INTERNAL = '__skvoz_server'
+      EGRESS = '__skvoz_egress'
+      NODE_BASE = 1 << 63
+      VERSIONS = NodeJoin::VERSIONS
       attr_reader :directory, :value, :revision
 
       def initialize(config)
@@ -104,18 +129,33 @@ module Skvoz
         raise Error, 'Server state is already in use' unless @lock.flock(File::LOCK_EX | File::LOCK_NB)
         @path = File.join(@directory, 'state.json')
         if File.exist?(@path)
-          @value = JSON.parse(PrivateFiles.read(@path, maximum: 1_048_576))
-          raise Error, 'Unsupported persistent state' unless @value['v'] == 1 && @value['namespace'] == config['namespace']
+          @value = JSON.parse(PrivateFiles.read(@path, maximum: 1_048_576), allow_duplicate_key: false)
+          raise Error, 'Unsupported persistent state' unless @value['v'] == 2 && @value['namespace'] == config['namespace'] && @value['components'] == config['components']
+          if config.join && (@value['node_id'] != config.join.value['node_id'] || @value['node_identity'] != config.join.value['identity'])
+            raise Error, 'Join identity differs from persistent node state'
+          end
         else
           password = SecureRandom.urlsafe_base64(32)
-          @value = { 'v' => 1, 'revision' => 0, 'next_id' => 1, 'namespace' => config['namespace'],
-                     'internal_password' => password, 'internal_hash' => BCrypt::Password.create(password, cost: 12).to_s,
-                     'users' => {}, 'tls' => nil }
+          @value = { 'v' => 2, 'revision' => 1, 'next_id' => 1, 'next_node' => 1, 'namespace' => config['namespace'],
+                     'components' => config['components'], 'internal_password' => password, 'internal_hash' => BCrypt::Password.create(password, cost: 12).to_s,
+                     'tls' => nil, 'nodes' => {}, 'revoked_nodes' => [] }
+          @value['users'] = {} if config.control?
+          if config.egress?
+            credential = SecureRandom.urlsafe_base64(32)
+            @value['egress_password'], @value['egress_hash'] = credential, BCrypt::Password.create(credential, cost: 12).to_s
+            @value['node_id'] = config.join ? config.join.value['node_id'] : NODE_BASE + 8
+            @value['node_identity'] = config.join ? config.join.value['identity'] : SecureRandom.hex(16)
+            @value['next_node'] = 2 unless config.join
+          end
           commit(@value)
         end
         @revision = @value.fetch('revision')
       rescue JSON::ParserError, KeyError
+        @lock&.close
         raise Error, 'Persistent state invalid'
+      rescue Error, SystemCallError
+        @lock&.close
+        raise
       end
 
       def close = @lock.close
@@ -131,7 +171,8 @@ module Skvoz
       end
 
       def mutate(operation, login, password: nil)
-        raise Error, 'Invalid login' unless login.is_a?(String) && login.match?(LOGIN) && login != INTERNAL
+        raise Error, 'Client administration requires control component' unless @config.control?
+        raise Error, 'Invalid login' unless login.is_a?(String) && login.match?(LOGIN) && !login.start_with?('__skvoz_')
         current = candidate
         users = current.fetch('users')
         exported_id = nil
@@ -142,7 +183,7 @@ module Skvoz
           count = @config['devices_per_user']
           raise Error, 'Identity pool admission exceeded' if active + count > @config['max_identities']
           start = current.fetch('next_id')
-          raise Error, 'Identity allocator exhausted' if start + count >= 1 << 64
+          raise Error, 'Identity allocator exhausted' if start + count >= 1 << 63
           ids = (start...(start + count)).to_a
           current['next_id'] += count
           exported_id = ids.first
@@ -165,60 +206,117 @@ module Skvoz
         [current, exported_id]
       end
 
+      def node_permissions(id)
+        namespace = @config['namespace']
+        { 'publish' => ["#{namespace}.join.*.#{id}", "#{namespace}.lane.*.*.0.*.#{id}.*", "#{namespace}.route.node.#{id}"],
+          'subscribe' => ["#{namespace}.join.#{id}.*", "#{namespace}.lane.#{id}.*.*.*.*.*", "#{namespace}.route.command.#{id}", "#{namespace}.route.reply.node.#{id}"] }
+      end
+
+      def registry(state = @value)
+        { 'revision' => state.fetch('revision'), 'devices' => state.fetch('users', {}).values.flat_map { |user| user.fetch('assigned') }.sort,
+          'nodes' => (state.fetch('nodes').values.map { |node| node.fetch('node_id') } + (@config.egress? && @config.control? ? [state.fetch('node_id')] : [])).sort }
+      end
+
       def nats_config(state = @value, tls: state.fetch('tls'))
         raise Error, 'TLS material missing' unless tls
         namespace = @config['namespace']
-        server_permissions = { 'publish' => ["#{namespace}.join.*.0", "#{namespace}.lane.*.*.0.*.0.*"],
-                               'subscribe' => ["#{namespace}.join.0.*", "#{namespace}.lane.0.*.*.*.*.*", 'skvoz.enroll.v2.*'] }
-        server_permissions['publish'] << 'skvoz.enroll.reply.*.*'
-        users = [{ 'user' => INTERNAL, 'password' => state.fetch('internal_hash'), 'permissions' => server_permissions }]
-        state.fetch('users').each do |login, user|
-          publish, subscribe = ["skvoz.enroll.v2.#{login}"], ["skvoz.enroll.reply.#{login}.*"]
-          user.fetch('assigned').each do |id|
-            publish.concat(["#{namespace}.join.0.#{id}", "#{namespace}.lane.0.*.#{id % 8}.*.#{id}.*"])
-            subscribe.concat(["#{namespace}.join.#{id}.*", "#{namespace}.lane.#{id}.*.*.*.*.*"])
+        internal = { 'publish' => ["#{namespace}.route.command.*", "#{namespace}.route.reply.client.*", "#{namespace}.route.reply.node.*", 'skvoz.enroll.reply.*.*'],
+                     'subscribe' => ["#{namespace}.route.client.*", "#{namespace}.route.node.*", 'skvoz.enroll.v3.*'] }
+        users = []
+        if @config.control?
+          users << { 'user' => INTERNAL, 'password' => state.fetch('internal_hash'), 'permissions' => internal, 'allowed_connection_types' => ['STANDARD'] }
+          state.fetch('nodes').each do |identity, node|
+            users << { 'user' => "__skvoz_node_#{identity}", 'password' => node.fetch('hash'), 'permissions' => node_permissions(node.fetch('node_id')), 'allowed_connection_types' => ['LEAFNODE'] }
           end
-          users << { 'user' => login, 'password' => user.fetch('hash'), 'permissions' => { 'publish' => publish, 'subscribe' => subscribe } }
+          destinations = registry(state).fetch('nodes')
+          state.fetch('users').each do |login, user|
+            publish, subscribe = ["skvoz.enroll.v3.#{login}"], ["skvoz.enroll.reply.#{login}.*"]
+            user.fetch('assigned').each do |id|
+              publish << "#{namespace}.route.client.#{id}"
+              subscribe << "#{namespace}.route.reply.client.#{id}"
+              destinations.each { |node| publish.concat(["#{namespace}.join.#{node}.#{id}", "#{namespace}.lane.#{node}.*.#{id % 8}.*.#{id}.*"]) }
+              subscribe.concat(["#{namespace}.join.#{id}.*", "#{namespace}.lane.#{id}.*.*.*.*.*"])
+            end
+            users << { 'user' => login, 'password' => user.fetch('hash'), 'permissions' => { 'publish' => publish, 'subscribe' => subscribe }, 'allowed_connection_types' => ['STANDARD'] }
+          end
+        else
+          # Loopback lifecycle probes have no application subject permissions.
+          users << { 'user' => INTERNAL, 'password' => state.fetch('internal_hash'), 'permissions' => { 'publish' => [], 'subscribe' => [] }, 'allowed_connection_types' => ['STANDARD'] }
         end
-        <<~CONF
-          server_name: "skvoz-server"
-          listen: #{JSON.generate(@config['bind'] + ':' + @config['port'].to_s)}
-          http: #{JSON.generate('127.0.0.1:' + @config['monitor_port'].to_s)}
-          max_payload: 65588
-          max_pending: 4MB
-          max_connections: #{@config['max_identities'] * 10 + 16}
-          write_deadline: "2s"
-          tls {
-            cert_file: #{JSON.generate(tls.fetch('certificate'))}
-            key_file: #{JSON.generate(tls.fetch('key'))}
-            handshake_first: false
-          }
-          authorization { users: #{JSON.generate(users)} }
-        CONF
+        users << { 'user' => EGRESS, 'password' => state.fetch('egress_hash'), 'permissions' => node_permissions(state.fetch('node_id')), 'allowed_connection_types' => ['STANDARD'] } if @config.egress?
+        value = { 'server_name' => "skvoz-#{state['node_identity'] || 'entry'}", 'listen' => "#{@config['bind']}:#{@config['port']}",
+          'http' => "127.0.0.1:#{@config['monitor_port']}", 'max_payload' => 65588, 'max_pending' => 4_194_304,
+          'max_connections' => @config['max_identities'] * 10 + 32, 'write_deadline' => '2s',
+          'tls' => { 'cert_file' => tls.fetch('certificate'), 'key_file' => tls.fetch('key'), 'handshake_first' => false },
+          'accounts' => { 'APP' => { 'users' => users } } }
+        value['leafnodes'] = if @config.control?
+          { 'host' => @config['leaf_bind'], 'port' => @config['leaf_port'], 'tls' => { 'cert_file' => tls.fetch('certificate'), 'key_file' => tls.fetch('key'), 'handshake_first' => true }, 'compression' => 'off' }
+        else
+          { 'compression' => 'off', 'remotes' => [@config.join.remote(ca_path: File.join(@directory, 'upstream-ca.pem'))] }
+        end
+        JSON.generate(value)
+      end
+
+      def core_credentials(username, password, id)
+        tls = @value.fetch('tls')
+        { 'url' => "tls://127.0.0.1:#{@config['port']}", 'tls_server_name' => @config['address'],
+          'trust' => tls['ca'] ? 'managed_ca' : 'system', 'ca_file' => tls['ca'], 'username' => username, 'password' => password,
+          'namespace' => @config['namespace'], 'peer_id' => id.to_s, 'membership' => 'allowlist', 'allowed_peers' => [], 'initiate' => [] }
       end
 
       def profile(policy)
-        tls = @value.fetch('tls')
-        identity = @config['address']
-        url = "tls://127.0.0.1:#{@config['port']}"
-        { 'v' => 1, 'role' => 'server', 'network' => policy.network, 'server' => policy.server,
-          'core' => { 'url' => url, 'tls_server_name' => identity,
-            'trust' => tls['ca'] ? 'managed_ca' : 'system', 'ca_file' => tls['ca'],
-            'username' => INTERNAL, 'password' => @value.fetch('internal_password'),
-            'namespace' => @config['namespace'], 'peer_id' => '0', 'membership' => 'broker_authorized',
-            'allowed_peers' => [], 'initiate' => [] } }
+        control = core_credentials(INTERNAL, @value.fetch('internal_password'), 0)
+        { 'v' => 2, 'role' => 'server', 'network' => policy.network, 'server' => policy.server,
+          'core' => @config.egress? ? core_credentials(EGRESS, @value.fetch('egress_password'), @value.fetch('node_id')) : control,
+          'routing' => { 'egress' => @config.egress?, 'authority' => @config.control? ? { 'core' => control, 'registry' => registry } : nil } }
       end
 
       def export(login, id, password)
-        { 'v' => 2, 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login,
-          'password' => password, 'namespace' => @config['namespace'], 'peer_id' => id,
-          'network_runtime' => { 'network' => 4, 'api' => 1, 'version' => '0.4.2', 'core' => '4.0.1' },
-          'allowed_peers' => [0], 'initiate' => [0], 'shards' => 8,
-          'trust' => @value.fetch('tls')['ca'] ? 'managed_ca' : 'system' }
+        { 'v' => 3, 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login,
+          'password' => password, 'namespace' => @config['namespace'], 'peer_id' => id, 'network_runtime' => VERSIONS,
+          'allowed_peers' => [], 'initiate' => [], 'shards' => 8, 'trust' => @value.fetch('tls')['ca'] ? 'managed_ca' : 'system' }
+      end
+
+      def mutate_node(operation, identity = nil)
+        raise Error, 'Node administration requires control component' unless @config.control?
+        current = candidate
+        nodes = current.fetch('nodes')
+        password = SecureRandom.urlsafe_base64(32)
+        if operation == 'node-add'
+          raise Error, 'Node pool admission exceeded' if nodes.length + (@config.egress? ? 1 : 0) >= 8
+          identity = SecureRandom.hex(16)
+          ordinal = current.fetch('next_node')
+          raise Error, 'Node allocator exhausted' if ordinal >= (1 << 60)
+          current['next_node'] += 1
+          nodes[identity] = { 'node_id' => NODE_BASE + 8 * ordinal, 'hash' => BCrypt::Password.create(password, cost: 12).to_s }
+        else
+          raise Error, 'Invalid node identity' unless identity.is_a?(String) && identity.match?(/\A[0-9a-f]{32}\z/)
+          node = nodes.fetch(identity) { raise Error, 'Node does not exist' }
+          if operation == 'node-rotate'
+            node['hash'] = BCrypt::Password.create(password, cost: 12).to_s
+          elsif operation == 'node-revoke'
+            nodes.delete(identity)
+            current['revoked_nodes'] << { 'identity' => identity, 'node_id' => node.fetch('node_id') }
+            current['revoked_nodes'].shift while current['revoked_nodes'].length > 32
+          else
+            raise Error, 'Unsupported node operation'
+          end
+        end
+        current['revision'] += 1
+        result = if operation == 'node-revoke'
+          { 'revoked' => identity }
+        else
+          tls = current.fetch('tls')
+          { 'v' => 1, 'identity' => identity, 'node_id' => nodes.fetch(identity).fetch('node_id'), 'username' => "__skvoz_node_#{identity}",
+            'password' => password, 'namespace' => @config['namespace'], 'address' => @config['address'], 'port' => @config['advertised_leaf_port'],
+            'trust' => tls['ca'] ? 'managed_ca' : 'system', 'ca_pem' => tls['ca'] ? PrivateFiles.read(tls['ca']) : nil, 'network_runtime' => VERSIONS }
+        end
+        [current, result]
       end
 
       # The caller derives login from the broker-authorized request subject.
       def enroll(login, token)
+        raise Error, 'Enrollment requires control component' unless @config.control?
         raise Error, 'Invalid device token' unless token.is_a?(String) && token.match?(/\A[0-9a-f]{32}\z/)
         current = candidate
         user = current.fetch('users').fetch(login) { raise Error, 'Login does not exist' }

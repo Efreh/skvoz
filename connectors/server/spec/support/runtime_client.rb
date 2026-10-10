@@ -8,28 +8,31 @@ module ServerSystem
     attr_reader :socket
     def initialize(socket)
       @socket, @id, @events = socket, 0, []
-      @mutex = Mutex.new
+      @mutex, @calls, @condition = Mutex.new, Mutex.new, ConditionVariable.new
+      @pending, @response, @failure = nil, nil, nil
+      @reader = Thread.new { receive }
     end
 
     def request(op, args = {})
-      @mutex.synchronize do
+      @calls.synchronize do
         Timeout.timeout(15) do
-          id = (@id += 1)
+          id = @mutex.synchronize do
+            raise @failure if @failure
+            @pending = (@id += 1)
+          end
           bytes = JSON.generate(v: 1, id:, op:, args:, fd_count: 0)
           @socket.write([bytes.bytesize].pack('N') + bytes)
-          loop do
-            value, descriptors = read
-            if value.key?('event')
-              raise IOError, 'Unexpected event descriptors' unless descriptors.empty?
-              raise IOError, 'Runtime event queue exceeded' if @events.size >= 128
-              @events << value
-              next
-            end
-            raise IOError, 'Unexpected response ID' unless value['id'] == id
-            return [value, descriptors]
+          @mutex.synchronize do
+            @condition.wait(@mutex) until @response || @failure
+            raise @failure unless @response
+            response, @response, @pending = @response, nil, nil
+            response
           end
         end
       end
+    rescue Timeout::Error
+      close
+      raise
     end
 
     def open(host, port)
@@ -44,14 +47,53 @@ module ServerSystem
 
     def close
       @socket.close unless @socket.closed?
+      @reader.join(1) unless @reader == Thread.current
+      @mutex.synchronize do
+        @response&.last&.each(&:close)
+        @response = nil
+      end
     end
 
     private
 
+    def receive_event(value)
+      return if value['event'] == 'STATS'
+      # This adapter has consumed the event; retain only recent diagnostics.
+      # Specialized fixtures can observe every event through this hook.
+      @events.shift if @events.size == 128
+      @events << value
+    end
+
+    def receive
+      descriptors = []
+      loop do
+        value, descriptors = read
+        @mutex.synchronize do
+          if value.key?('event')
+            raise IOError, 'Unexpected event descriptors' unless descriptors.empty?
+            receive_event(value)
+          else
+            raise IOError, 'Unexpected response ID' unless value['id'] == @pending && @response.nil?
+            @response = [value, descriptors]
+            descriptors = []
+          end
+          @condition.broadcast
+        end
+      end
+    rescue StandardError => error
+      descriptors&.each(&:close)
+      @mutex.synchronize do
+        @failure = error
+        @condition.broadcast
+      end
+    end
+
     def exact(size, descriptors)
       bytes = ''.b
       while bytes.bytesize < size
-        data, _, flags, *controls = @socket.recvmsg(size - bytes.bytesize, 0, 256, scm_rights: true)
+        message = @socket.recvmsg(size - bytes.bytesize, 0, 256, scm_rights: true)
+        raise IOError, 'Runtime control EOF' if message.nil?
+        data, _, flags, *controls = message
         controls.each { |control| descriptors.concat(control.unix_rights || []) }
         raise IOError, 'Runtime control truncated' unless flags & Socket::MSG_CTRUNC == 0
         raise IOError, 'Runtime control EOF' if data.empty?

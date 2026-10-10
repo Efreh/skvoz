@@ -17,8 +17,8 @@ RSpec.describe 'Authenticated device enrollment', integration: true do
         raise IOError, 'Enrollment permission rejected' if !line || line.start_with?('-ERR')
         break if line == "PONG\r\n"
       end
-      payload ||= JSON.generate(v: 2, device: token)
-      tls.write("PUB skvoz.enroll.v2.#{request_login} #{reply_target || reply} #{payload.bytesize}\r\n#{payload}\r\nPING\r\n")
+      payload ||= JSON.generate(v: 3, device: token)
+      tls.write("PUB skvoz.enroll.v3.#{request_login} #{reply_target || reply} #{payload.bytesize}\r\n#{payload}\r\nPING\r\n")
       loop do
         line = tls.gets("\r\n", 4096)
         raise IOError, 'Enrollment permission rejected' if !line || line.start_with?('-ERR')
@@ -66,7 +66,7 @@ RSpec.describe 'Authenticated device enrollment', integration: true do
     expect { enrollment(@server, 'shared', 'process-test-password', 'a' * 32, request_login: 'other') }.to raise_error(IOError)
     expect { enrollment(@server, 'shared', 'process-test-password', 'a' * 32, reply_login: 'other') }.to raise_error(IOError)
     expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":2,"device":"bad","login":"other"}')).to include('error' => 'enrollment_failed')
-    expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":2,"v":2,"device":"' + 'a' * 32 + '"}')).to include('error' => 'enrollment_failed')
+    expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: '{"v":3,"v":3,"device":"' + 'a' * 32 + '"}')).to include('error' => 'enrollment_failed')
     expect(enrollment(@server, 'shared', 'process-test-password', 'a' * 32, payload: 'x' * 65_000)).to include('error' => 'invalid_request')
     %w[a b c].each { |letter| expect(enrollment(@server, 'shared', 'process-test-password', letter * 32)).to have_key('peer_id') }
     expect(enrollment(@server, 'shared', 'process-test-password', 'd' * 32)).to include('error' => 'device_limit')

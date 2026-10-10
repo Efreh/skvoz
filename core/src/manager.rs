@@ -348,6 +348,104 @@ mod credit_integration_tests {
         assert!(b.receive_promises.bytes <= b.config.receive_budget as u64);
     }
     #[test]
+    fn transport_credit_keeps_open_order_without_blocking_smaller_live_frames() {
+        let mut config = profile(false);
+        config.max_peers = 2;
+        let mut sender = Manager::new(config).unwrap();
+        let mut receiver = Manager::new(profile(true)).unwrap();
+        sender.register_peer(PeerId(1), false).unwrap();
+        receiver.register_peer(PeerId(1), true).unwrap();
+        let live = established(&mut sender, &mut receiver);
+        let keys: Vec<_> = [400, 1, 100]
+            .into_iter()
+            .map(|size| sender.open(PeerId(1), &vec![7; size], 0).unwrap())
+            .collect();
+        let cancelled = sender.open(PeerId(1), b"cancel", 0).unwrap();
+        sender.close(cancelled, CloseReason::Cancelled).unwrap();
+        sender.register_peer(PeerId(2), false).unwrap();
+        let other = sender.open(PeerId(2), b"other", 0).unwrap();
+        sender.close(other, CloseReason::Cancelled).unwrap();
+        assert_eq!(
+            sender.send(live, b"tail").unwrap(),
+            SendOutcome::Accepted(4)
+        );
+        sender.finish(live).unwrap();
+
+        let mut attempts = 0;
+        let mut emitted = Vec::new();
+        for _ in 0..4 {
+            emitted.extend(sender.poll_frames_with_budget(256, |_, size, _| {
+                attempts += 1;
+                size <= 64
+            }));
+        }
+        assert!(attempts <= 4 * (256 + 6 + 2));
+        assert!(
+            !emitted
+                .iter()
+                .any(|f| matches!(f.frame, Frame::Open { .. }))
+        );
+        for key in [cancelled, other] {
+            assert!(
+                emitted
+                    .iter()
+                    .any(|f| f.key == key && matches!(f.frame, Frame::Close { .. }))
+            );
+        }
+        assert!(
+            emitted
+                .iter()
+                .any(|f| f.key.peer == PeerId(2) && matches!(f.frame, Frame::PeerGrant { .. }))
+        );
+        assert!(emitted.iter().any(|f| f.key == live
+            && matches!(&f.frame, Frame::Data { bytes, .. } if &**bytes == b"tail")));
+        assert!(
+            emitted
+                .iter()
+                .any(|f| f.key == live && matches!(f.frame, Frame::Fin { final_offset: 4 }))
+        );
+        // A smaller, barred OPEN must not keep a recipient grant open when
+        // its remainder cannot carry the oldest eligible OPEN.
+        assert_eq!(
+            sender.next_transport_weight(PeerId(1), 24),
+            Some(24 + 28 + 400)
+        );
+        for frame in emitted.iter().filter(|f| f.key.peer == PeerId(1)) {
+            receiver.receive(frame.key, &frame.frame, 0).unwrap();
+        }
+        let mut published = Vec::new();
+        for _ in 0..3 {
+            let frames = sender.poll_frames_with_budget(1, |_, _, _| true);
+            assert_eq!(frames.len(), 1);
+            assert!(matches!(frames[0].frame, Frame::Open { .. }));
+            published.push(frames[0].key);
+            receiver
+                .receive(frames[0].key, &frames[0].frame, 0)
+                .unwrap();
+        }
+        assert_eq!(published, keys);
+        let incoming: Vec<_> = receiver
+            .poll_events(256)
+            .into_iter()
+            .filter(|event| matches!(event.event, Event::IncomingOpen { .. }))
+            .map(|event| event.key)
+            .collect();
+        assert_eq!(incoming, keys);
+        for key in &incoming {
+            receiver.accept(*key, b"").unwrap();
+        }
+        forward(&mut receiver, &mut sender, 0);
+        assert_eq!(
+            sender
+                .poll_events(256)
+                .into_iter()
+                .filter(|event| matches!(event.event, Event::Opened { .. }))
+                .count(),
+            keys.len()
+        );
+    }
+
+    #[test]
     fn delivery_frame_gate_preserves_pending_data_other_peer_cancel_and_freeze_order() {
         let mut sender = Manager::new(profile(true)).unwrap();
         let mut keys = Vec::new();
@@ -439,6 +537,28 @@ mod credit_integration_tests {
             }
         ));
         assert_eq!(sender.resources().pending_send_bytes, 0);
+    }
+    #[test]
+    fn framed_demand_survives_data_scheduling_yields_without_a_rejection() {
+        let (mut sender, mut recipient) = pair();
+        let key = established(&mut sender, &mut recipient);
+        sender.poll_frames(256);
+        for _ in 0..3 {
+            assert_eq!(
+                sender.send(key, &[1; 16384]).unwrap(),
+                SendOutcome::Accepted(16384)
+            );
+        }
+        let before = sender.transport_demand(key.peer, 540, 3 << 20);
+        let first = sender.poll_frames(1).pop().unwrap();
+        assert!(matches!(first.frame, Frame::Data { .. }));
+        assert!(sender.peers[&key.peer].reject_next);
+        assert!(sender.peers[&key.peer].rejection.is_none());
+        assert!(sender.next_transport_weight(key.peer, 540).is_some());
+        let after = sender.transport_demand(key.peer, 540, 3 << 20);
+        assert!(after > 0 && after < before);
+        let next = sender.poll_frames(1).pop().unwrap();
+        assert!(matches!(next.frame, Frame::Data { .. }));
     }
     #[test]
     fn requester_remote_fin_clears_pressure_without_retiring_unread_neighbor() {
@@ -2762,6 +2882,100 @@ impl Manager {
     pub fn poll_frames(&mut self, max: usize) -> Vec<RoutedFrame> {
         self.poll_frames_with_budget(max, |_, _, _| true)
     }
+    /// Framed demand already retained in ready output. Does not extract,
+    /// clone payloads, dispatch credit or alter stream/peer rotation.
+    pub fn transport_demand(&self, peer: PeerId, overhead: usize, maximum: usize) -> usize {
+        let Some(p) = self.peers.get(&peer) else {
+            return 0;
+        };
+        let weight = |id, frame: &Frame| {
+            crate::wire::encoded_size(id, frame)
+                .unwrap_or(maximum)
+                .saturating_add(overhead)
+        };
+        let mut bytes = 0usize;
+        for frame in &p.controls {
+            bytes = bytes.saturating_add(weight(0, frame));
+            if bytes >= maximum {
+                return maximum;
+            }
+        }
+        if let Some(frame) = p.tx.peek_frozen_frame() {
+            bytes = bytes.saturating_add(weight(0, &frame));
+        }
+        if let Some(frame) = &p.rejection {
+            bytes = bytes.saturating_add(weight(frame.key.stream_id, &frame.frame));
+        }
+        for &id in &p.output {
+            if bytes >= maximum {
+                break;
+            }
+            if let Some(entry) = self.streams.get(&StreamKey {
+                peer,
+                stream_id: id,
+            }) {
+                bytes = bytes.saturating_add(entry.stream.transport_demand(
+                    id,
+                    overhead,
+                    maximum - bytes,
+                ));
+            }
+        }
+        bytes.min(maximum)
+    }
+    pub fn next_transport_weight(&self, peer: PeerId, overhead: usize) -> Option<usize> {
+        let p = self.peers.get(&peer)?;
+        let weight = |id, frame: &Frame| {
+            crate::wire::encoded_size(id, frame)
+                .ok()?
+                .checked_add(overhead)
+        };
+        if let Some(frame) = p.controls.front() {
+            return weight(0, frame);
+        }
+        if let Some(frame) = p.tx.peek_frozen_frame() {
+            return weight(0, &frame);
+        }
+        let rejected = p
+            .rejection
+            .as_ref()
+            .and_then(|frame| weight(frame.key.stream_id, &frame.frame));
+        if p.rejection.is_some() && (p.output.is_empty() || p.reject_next) {
+            return rejected;
+        }
+        p.output
+            .iter()
+            .filter_map(|&id| {
+                let key = StreamKey {
+                    peer,
+                    stream_id: id,
+                };
+                if self.open_output_blocked(key) {
+                    return None;
+                }
+                let entry = self.streams.get(&key)?;
+                let (size, _) = entry.stream.next_frame_size_for(id)?;
+                size.checked_add(overhead)
+            })
+            .chain(rejected)
+            .min()
+    }
+    fn open_output_blocked(&self, key: StreamKey) -> bool {
+        self.streams
+            .get(&key)
+            .is_some_and(|entry| entry.stream.has_pending_open())
+            && self.peers[&key.peer]
+                .output_set
+                .range(..key.stream_id)
+                .any(|&id| {
+                    self.streams
+                        .get(&StreamKey {
+                            peer: key.peer,
+                            stream_id: id,
+                        })
+                        .is_some_and(|entry| entry.stream.has_pending_open())
+                })
+    }
     /// Admit an encoded Core frame before extraction. Denied work stays owned
     /// by Core; ready peers/streams rotate within a finite scan, never idle slots.
     /// The callback accounts cumulative admissions within this batch.
@@ -2803,12 +3017,15 @@ impl Manager {
                     self.streams
                         .get(&key)?
                         .stream
-                        .next_frame_size()
+                        .next_frame_size_for(id)
                         .map(|(size, data)| (key, size, data, true))
                 })
             };
+            // The receiver's replay watermark requires first OPEN publication
+            // in identity order. Keep rotating denied work so smaller DATA,
+            // FIN/CLOSE and peer controls can still use available credit.
             if let Some((key, size, data, stream)) = next
-                && !admit(key, size, data)
+                && (self.open_output_blocked(key) || !admit(key, size, data))
             {
                 if stream {
                     let p = self.peers.get_mut(&peer).unwrap();

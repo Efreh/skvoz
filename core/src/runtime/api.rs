@@ -281,7 +281,6 @@ impl RuntimeConfig {
         {
             return Err(RuntimeError::Config);
         }
-        super::delivery_limits(self)?;
         self.subscription_capacity
             .checked_mul(2)
             .and_then(|n| n.checked_mul(self.shards))
@@ -296,6 +295,9 @@ impl RuntimeConfig {
                         .checked_mul(crate::TRANSPORT_DELIVERY_STATE_BYTES)?,
                 )
             })
+            // Two exact-source subscriptions per peer share the existing lane
+            // packet queues. Bound subject, handler and owned-handle metadata.
+            .and_then(|n| n.checked_add(limits.max_peers.checked_mul(2 * 1024)?))
             .ok_or(RuntimeError::Config)
     }
 }
@@ -303,6 +305,35 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod counter_tests {
     use super::*;
+    #[test]
+    fn source_subscription_metadata_does_not_multiply_packet_queues_by_peer_count() {
+        let config = RuntimeConfig::new(
+            "tls://localhost:4222",
+            Trust::System,
+            Authentication {
+                username: "fixture".into(),
+                password: "fixture".into(),
+            },
+            "fixture",
+            PeerId(0),
+            Membership::BrokerAuthorized,
+        );
+        let one = ManagerConfig {
+            max_peers: 1,
+            ..ManagerConfig::default()
+        };
+        let eight = ManagerConfig {
+            max_peers: 8,
+            ..one
+        };
+        let bound_one = config.validate_profile(one).unwrap();
+        let bound_eight = config.validate_profile(eight).unwrap();
+        assert_eq!(
+            bound_eight - bound_one,
+            7 * (crate::TRANSPORT_DELIVERY_STATE_BYTES + 2048)
+        );
+    }
+
     #[test]
     fn transport_size_bins_and_published_counters_saturate() {
         let mut counters = Counters::default();

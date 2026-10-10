@@ -578,7 +578,7 @@ impl Connector {
         }
 
         let op = connection.read_op().await?;
-        let info = match op {
+        let mut info = match op {
             Some(ServerOp::Info(info)) => {
                 tracing::debug!(
                     server_id = %info.server_id,
@@ -721,35 +721,96 @@ impl Connector {
             .easy_write_and_flush([ClientOp::Connect(connect_info), ClientOp::Ping].iter())
             .await?;
 
-        match connection.read_op().await? {
+        loop { match connection.read_op().await? {
             Some(ServerOp::Error(err)) => match err {
                 ServerError::AuthorizationViolation => {
                     tracing::error!(error = %err, "authorization violation");
-                    Err(ConnectError::with_source(
+                    return Err(ConnectError::with_source(
                         crate::ConnectErrorKind::AuthorizationViolation,
                         err,
-                    ))
+                    ));
                 }
                 err => {
                     tracing::error!(error = %err, "server error during connection");
-                    Err(ConnectError::with_source(crate::ConnectErrorKind::Io, err))
+                    return Err(ConnectError::with_source(crate::ConnectErrorKind::Io, err));
                 }
             },
-            Some(_) => Ok((*info, connection)),
+            Some(ServerOp::Pong) => return Ok((*info, connection)),
+            Some(ServerOp::Info(updated)) => info = updated,
+            Some(ServerOp::Ping) => connection.easy_write_and_flush([ClientOp::Pong].iter()).await?,
+            Some(ServerOp::Ok) => {},
+            Some(_) => return Err(ConnectError::with_source(crate::ConnectErrorKind::Io, "unexpected operation during connection proof")),
             None => {
                 tracing::error!("connection closed unexpectedly");
-                Err(ConnectError::with_source(
+                return Err(ConnectError::with_source(
                     crate::ConnectErrorKind::Io,
                     "broken pipe",
-                ))
+                ));
             }
-        }
+        } }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn handshake_interleaving_cannot_acknowledge_a_later_broker_barrier() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::oneshot;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (proof_seen, wait_proof) = oneshot::channel();
+            let (allow_proof, proof_gate) = oneshot::channel();
+            let (barrier_seen, wait_barrier) = oneshot::channel();
+            let (allow_barrier, barrier_gate) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (read, mut write) = socket.into_split();
+                let mut read = BufReader::new(read);
+                let info = String::from("INFO {\"max_payload\":65588}\r\n");
+                write.write_all(info.as_bytes()).await.unwrap();
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("CONNECT "));
+                line.clear(); read.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "PING\r\n");
+                write.write_all(format!("{info}PING\r\n+OK\r\n").as_bytes()).await.unwrap();
+                line.clear(); read.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "PONG\r\n");
+                proof_seen.send(()).unwrap();
+                proof_gate.await.unwrap();
+                write.write_all(b"PONG\r\n").await.unwrap();
+                // A SUB marks the explicit barrier command's ordered prefix.
+                // Heartbeat PINGs preceding it have independent PONGs.
+                loop {
+                    line.clear(); read.read_line(&mut line).await.unwrap();
+                    if line.starts_with("SUB proof ") { break; }
+                    assert_eq!(line, "PING\r\n");
+                    write.write_all(b"PONG\r\n").await.unwrap();
+                }
+                line.clear(); read.read_line(&mut line).await.unwrap();
+                assert_eq!(line, "PING\r\n");
+                barrier_seen.send(()).unwrap();
+                barrier_gate.await.unwrap();
+                write.write_all(b"PONG\r\n").await.unwrap();
+            });
+            let connect = tokio::spawn(async move { crate::ConnectOptions::new().max_reconnects(0).ping_interval(Duration::from_secs(60)).connect(format!("nats://{address}")).await });
+            wait_proof.await.unwrap();
+            assert!(!connect.is_finished(), "INFO/PING/OK accepted as CONNECT proof");
+            allow_proof.send(()).unwrap();
+            let client = connect.await.unwrap().unwrap();
+            let _subscription = client.subscribe("proof").await.unwrap();
+            let barrier = tokio::spawn(async move { client.broker_barrier().await });
+            wait_barrier.await.unwrap();
+            assert!(!barrier.is_finished(), "handshake PONG satisfied a later barrier");
+            allow_barrier.send(()).unwrap();
+            barrier.await.unwrap().unwrap();
+            server.await.unwrap();
+        }).await.unwrap();
+    }
 
     #[test]
     fn reconnect_delay_callback_duration() {

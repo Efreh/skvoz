@@ -1,5 +1,7 @@
 //! One owner actor shared by the executable and native embedding boundary.
 mod diagnostics;
+use crate::routing::transport::Routing;
+use crate::routing::{self, Assignment};
 use crate::{
     budget::{Budget, Reservation},
     config::{Role, StartupConfig},
@@ -32,6 +34,12 @@ use tokio::{
 };
 fn elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+fn diagnostic_time_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFailure {
@@ -225,13 +233,16 @@ impl RuntimeHandle {
         config
             .validate()
             .map_err(|_| RuntimeFailure::InvalidArgument)?;
+        let payload = config.role == Role::Client || config.routing.egress;
         let profile = config
             .core_runtime()
             .map_err(|_| RuntimeFailure::InvalidArgument)?;
         let limits = config.network.limits.manager(config.role);
-        profile
-            .validate_profile(limits)
-            .map_err(|_| RuntimeFailure::InvalidArgument)?;
+        if payload {
+            profile
+                .validate_profile(limits)
+                .map_err(|_| RuntimeFailure::InvalidArgument)?;
+        }
         let helper_required = config.role == Role::Server && !config.network.families.is_empty();
         if helper.is_some() != helper_required {
             return Err(RuntimeFailure::InvalidArgument);
@@ -251,27 +262,56 @@ impl RuntimeHandle {
             config.network.limits.runtime_buffer_records,
         );
         let transport = budget
-            .reserve(config.network.limits.transport_reservation(config.role), 0)
+            .reserve(
+                if payload {
+                    config.network.limits.transport_reservation(config.role)
+                } else {
+                    0
+                },
+                0,
+            )
             .map_err(|_| RuntimeFailure::Overloaded)?;
         let core = budget
             .reserve(
-                limits.receive_budget
-                    + limits.send_budget
-                    + limits
-                        .metadata_backing()
-                        .ok_or(RuntimeFailure::InvalidArgument)?,
+                if payload {
+                    limits.receive_budget
+                        + limits.send_budget
+                        + limits
+                            .metadata_backing()
+                            .ok_or(RuntimeFailure::InvalidArgument)?
+                } else {
+                    0
+                },
                 0,
             )
+            .map_err(|_| RuntimeFailure::Overloaded)?;
+        let route_bytes = if config.routing.authority.is_some() {
+            8 * 1048576
+        } else {
+            0
+        } + if config.role == Role::Client {
+            1048576
+        } else if config.routing.egress {
+            4 * 1048576
+        } else {
+            0
+        };
+        let routing_reservation = budget
+            .reserve(route_bytes, 0)
             .map_err(|_| RuntimeFailure::Overloaded)?;
         let fixed = budget
             .reserve(
                 524288
                     + diagnostics::RESERVATION
-                    + config
-                        .network
-                        .limits
-                        .backend_payload_backing()
-                        .map_err(|_| RuntimeFailure::InvalidArgument)?
+                    + if payload {
+                        config
+                            .network
+                            .limits
+                            .backend_payload_backing()
+                            .map_err(|_| RuntimeFailure::InvalidArgument)?
+                    } else {
+                        0
+                    }
                     + if helper_required {
                         local_api::BODY_MAX * 40
                     } else {
@@ -317,6 +357,7 @@ impl RuntimeHandle {
                         .enable_all()
                         .build()
                         .map_err(|_| RuntimeFailure::Internal)?;
+                    let _routing_reservation = routing_reservation;
                     let result = runtime.block_on(actor.run(receiver));
                     runtime.shutdown_background();
                     result
@@ -453,6 +494,49 @@ impl Drop for RuntimeHandle {
     }
 }
 
+fn helper_key(kind: &HelperKind) -> Option<RuntimeKey> {
+    match kind {
+        HelperKind::Reserve { key, .. }
+        | HelperKind::Activate { key, .. }
+        | HelperKind::Retire { key, .. } => Some(*key),
+        _ => None,
+    }
+}
+async fn route_deadline(
+    view: Option<Arc<Mutex<routing::transport::View>>>,
+    stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+) {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        let until = if let Some(view) = view.as_ref() {
+            let view = view.lock().unwrap();
+            if view.ever_ready && !view.ready() {
+                return;
+            }
+            let members = view.egress.lock().unwrap();
+            let first = members
+                .members
+                .values()
+                .map(|(_, deadline)| *deadline)
+                .min();
+            if first.is_some_and(|d| d <= now) {
+                return;
+            }
+            first
+                .into_iter()
+                .chain(view.lease.deadline())
+                .min()
+                .unwrap_or(now + Duration::from_secs(1))
+        } else {
+            now + Duration::from_secs(1)
+        };
+        tokio::select! { _=wake.notified()=>{}, _=tokio::time::sleep_until(until.into())=>{} }
+    }
+}
 type Connect = Pin<Box<dyn Future<Output = Result<std::net::TcpStream, ApiError>> + Send>>;
 struct Connecting {
     key: RuntimeKey,
@@ -461,6 +545,29 @@ struct Connecting {
     port: u16,
     _reservation: Reservation,
     deadline: Instant,
+    resolver_alive: Arc<AtomicBool>,
+    cancelled: bool,
+}
+impl Connecting {
+    fn retain_owned(&mut self, core_live: bool) -> bool {
+        if !core_live {
+            self.cancelled = true;
+            self.future = None;
+        }
+        core_live || self.resolver_alive.load(Ordering::Acquire)
+    }
+}
+struct ResolverWorker(Arc<AtomicBool>);
+impl ResolverWorker {
+    fn new(alive: Arc<AtomicBool>) -> Self {
+        alive.store(true, Ordering::Release);
+        Self(alive)
+    }
+}
+impl Drop for ResolverWorker {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 struct HelperPending {
     request: local_api::HelperRequest,
@@ -482,7 +589,10 @@ enum HelperKind {
         key: RuntimeKey,
         session: SessionId,
     },
-    Retire,
+    Retire {
+        key: RuntimeKey,
+        session: SessionId,
+    },
     Stop,
 }
 struct PendingStop {
@@ -501,7 +611,31 @@ struct Journal {
     downloaded: u64,
     terminal: bool,
 }
+#[derive(Clone)]
+enum AdmissionKind {
+    Tcp(local_api::TcpArgs),
+    Ip(local_api::IpArgs),
+}
+struct PendingAdmission {
+    id: u32,
+    sequence: u64,
+    kind: AdmissionKind,
+    retry_at: Instant,
+    assignment: Option<Assignment>,
+    deadline: Instant,
+}
+struct ProxyAdmission {
+    host: String,
+    port: u16,
+    initial: Vec<u8>,
+    success: Vec<u8>,
+    failure: Vec<u8>,
+    sequence: u64,
+    retry_at: Instant,
+    assignment: Option<Assignment>,
+}
 struct ProxyPending {
+    admission: Option<ProxyAdmission>,
     socket: std::net::TcpStream,
     parser: crate::proxy::Handshake,
     output: Vec<u8>,
@@ -551,6 +685,13 @@ struct Actor {
     socks: Option<TcpListener>,
     proxy_pending: Vec<ProxyPending>,
     ip: Option<SessionId>,
+    ip_peer: Option<PeerId>,
+    routing: Routing,
+    admitted_peers: BTreeMap<PeerId, u128>,
+    helper_retiring: BTreeMap<RuntimeKey, SessionId>,
+    client_assignments: BTreeMap<RuntimeKey, Assignment>,
+    route_closing: BTreeMap<RuntimeKey, Instant>,
+    admission: Option<PendingAdmission>,
     configured: bool,
     active: bool,
     ip_guard: Option<Reservation>,
@@ -617,6 +758,13 @@ impl Actor {
             socks: None,
             proxy_pending: Vec::new(),
             ip: None,
+            ip_peer: None,
+            routing: Routing::new(),
+            admitted_peers: BTreeMap::new(),
+            helper_retiring: BTreeMap::new(),
+            client_assignments: BTreeMap::new(),
+            route_closing: BTreeMap::new(),
+            admission: None,
             configured: false,
             active: false,
             ip_guard: None,
@@ -716,12 +864,24 @@ impl Actor {
         &mut self,
         mut commands: mpsc::Receiver<Command>,
     ) -> Result<(), RuntimeFailure> {
+        if let Some(authority) = self.config.routing.authority.clone() {
+            self.routing
+                .authority(authority.core, authority.registry, self.wake.clone())
+                .map_err(|_| RuntimeFailure::InvalidArgument)?;
+        }
+        let payload = self.config.role == Role::Client || self.config.routing.egress;
         let profile = self
             .config
             .core_runtime()
             .map_err(|_| RuntimeFailure::InvalidArgument)?;
         let limits = self.config.network.limits.manager(self.config.role);
-        let connect = NatsRuntime::connect(profile, limits);
+        let connect = async move {
+            if payload {
+                NatsRuntime::connect(profile, limits).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        };
         tokio::pin!(connect);
         let mut connecting = true;
         let mut connect_error = false;
@@ -745,16 +905,22 @@ impl Actor {
                 break Err(RuntimeFailure::Closed);
             }
             self.helper_turn()?;
+            self.route_turn()?;
+            if self.stop.load(Ordering::Acquire) {
+                break Ok(());
+            }
             if connecting {
                 tokio::select! {
                  result=&mut connect=>{connecting=false;match result{
-                  Ok(runtime)=>{
+                  Ok(Some(runtime))=>{
+                   self.routing.participant(self.config.core.clone(), routing::epoch(runtime.epoch()), if self.config.role==Role::Server { Some(self.config.network.families.clone()) } else { None }, self.wake.clone());
                    let role=if self.config.role==Role::Client{EngineRole::Client}else{EngineRole::Server{grants:BTreeMap::new()}};
                    let mut engine=NetworkEngine::new(runtime,role,self.config.network.limits.engine()).map_err(|_|RuntimeFailure::Internal)?;engine.enable_tcp();engine.set_budget(self.budget.clone());
+                   if self.config.role==Role::Server { engine.set_admission(self.routing.participant.as_ref().unwrap().view.lock().unwrap().egress.clone()); }
                    if self.config.role==Role::Server && self.config.network.families.is_empty(){engine.enable_dynamic_server(Vec::new(),self.config.network.max_mtu,self.config.network.channels).map_err(|_|RuntimeFailure::Internal)?;}
                    if self.helper_ready{engine.enable_dynamic_server(self.config.network.families.clone(),self.config.network.max_mtu,self.config.network.channels).map_err(|_|RuntimeFailure::Internal)?;}
                    self.engine=Some(engine);self.ip_events()?;
-                  },Err(_)=>{connect_error=true;self.state("starting",Some(ApiError::NetworkUnavailable))?;}
+                  },Ok(None)=>{},Err(_)=>{connect_error=true;self.state("starting",Some(ApiError::NetworkUnavailable))?;}
                  }},
                  command=commands.recv()=>match command{Some(c)=>self.command(c).await?,None=>break Ok(())},
                  _=self.wake.notified()=>{},
@@ -792,18 +958,38 @@ impl Actor {
                         .saturating_add(elapsed_us(start));
                 }
                 let profile_drive = self.profile.value.enabled.then(Instant::now);
-                if let Some(engine) = self.engine.as_mut()
-                    && let Err(error) = engine
-                        .drive_with_wake(Duration::from_millis(5), self.wake.notified())
-                        .await
-                    && self.lifecycle != "starting"
-                {
-                    eprintln!(
-                        "Network drive failure: {error:?} counters={:?}",
-                        engine.runtime.status().counters
-                    );
-                    self.state("starting", Some(ApiError::NetworkUnavailable))?;
+                let native_poll = !self.tcp.is_empty()
+                    || !self.connects.is_empty()
+                    || self.http.is_some()
+                    || self.socks.is_some()
+                    || !self.proxy_pending.is_empty()
+                    || self.tun.is_some();
+                let drive_wait = if native_poll {
+                    Duration::from_millis(5)
+                } else if self.admission.is_some() {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(1)
+                };
+                if let Some(engine) = self.engine.as_mut() {
+                    let view = self.routing.participant.as_ref().map(|p| p.view.clone());
+                    let stop = self.stop.clone();
+                    let wake = self.wake.clone();
+                    let result = engine
+                        .drive_with_wake(drive_wait, route_deadline(view, stop, wake))
+                        .await;
+                    if let Err(error) = result {
+                        eprintln!(
+                            "Network drive failure: time_ms={} id={} error={error:?}",
+                            diagnostic_time_ms(),
+                            self.config.core.peer_id
+                        );
+                        self.state("starting", Some(ApiError::NetworkUnavailable))?;
+                    }
+                } else {
+                    tokio::select! { command=commands.recv()=>match command{Some(c)=>self.command(c).await?,None=>break Ok(())}, _=self.wake.notified()=>{}, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
                 }
+                self.route_turn()?;
                 if let Some(start) = profile_drive {
                     self.profile.value.drive_us = self
                         .profile
@@ -876,22 +1062,51 @@ impl Actor {
                 return self.respond(r.id, Err(ApiError::InvalidState), None);
             }
             self.hello = true;
-            return self.respond(r.id,Ok(json!({"api":1,"network":4,"role":self.config.role,"capabilities":{"profiles":if self.config.network.families.is_empty(){vec!["tcp"]}else{vec!["tcp","ip"]},"families":self.config.network.families,"max_mtu":self.config.network.max_mtu,"max_channels":self.config.network.channels}})),None);
+            return self.respond(r.id,Ok(json!({"api":1,"network":crate::NETWORK_VERSION,"role":self.config.role,"capabilities":{"profiles":if self.config.network.families.is_empty(){vec!["tcp"]}else{vec!["tcp","ip"]},"families":self.config.network.families,"max_mtu":self.config.network.max_mtu,"max_channels":self.config.network.channels}})),None);
         }
         if r.op == Operation::Hello {
             return self.respond(r.id, Err(ApiError::InvalidState), None);
         }
         if self.config.role == Role::Server
-            && !matches!(r.op, Operation::Status | Operation::PrepareShutdown)
+            && !matches!(
+                r.op,
+                Operation::Status | Operation::PrepareShutdown | Operation::UpdateRegistry
+            )
         {
             return self.respond(r.id, Err(ApiError::Forbidden), None);
         }
         let result: Result<Value, ApiError> = match r.op {
+            Operation::UpdateRegistry => {
+                let registry: routing::Registry =
+                    local_api::arguments(&r.args).map_err(|_| RuntimeFailure::InvalidArgument)?;
+                if let Some(authority) = self.routing.authority.as_ref() {
+                    authority
+                        .lock()
+                        .unwrap()
+                        .apply_registry(registry)
+                        .map(|_| json!({}))
+                        .map_err(ApiError::from)
+                } else {
+                    Err(ApiError::Forbidden)
+                }
+            }
             Operation::Status => {
                 self.update_counters();
-                let session=self.ip.as_ref().map(|id|json!({"handle":id,"state":if self.pending_stop.as_ref().is_some_and(|s|s.target.is_some()){"closing"}else{self.engine.as_ref().and_then(|e|e.sessions().into_iter().find(|s|s.peer==PeerId(0))).map(|s|session_label(s.state)).unwrap_or("closed")}}));
+                let control_ready = self.routing.authority.as_ref().map_or_else(
+                    || {
+                        self.routing
+                            .participant
+                            .as_ref()
+                            .is_some_and(|p| p.view.lock().unwrap().ready())
+                    },
+                    |_| self.routing.control_ready.load(Ordering::Acquire),
+                );
+                let eligible_exits = self.routing.authority.as_ref().map_or(0, |authority| {
+                    authority.lock().unwrap().ready_exits(Instant::now())
+                });
+                let session=self.ip.as_ref().map(|id|json!({"handle":id,"state":if self.pending_stop.as_ref().is_some_and(|s|s.target.is_some()){"closing"}else{self.engine.as_ref().and_then(|e|e.sessions().into_iter().find(|s|Some(s.peer)==self.ip_peer)).map(|s|session_label(s.state)).unwrap_or("closed")}}));
                 Ok(
-                    json!({"lifecycle":self.lifecycle,"mode":self.mode,"session":session,"counters":self.counters}),
+                    json!({"lifecycle":self.lifecycle,"mode":self.mode,"session":session,"counters":self.counters,"routing":{"control_ready":control_ready,"eligible_exits":eligible_exits}}),
                 )
             }
             Operation::StartProxy => {
@@ -929,16 +1144,15 @@ impl Actor {
             Operation::OpenTcp => {
                 if self.mode != "proxy" {
                     Err(ApiError::InvalidState)
-                } else if self
-                    .engine
-                    .as_ref()
-                    .is_none_or(|e| !e.peer_ready(PeerId(0)))
-                {
-                    Err(ApiError::NetworkUnavailable)
                 } else {
                     let args: local_api::TcpArgs = local_api::arguments(&r.args)
                         .map_err(|_| RuntimeFailure::InvalidArgument)?;
-                    match self.open_api_tcp(r.id, args) {
+                    let target = Metadata::Tcp {
+                        v: crate::NETWORK_VERSION,
+                        host: args.host.clone(),
+                        port: args.port,
+                    };
+                    match self.begin_admission(r.id, target, AdmissionKind::Tcp(args)) {
                         Ok(()) => return Ok(()),
                         Err(e) => Err(e),
                     }
@@ -947,38 +1161,26 @@ impl Actor {
             Operation::StartIp => {
                 if self.mode != "idle" {
                     Err(ApiError::InvalidState)
-                } else if self
-                    .engine
-                    .as_ref()
-                    .is_none_or(|e| !e.peer_ready(PeerId(0)))
-                {
-                    Err(ApiError::NetworkUnavailable)
                 } else {
-                    let a: local_api::IpArgs = local_api::arguments(&r.args)
+                    let args: local_api::IpArgs = local_api::arguments(&r.args)
                         .map_err(|_| RuntimeFailure::InvalidArgument)?;
-                    if a.families
+                    if args
+                        .families
                         .iter()
                         .any(|f| !self.config.network.families.contains(f))
                     {
                         Err(ApiError::UnsupportedFamily)
                     } else {
-                        match self.engine.as_mut().unwrap().open_ip(
-                            PeerId(0),
-                            a.families,
-                            a.family_policy,
-                            a.max_mtu,
-                            a.channels,
-                        ) {
-                            Ok(_key) => {
-                                let handle =
-                                    SessionId::random().map_err(|_| RuntimeFailure::Internal)?;
-                                self.mode = "ip";
-                                self.ip = Some(handle.clone());
-                                self.configured = false;
-                                self.active = false;
-                                Ok(local_api::handle_result(&handle))
-                            }
-                            Err(e) => Err(e.into()),
+                        let target = Metadata::IpSession {
+                            v: crate::NETWORK_VERSION,
+                            families: args.families.clone(),
+                            family_policy: args.family_policy,
+                            max_mtu: args.max_mtu,
+                            channels: args.channels,
+                        };
+                        match self.begin_admission(r.id, target, AdmissionKind::Ip(args)) {
+                            Ok(()) => return Ok(()),
+                            Err(e) => Err(e),
                         }
                     }
                 }
@@ -994,7 +1196,11 @@ impl Actor {
                     let config = self
                         .engine
                         .as_ref()
-                        .and_then(|e| e.sessions().into_iter().find(|s| s.peer == PeerId(0)))
+                        .and_then(|e| {
+                            e.sessions()
+                                .into_iter()
+                                .find(|s| Some(s.peer) == self.ip_peer)
+                        })
                         .and_then(|s| s.config);
                     if config.is_none_or(|c| c.mtu != a.mtu) {
                         Err(ApiError::InvalidRequest)
@@ -1079,10 +1285,350 @@ impl Actor {
         };
         self.respond(r.id, result, None)
     }
+    fn begin_admission(
+        &mut self,
+        id: u32,
+        target: Metadata,
+        kind: AdmissionKind,
+    ) -> Result<(), ApiError> {
+        if self.admission.is_some() {
+            return Err(ApiError::Overloaded);
+        }
+        let participant = self
+            .routing
+            .participant
+            .as_ref()
+            .ok_or(ApiError::NetworkUnavailable)?;
+        let sequence = participant.submit(target).map_err(ApiError::from)?;
+        self.admission = Some(PendingAdmission {
+            id,
+            sequence,
+            kind,
+            retry_at: Instant::now(),
+            assignment: None,
+            deadline: Instant::now() + Duration::from_secs(15),
+        });
+        Ok(())
+    }
+    fn admission_target(kind: &AdmissionKind) -> Metadata {
+        match kind {
+            AdmissionKind::Tcp(args) => Metadata::Tcp {
+                v: crate::NETWORK_VERSION,
+                host: args.host.clone(),
+                port: args.port,
+            },
+            AdmissionKind::Ip(args) => Metadata::IpSession {
+                v: crate::NETWORK_VERSION,
+                families: args.families.clone(),
+                family_policy: args.family_policy,
+                max_mtu: args.max_mtu,
+                channels: args.channels,
+            },
+        }
+    }
+    fn assignment_ready(&mut self, assignment: &Assignment) -> Result<bool, ApiError> {
+        let peer = PeerId(assignment.owner);
+        let epoch = routing::epoch_number(&assignment.owner_epoch);
+        let engine = self.engine.as_mut().ok_or(ApiError::NetworkUnavailable)?;
+        if self
+            .admitted_peers
+            .get(&peer)
+            .is_some_and(|old| *old != epoch)
+        {
+            // Changing an active incarnation requires native cleanup first.
+            if self
+                .client_assignments
+                .keys()
+                .any(|k| k.stream.peer == peer)
+            {
+                return Err(ApiError::NetworkUnavailable);
+            }
+            engine
+                .runtime
+                .revoke_peer(peer)
+                .map_err(|_| ApiError::NetworkUnavailable)?;
+            self.admitted_peers.remove(&peer);
+        }
+        if let std::collections::btree_map::Entry::Vacant(e) = self.admitted_peers.entry(peer) {
+            engine
+                .runtime
+                .authorize_peer(peer, Some(epoch))
+                .map_err(|_| ApiError::NetworkUnavailable)?;
+            engine
+                .runtime
+                .join_peer(peer)
+                .map_err(|_| ApiError::NetworkUnavailable)?;
+            e.insert(epoch);
+        }
+        Ok(engine.peer_ready(peer))
+    }
+    fn route_turn(&mut self) -> Result<(), RuntimeFailure> {
+        if self.routing.failed() {
+            eprintln!(
+                "Network generation fenced: time_ms={} id={} reason=route_control_failed",
+                diagnostic_time_ms(),
+                self.config.core.peer_id
+            );
+            self.stop.store(true, Ordering::Release);
+        }
+        if let Some(participant) = self.routing.participant.as_ref() {
+            let view = participant.view.lock().unwrap();
+            let now = Instant::now();
+            let epoch_changed = self.engine.as_ref().is_some_and(|e| {
+                routing::epoch(e.runtime.epoch()) != view.epoch
+                    || (view.ever_ready && e.core_status().lifecycle != Lifecycle::Ready)
+            });
+            if epoch_changed || (view.ever_ready && !view.ready()) {
+                eprintln!(
+                    "Network generation fenced: time_ms={} id={} reason={} alive={} core={:?} lease={:?}",
+                    diagnostic_time_ms(),
+                    self.config.core.peer_id,
+                    if epoch_changed {
+                        "core_generation"
+                    } else {
+                        "route_lease"
+                    },
+                    view.alive,
+                    self.engine.as_ref().map(|e| e.core_status().lifecycle),
+                    view.lease
+                );
+                // The supervised host restarts with the new actual Core epoch;
+                // authority replacement remains fenced until nine seconds.
+                let deadline = (view.lease.deadline().unwrap_or(now) + Duration::from_secs(3))
+                    .min(now + Duration::from_secs(3));
+                let mut shutdown = self.shutdown_deadline.lock().unwrap();
+                *shutdown = Some(shutdown.map_or(deadline, |old| old.min(deadline)));
+                self.stop.store(true, Ordering::Release);
+            }
+            if self.config.role == Role::Server {
+                let table = view.egress.clone();
+                let mut egress = table.lock().unwrap();
+                let desired: BTreeMap<_, _> = if view.ready() {
+                    egress
+                        .members
+                        .iter()
+                        .filter(|(_, (_, deadline))| now < *deadline)
+                        .map(|(id, (epoch, _))| (PeerId(*id), routing::epoch_number(epoch)))
+                        .collect()
+                } else {
+                    BTreeMap::new()
+                };
+                if let Some(engine) = self.engine.as_mut() {
+                    let retiring: Vec<_> = self
+                        .admitted_peers
+                        .iter()
+                        .filter(|(id, epoch)| desired.get(id) != Some(epoch))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in retiring {
+                        engine
+                            .runtime
+                            .revoke_peer(id)
+                            .map_err(|_| RuntimeFailure::Internal)?;
+                        self.admitted_peers.remove(&id);
+                    }
+                    for (id, epoch) in desired {
+                        if let std::collections::btree_map::Entry::Vacant(e) =
+                            self.admitted_peers.entry(id)
+                        {
+                            engine
+                                .runtime
+                                .authorize_peer(id, Some(epoch))
+                                .map_err(|_| RuntimeFailure::Internal)?;
+                            e.insert(epoch);
+                        }
+                    }
+                    let closing = egress.cleanup(now, |key, ip| {
+                        engine.route_live(key, ip)
+                            || self.tcp.contains_key(&key)
+                            || self.connects.iter().any(|c| c.key == key)
+                            || self.helper_retiring.contains_key(&key)
+                            || self
+                                .helper_pending
+                                .as_ref()
+                                .is_some_and(|p| helper_key(&p.kind) == Some(key))
+                            || self
+                                .helper_queue
+                                .iter()
+                                .any(|p| helper_key(&p.kind) == Some(key))
+                    });
+                    for key in closing {
+                        self.route_closing
+                            .entry(key)
+                            .or_insert(now + Duration::from_secs(3));
+                        engine.close_owned(key);
+                    }
+                    self.route_closing.retain(|key, _| {
+                        engine.route_live(*key, true)
+                            || self.tcp.contains_key(key)
+                            || self.connects.iter().any(|c| c.key == *key)
+                            || self.helper_retiring.contains_key(key)
+                            || self
+                                .helper_pending
+                                .as_ref()
+                                .is_some_and(|p| helper_key(&p.kind) == Some(*key))
+                            || self
+                                .helper_queue
+                                .iter()
+                                .any(|p| helper_key(&p.kind) == Some(*key))
+                    });
+                    if self.route_closing.values().any(|deadline| now >= *deadline) {
+                        eprintln!(
+                            "Network generation fenced: time_ms={} id={} reason=native_route_cleanup pending={} tcp={}",
+                            diagnostic_time_ms(),
+                            self.config.core.peer_id,
+                            self.route_closing.len(),
+                            self.tcp.len()
+                        );
+                        self.shutdown_deadline.lock().unwrap().get_or_insert(now);
+                        self.stop.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+        let retired: Vec<_> = self
+            .client_assignments
+            .keys()
+            .copied()
+            .filter(|key| {
+                self.engine
+                    .as_ref()
+                    .is_none_or(|e| !e.route_live(*key, self.ip_peer == Some(key.stream.peer)))
+                    && !self.tcp.contains_key(key)
+                    && !self.connects.iter().any(|c| c.key == *key)
+            })
+            .collect();
+        for key in retired {
+            if let Some(assignment) = self.client_assignments.remove(&key)
+                && let Some(p) = self.routing.participant.as_ref()
+            {
+                p.cancel(assignment.attempt);
+            }
+        }
+        let Some(mut pending) = self.admission.take() else {
+            return Ok(());
+        };
+        if pending.sequence == 0 && Instant::now() < pending.deadline {
+            if Instant::now() >= pending.retry_at {
+                match self
+                    .routing
+                    .participant
+                    .as_ref()
+                    .ok_or(NetworkError::InvalidState)
+                    .and_then(|p| p.submit(Self::admission_target(&pending.kind)))
+                {
+                    Ok(sequence) => pending.sequence = sequence,
+                    Err(NetworkError::Overloaded) => {
+                        pending.retry_at = Instant::now() + Duration::from_millis(250)
+                    }
+                    Err(error) => return self.respond(pending.id, Err(error.into()), None),
+                }
+            }
+            self.admission = Some(pending);
+            return Ok(());
+        }
+        let result = if Instant::now() >= pending.deadline {
+            Some(Err(ApiError::Timeout))
+        } else if pending.assignment.is_none() {
+            self.routing
+                .participant
+                .as_ref()
+                .and_then(|p| p.result(pending.sequence))
+                .map(|r| r.map_err(ApiError::from))
+        } else {
+            None
+        };
+        if let Some(result) = result {
+            match result {
+                Ok(assignment) => pending.assignment = Some(assignment),
+                Err(ApiError::Overloaded) if Instant::now() < pending.deadline => {
+                    pending.sequence = 0;
+                    pending.retry_at = Instant::now() + Duration::from_millis(250);
+                }
+                Err(error) => {
+                    if let Some(p) = self.routing.participant.as_ref() {
+                        p.abandon(pending.sequence);
+                    }
+                    return self.respond(pending.id, Err(error), None);
+                }
+            }
+        }
+        if let Some(assignment) = pending.assignment.as_ref() {
+            match self.assignment_ready(assignment) {
+                Ok(true) => {
+                    let assignment = assignment.clone();
+                    match pending.kind {
+                        AdmissionKind::Tcp(args) => {
+                            if let Err(error) =
+                                self.open_api_tcp(pending.id, args, assignment.clone())
+                            {
+                                self.routing
+                                    .participant
+                                    .as_ref()
+                                    .unwrap()
+                                    .cancel(assignment.attempt);
+                                self.respond(pending.id, Err(error), None)?;
+                            }
+                        }
+                        AdmissionKind::Ip(args) => {
+                            match self.engine.as_mut().unwrap().open_ip_assigned(
+                                &assignment,
+                                args.families,
+                                args.family_policy,
+                                args.max_mtu,
+                                args.channels,
+                            ) {
+                                Ok(key) => {
+                                    self.client_assignments.insert(key, assignment.clone());
+                                    self.ip_peer = Some(PeerId(assignment.owner));
+                                    let handle = SessionId::random()
+                                        .map_err(|_| RuntimeFailure::Internal)?;
+                                    self.ip = Some(handle.clone());
+                                    self.mode = "ip";
+                                    self.configured = false;
+                                    self.active = false;
+                                    self.respond(
+                                        pending.id,
+                                        Ok(local_api::handle_result(&handle)),
+                                        None,
+                                    )?;
+                                }
+                                Err(error) => {
+                                    self.routing
+                                        .participant
+                                        .as_ref()
+                                        .unwrap()
+                                        .cancel(assignment.attempt);
+                                    self.respond(pending.id, Err(error.into()), None)?;
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.routing
+                        .participant
+                        .as_ref()
+                        .unwrap()
+                        .cancel(assignment.attempt.clone());
+                    self.respond(pending.id, Err(error), None)?;
+                    return Ok(());
+                }
+                Ok(false) => {}
+            }
+        }
+        self.admission = Some(pending);
+        Ok(())
+    }
     fn remote_ip(&self) -> Option<SessionId> {
         self.engine
             .as_ref()
-            .and_then(|e| e.sessions().into_iter().find(|s| s.peer == PeerId(0)))
+            .and_then(|e| {
+                e.sessions()
+                    .into_iter()
+                    .find(|s| Some(s.peer) == self.ip_peer)
+            })
             .map(|s| s.session)
     }
     fn remember_ip(&mut self, id: SessionId) {
@@ -1139,7 +1685,12 @@ impl Actor {
             .ok_or(RuntimeFailure::Internal)?;
         self.event("REQUEST", json!({"id":self.request_seq,"protocol":protocol,"host":host,"port":port,"result":reason,"uploaded":0,"downloaded":0}))
     }
-    fn open_api_tcp(&mut self, id: u32, args: local_api::TcpArgs) -> Result<(), ApiError> {
+    fn open_api_tcp(
+        &mut self,
+        id: u32,
+        args: local_api::TcpArgs,
+        assignment: Assignment,
+    ) -> Result<(), ApiError> {
         let (runtime, host) = UnixStream::pair().map_err(|_| ApiError::LocalSetupFailed)?;
         runtime
             .set_nonblocking(true)
@@ -1158,7 +1709,7 @@ impl Actor {
             .engine
             .as_mut()
             .ok_or(ApiError::NetworkUnavailable)?
-            .open_tcp(PeerId(0), args.host.clone(), args.port)
+            .open_tcp_assigned(&assignment, args.host.clone(), args.port)
         {
             Ok(key) => key,
             Err(error) => {
@@ -1186,6 +1737,7 @@ impl Actor {
                     SessionId::random().map_err(ApiError::from)?,
                     host.into(),
                 ));
+                self.client_assignments.insert(key, assignment);
                 self.tcp.insert(key, connection);
                 self.record_request(key, "TCP", args.host, args.port)
                     .map_err(|_| ApiError::Overloaded)?;
@@ -1208,6 +1760,16 @@ impl Actor {
     fn stop_proxy(&mut self) {
         self.http.take();
         self.socks.take();
+        if let Some(participant) = self.routing.participant.as_ref() {
+            for pending in &self.proxy_pending {
+                if let Some(admission) = &pending.admission {
+                    participant.abandon(admission.sequence);
+                    if let Some(a) = &admission.assignment {
+                        participant.cancel(a.attempt.clone());
+                    }
+                }
+            }
+        }
         self.proxy_pending.clear();
         self.connects.clear();
         self.tcp_stopping = true;
@@ -1218,6 +1780,12 @@ impl Actor {
         args: Value,
         kind: HelperKind,
     ) -> Result<(), RuntimeFailure> {
+        if let HelperKind::Retire { key, session } = &kind {
+            if self.helper_retiring.len() >= 128 && !self.helper_retiring.contains_key(key) {
+                return Err(RuntimeFailure::Overloaded);
+            }
+            self.helper_retiring.insert(*key, session.clone());
+        }
         if self.helper_queue.len() >= 256 {
             return Err(RuntimeFailure::Overloaded);
         }
@@ -1250,7 +1818,7 @@ impl Actor {
         if self.helper_id == 0 {
             self.helper_enqueue(
                 local_api::HelperOperation::Hello,
-                json!({"api":1,"network":4}),
+                json!({"api":1,"network":crate::NETWORK_VERSION}),
                 HelperKind::Hello,
             )?;
         }
@@ -1321,7 +1889,9 @@ impl Actor {
         }
         match pending.kind {
             HelperKind::Hello => {
-                if frame.fd.is_some() || result != json!({"api":1,"network":4,"role":"server"}) {
+                if frame.fd.is_some()
+                    || result != json!({"api":1,"network":crate::NETWORK_VERSION,"role":"server"})
+                {
                     return Err(RuntimeFailure::Internal);
                 }
                 self.helper_enqueue(
@@ -1412,7 +1982,10 @@ impl Actor {
                     self.helper_enqueue(
                         local_api::HelperOperation::RetirePeer,
                         json!({"peer":key.stream.peer.0.to_string(),"session":session}),
-                        HelperKind::Retire,
+                        HelperKind::Retire {
+                            key,
+                            session: session.clone(),
+                        },
                     )?;
                 }
             }
@@ -1430,11 +2003,14 @@ impl Actor {
                     self.helper_enqueue(
                         local_api::HelperOperation::RetirePeer,
                         json!({"peer":key.stream.peer.0.to_string(),"session":session}),
-                        HelperKind::Retire,
+                        HelperKind::Retire {
+                            key,
+                            session: session.clone(),
+                        },
                     )?;
                 }
             }
-            HelperKind::Retire => {
+            HelperKind::Retire { key, session } => {
                 if frame.fd.is_some()
                     || result
                         != pending
@@ -1447,12 +2023,15 @@ impl Actor {
                 {
                     return Err(RuntimeFailure::Internal);
                 }
+                self.helper_retiring.remove(&key);
+                let _ = session;
             }
             HelperKind::Stop => {
                 if frame.fd.is_some() || result != json!({"state":"idle"}) {
                     return Err(RuntimeFailure::Internal);
                 }
                 self.helper_ready = false;
+                self.helper_retiring.clear();
             }
         }
         Ok(())
@@ -1533,6 +2112,8 @@ impl Actor {
                         port,
                         _reservation: reservation,
                         deadline: Instant::now() + Duration::from_secs(10),
+                        resolver_alive: Arc::new(AtomicBool::new(false)),
+                        cancelled: false,
                     });
                 }
                 BackendEvent::Tcp { key, event } => {
@@ -1611,7 +2192,10 @@ impl Actor {
                         self.helper_enqueue(
                             local_api::HelperOperation::RetirePeer,
                             json!({"peer":key.stream.peer.0.to_string(),"session":session}),
-                            HelperKind::Retire,
+                            HelperKind::Retire {
+                                key,
+                                session: session.clone(),
+                            },
                         )?;
                     }
                 }
@@ -1619,13 +2203,15 @@ impl Actor {
         }
         // Canceled opens drop their queued/active futures promptly. An actual OS
         // resolver worker keeps its own permit and reservation until completion.
-        self.connects.retain(|c| {
-            self.engine
+        self.connects.retain_mut(|c| {
+            let core_live = self
+                .engine
                 .as_ref()
                 .unwrap()
                 .runtime
                 .snapshot(c.key)
-                .is_some()
+                .is_some();
+            c.retain_owned(core_live)
         });
         // Round-robin admission by peer, with four active connects per peer.
         // One stalled peer cannot occupy all sixteen DNS/connect workers.
@@ -1636,7 +2222,7 @@ impl Actor {
             let mut peers: Vec<_> = self
                 .connects
                 .iter()
-                .filter(|c| c.future.is_none())
+                .filter(|c| c.future.is_none() && !c.cancelled)
                 .map(|c| c.key.stream.peer)
                 .collect();
             peers.sort();
@@ -1655,7 +2241,7 @@ impl Actor {
             let c = self
                 .connects
                 .iter_mut()
-                .filter(|c| c.key.stream.peer == peer && c.future.is_none())
+                .filter(|c| c.key.stream.peer == peer && c.future.is_none() && !c.cancelled)
                 .min_by_key(|c| c.deadline)
                 .unwrap();
             c.future = Some(Box::pin(connect_destination(
@@ -1663,11 +2249,16 @@ impl Actor {
                 c.host.clone(),
                 c.port,
                 self.budget.clone(),
+                c.resolver_alive.clone(),
             )));
             self.connect_peer = peer;
         }
         let mut index = 0;
         while index < self.connects.len() {
+            if self.connects[index].cancelled {
+                index += 1;
+                continue;
+            }
             let result = if Instant::now() >= self.connects[index].deadline {
                 Some(Err(ApiError::Timeout))
             } else {
@@ -1680,8 +2271,13 @@ impl Actor {
                 index += 1;
                 continue;
             };
-            let connecting = self.connects.swap_remove(index);
+            let mut connecting = self.connects.swap_remove(index);
             let key = connecting.key;
+            if connecting.resolver_alive.load(Ordering::Acquire) {
+                connecting.cancelled = true;
+                connecting.future = None;
+                self.connects.push(connecting);
+            }
             match result {
                 Ok(socket) => {
                     if self
@@ -1750,6 +2346,7 @@ impl Actor {
     fn proxy_failure(pending: &mut ProxyPending, bytes: Vec<u8>) -> Result<(), NetworkError> {
         let protocol = pending.parser.protocol();
         pending.parser = crate::proxy::Handshake::new(protocol);
+        pending.admission = None;
         pending.output = bytes;
         pending.cursor = 0;
         pending.terminal = true;
@@ -1794,11 +2391,12 @@ impl Actor {
                 };
                 let full = self.proxy_pending.iter().filter(|p| !p.terminal).count() >= 128;
                 let mut pending = ProxyPending {
+                    admission: None,
                     socket,
                     parser: crate::proxy::Handshake::new(protocol),
                     output: Vec::new(),
                     cursor: 0,
-                    deadline: Instant::now() + Duration::from_secs(10),
+                    deadline: Instant::now() + Duration::from_secs(15),
                     _reservation: reservation,
                     terminal: false,
                 };
@@ -1825,8 +2423,88 @@ impl Actor {
         while index < self.proxy_pending.len() {
             if Instant::now() >= self.proxy_pending[index].deadline {
                 self.admission_error("setup_timeout");
+                if let Some(admission) = self.proxy_pending[index].admission.as_ref()
+                    && let Some(p) = self.routing.participant.as_ref()
+                {
+                    p.abandon(admission.sequence);
+                    if let Some(a) = &admission.assignment {
+                        p.cancel(a.attempt.clone());
+                    }
+                }
                 self.proxy_pending.swap_remove(index);
                 continue;
+            }
+            if let Some(admission) = self.proxy_pending[index].admission.as_mut() {
+                if admission.sequence == 0 {
+                    if Instant::now() >= admission.retry_at {
+                        let target = Metadata::Tcp {
+                            v: crate::NETWORK_VERSION,
+                            host: admission.host.clone(),
+                            port: admission.port,
+                        };
+                        match self
+                            .routing
+                            .participant
+                            .as_ref()
+                            .ok_or(NetworkError::InvalidState)
+                            .and_then(|p| p.submit(target))
+                        {
+                            Ok(sequence) => admission.sequence = sequence,
+                            Err(NetworkError::Overloaded) => {
+                                admission.retry_at = Instant::now() + Duration::from_millis(250)
+                            }
+                            Err(error) => {
+                                let pending = &mut self.proxy_pending[index];
+                                let bytes = pending.parser.setup_failure(error.into());
+                                let _ = Self::proxy_failure(pending, bytes);
+                            }
+                        }
+                    }
+                    index += 1;
+                    continue;
+                }
+                if admission.assignment.is_none()
+                    && let Some(result) = self
+                        .routing
+                        .participant
+                        .as_ref()
+                        .and_then(|p| p.result(admission.sequence))
+                {
+                    match result {
+                        Ok(assignment) => admission.assignment = Some(assignment),
+                        Err(NetworkError::Overloaded) => {
+                            admission.sequence = 0;
+                            admission.retry_at = Instant::now() + Duration::from_millis(250);
+                            index += 1;
+                            continue;
+                        }
+                        Err(error) => {
+                            let pending = &mut self.proxy_pending[index];
+                            let bytes = pending.parser.setup_failure(error.into());
+                            let _ = Self::proxy_failure(pending, bytes);
+                            index += 1;
+                            continue;
+                        }
+                    }
+                }
+                let assignment = admission.assignment.clone();
+                match assignment.as_ref().map(|a| self.assignment_ready(a)) {
+                    Some(Ok(true)) => {}
+                    Some(Err(error)) => {
+                        if let Some(p) = self.routing.participant.as_ref() {
+                            p.cancel(assignment.unwrap().attempt);
+                        }
+                        let pending = &mut self.proxy_pending[index];
+                        let bytes = pending.parser.setup_failure(error);
+                        let _ = Self::proxy_failure(pending, bytes);
+                        index += 1;
+                        continue;
+                    }
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
+                }
             }
             let pending = &mut self.proxy_pending[index];
             if pending.cursor < pending.output.len() {
@@ -1862,39 +2540,50 @@ impl Actor {
                 index += 1;
                 continue;
             }
-            let progress = match pending.parser.feed(&[]) {
-                Ok(crate::proxy::Progress::Read) => {
-                    let mut bytes = [0u8; 16384];
-                    match pending.socket.read(&mut bytes) {
-                        Ok(0) => {
-                            self.proxy_pending.swap_remove(index);
-                            continue;
-                        }
-                        Ok(n) => {
-                            if pending
-                                ._reservation
-                                .resize(pending.parser.feed_reservation(n), 4)
-                                .is_err()
-                            {
-                                let failure = pending.parser.setup_failure(ApiError::Overloaded);
-                                let _ = Self::proxy_failure(pending, failure);
-                                self.admission_error("buffer");
+            let progress = if let Some(admission) = pending.admission.as_ref() {
+                Ok(crate::proxy::Progress::Open {
+                    host: admission.host.clone(),
+                    port: admission.port,
+                    initial: admission.initial.clone(),
+                    success: admission.success.clone(),
+                    failure: admission.failure.clone(),
+                })
+            } else {
+                match pending.parser.feed(&[]) {
+                    Ok(crate::proxy::Progress::Read) => {
+                        let mut bytes = [0u8; 16384];
+                        match pending.socket.read(&mut bytes) {
+                            Ok(0) => {
+                                self.proxy_pending.swap_remove(index);
+                                continue;
+                            }
+                            Ok(n) => {
+                                if pending
+                                    ._reservation
+                                    .resize(pending.parser.feed_reservation(n), 4)
+                                    .is_err()
+                                {
+                                    let failure =
+                                        pending.parser.setup_failure(ApiError::Overloaded);
+                                    let _ = Self::proxy_failure(pending, failure);
+                                    self.admission_error("buffer");
+                                    index += 1;
+                                    continue;
+                                }
+                                pending.parser.feed(&bytes[..n])
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 index += 1;
                                 continue;
                             }
-                            pending.parser.feed(&bytes[..n])
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            index += 1;
-                            continue;
-                        }
-                        Err(_) => {
-                            self.proxy_pending.swap_remove(index);
-                            continue;
+                            Err(_) => {
+                                self.proxy_pending.swap_remove(index);
+                                continue;
+                            }
                         }
                     }
+                    other => other,
                 }
-                other => other,
             };
             match progress {
                 Ok(crate::proxy::Progress::Read) => index += 1,
@@ -1909,7 +2598,43 @@ impl Actor {
                     success,
                     failure,
                 }) => {
-                    let pending = self.proxy_pending.swap_remove(index);
+                    if pending.admission.is_none() {
+                        let target = Metadata::Tcp {
+                            v: crate::NETWORK_VERSION,
+                            host: host.clone(),
+                            port,
+                        };
+                        match self
+                            .routing
+                            .participant
+                            .as_ref()
+                            .ok_or(NetworkError::InvalidState)
+                            .and_then(|p| p.submit(target))
+                        {
+                            Ok(sequence) => {
+                                pending.admission = Some(ProxyAdmission {
+                                    host,
+                                    port,
+                                    initial,
+                                    success,
+                                    failure,
+                                    sequence,
+                                    retry_at: Instant::now(),
+                                    assignment: None,
+                                });
+                                index += 1;
+                                continue;
+                            }
+                            Err(error) => {
+                                let bytes = pending.parser.setup_failure(error.into());
+                                let _ = Self::proxy_failure(pending, bytes);
+                                index += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    let mut pending = self.proxy_pending.swap_remove(index);
+                    let assignment = pending.admission.take().unwrap().assignment.unwrap();
                     let protocol = match pending.parser.protocol() {
                         crate::proxy::Protocol::Socks => "SOCKS5",
                         crate::proxy::Protocol::Http if success.is_empty() => "HTTP",
@@ -1918,10 +2643,11 @@ impl Actor {
                     let key = if self.tcp.len() >= self.config.network.limits.core_streams {
                         Err(NetworkError::Overloaded)
                     } else {
-                        self.engine
-                            .as_mut()
-                            .unwrap()
-                            .open_tcp(PeerId(0), host.clone(), port)
+                        self.engine.as_mut().unwrap().open_tcp_assigned(
+                            &assignment,
+                            host.clone(),
+                            port,
+                        )
                     };
                     match key {
                         Ok(key) => {
@@ -1943,14 +2669,21 @@ impl Actor {
                                 Ok(mut connection) => {
                                     connection.success = success;
                                     connection.failure = failure;
+                                    self.client_assignments.insert(key, assignment.clone());
                                     self.tcp.insert(key, connection);
                                     self.record_request(key, protocol, host, port)?;
                                 }
                                 Err(failed) => {
                                     let api_error = setup_api_error(failed.error.clone());
                                     self.engine.as_mut().unwrap().close_tcp(key);
+                                    self.routing
+                                        .participant
+                                        .as_ref()
+                                        .unwrap()
+                                        .cancel(assignment.attempt.clone());
                                     if let Socket::Tcp(socket) = failed.socket {
                                         let mut pending = ProxyPending {
+                                            admission: None,
                                             socket,
                                             parser: crate::proxy::Handshake::new(
                                                 if protocol == "SOCKS5" {
@@ -1985,6 +2718,11 @@ impl Actor {
                             }
                         }
                         Err(error) => {
+                            self.routing
+                                .participant
+                                .as_ref()
+                                .unwrap()
+                                .cancel(assignment.attempt.clone());
                             let api_error = ApiError::from(error);
                             let mut pending = pending;
                             let bytes = pending.parser.setup_failure(api_error);
@@ -2082,7 +2820,8 @@ impl Actor {
         let mut retired = 0;
         let mut remaining = batch;
         for (key, error) in failed {
-            let cost = 1 + usize::from(self.tcp.get(&key).is_some_and(|c| c.reply.is_some()));
+            let cost = usize::from(self.journal.get(&key).is_some_and(|j| !j.terminal))
+                + usize::from(self.tcp.get(&key).is_some_and(|c| c.reply.is_some()));
             if cost > remaining {
                 break;
             }
@@ -2205,7 +2944,7 @@ impl Actor {
                         engine
                             .sessions()
                             .into_iter()
-                            .find(|s| s.peer == PeerId(0))
+                            .find(|s| Some(s.peer) == self.ip_peer)
                             .map(|s| s.session)
                     } else {
                         crate::validate_packet(
@@ -2298,10 +3037,11 @@ impl Actor {
             return Ok(());
         }
         if let Some(id) = self.ip.clone() {
-            let session = self
-                .engine
-                .as_ref()
-                .and_then(|e| e.sessions().into_iter().find(|s| s.peer == PeerId(0)));
+            let session = self.engine.as_ref().and_then(|e| {
+                e.sessions()
+                    .into_iter()
+                    .find(|s| Some(s.peer) == self.ip_peer)
+            });
             if let Some(session) = session {
                 if !self.configured
                     && let Some(config) = session.config
@@ -2328,10 +3068,18 @@ impl Actor {
                 self.event("CLOSED", json!({"handle":id,"error":error}))?;
             }
         }
-        let ready = self.engine.as_ref().is_some_and(|e| {
-            e.core_status().lifecycle == Lifecycle::Ready
-                && (self.config.role == Role::Server || e.peer_ready(PeerId(0)))
-        });
+        let ready = if self.config.role == Role::Server && !self.config.routing.egress {
+            self.routing.control_ready.load(Ordering::Acquire)
+        } else {
+            self.engine
+                .as_ref()
+                .is_some_and(|e| e.core_status().lifecycle == Lifecycle::Ready)
+                && self
+                    .routing
+                    .participant
+                    .as_ref()
+                    .is_some_and(|p| p.view.lock().unwrap().ready())
+        };
         if ready && self.lifecycle != "ready" && (self.helper.is_none() || self.helper_ready) {
             self.state("ready", None)?;
         } else if !ready && self.lifecycle == "ready" {
@@ -2351,6 +3099,12 @@ impl Actor {
         }
         self.cleanup_done = true;
         self.stop_proxy();
+        // This generation is terminal. Native socket release must not wait for
+        // an envelope/terminal quantum on a transport that can no longer own
+        // new work. Preserve API journal/response delivery and helper cleanup.
+        if let Some(engine) = self.engine.as_mut() {
+            engine.runtime.transport_lost();
+        }
         self.tun.take();
         self.packet_pending.take();
         self.ip.take();
@@ -2366,6 +3120,7 @@ impl Actor {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(|| Instant::now() + Duration::from_secs(3));
+        self.routing.fence();
         let mut result = Ok(());
         while !self.tcp.is_empty()
             || self
@@ -2426,7 +3181,7 @@ impl Actor {
             if self.helper_id == 0
                 && let Err(error) = self.helper_enqueue(
                     local_api::HelperOperation::Hello,
-                    json!({"api":1,"network":4}),
+                    json!({"api":1,"network":crate::NETWORK_VERSION}),
                     HelperKind::Hello,
                 )
             {
@@ -2452,6 +3207,7 @@ impl Actor {
                 result = Err(RuntimeFailure::Internal)
             }
         }
+        self.routing.shutdown(until).await;
         let mut engine = self.engine.take();
         let shutdown = async {
             if let Some(engine) = engine.as_mut() {
@@ -2552,17 +3308,21 @@ async fn connect_destination(
     host: String,
     port: u16,
     budget: Budget,
+    resolver_alive: Arc<AtomicBool>,
 ) -> Result<std::net::TcpStream, ApiError> {
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
     let addresses = if let Ok(address) = host.parse::<std::net::IpAddr>() {
         vec![std::net::SocketAddr::new(address, port)]
     } else {
-        let permit = resolver_slots()
-            .acquire_owned()
+        let permit = tokio::time::timeout_at(until, resolver_slots().acquire_owned())
             .await
+            .map_err(|_| ApiError::Timeout)?
             .map_err(|_| ApiError::Overloaded)?;
         let reservation = budget.reserve(65536, 1).map_err(|_| ApiError::Overloaded)?;
+        let worker = ResolverWorker::new(resolver_alive);
         // Permits and reservations live in the OS resolver task, not its cancelable waiter.
         let task = tokio::task::spawn_blocking(move || {
+            let _worker = worker;
             let _permit = permit;
             let _reservation = reservation;
             use std::net::ToSocketAddrs;
@@ -2580,7 +3340,7 @@ async fn connect_destination(
             }
             Ok(addresses)
         });
-        tokio::time::timeout(Duration::from_secs(5), task)
+        tokio::time::timeout_at(until, task)
             .await
             .map_err(|_| ApiError::Timeout)?
             .map_err(|_| ApiError::NetworkUnavailable)??
@@ -2594,7 +3354,6 @@ async fn connect_destination(
     {
         return Err(ApiError::Forbidden);
     }
-    let until = tokio::time::Instant::now() + Duration::from_secs(5);
     for address in addresses {
         if let Ok(Ok(socket)) = tokio::time::timeout_at(until, TcpStream::connect(address)).await {
             return socket.into_std().map_err(|_| ApiError::LocalSetupFailed);
@@ -2818,7 +3577,7 @@ mod tests {
             .unwrap();
         let budget = Budget::new(65536, 4);
         let request = Request::parse_json(
-            br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":4},"fd_count":0}"#,
+            br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":5},"fd_count":0}"#,
         )
         .unwrap();
         sender
@@ -2885,7 +3644,7 @@ mod tests {
         drop(observer);
         assert_eq!(
             handle.request_json(
-                br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":4},"fd_count":0}"#,
+                br#"{"v":1,"id":1,"op":"HELLO","args":{"api":1,"network":5},"fd_count":0}"#,
                 Some(duplicate)
             ),
             Err(RuntimeFailure::InvalidArgument)
@@ -2969,6 +3728,26 @@ mod tests {
         let slots = Arc::new(Semaphore::new(1));
         let permit = slots.clone().try_acquire_owned().unwrap();
         let reservation = budget.reserve(65536, 1).unwrap();
+        let alive = Arc::new(AtomicBool::new(false));
+        let liveness = ResolverWorker::new(alive.clone());
+        let key = RuntimeKey {
+            epoch: 1,
+            incarnation: 1,
+            stream: skvoz_core::StreamKey {
+                peer: PeerId(1),
+                stream_id: 7,
+            },
+        };
+        let mut owned = Connecting {
+            key,
+            future: Some(Box::pin(std::future::pending())),
+            host: "example.org".into(),
+            port: 443,
+            _reservation: Budget::new(1024, 4).reserve(1024, 4).unwrap(),
+            deadline: Instant::now() + Duration::from_secs(3),
+            resolver_alive: alive,
+            cancelled: false,
+        };
         let (started_send, started) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel();
         let (done_send, done) = std::sync::mpsc::channel();
@@ -2982,7 +3761,7 @@ mod tests {
                 let _reservation = reservation;
                 started_send.send(()).unwrap();
                 gate.recv().unwrap();
-                drop((_permit, _reservation));
+                drop((_permit, _reservation, liveness));
                 done_send.send(()).unwrap();
             });
             assert!(tokio::time::timeout(Duration::ZERO, worker).await.is_err());
@@ -2990,10 +3769,14 @@ mod tests {
         started.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(slots.clone().try_acquire_owned().is_err());
         assert_eq!(budget.usage().bytes, 65536);
+        assert!(owned.retain_owned(false));
+        assert!(owned.cancelled && owned.future.is_none());
+        assert_eq!(owned.key, key); // terminal proof keeps the exact old owner
         release.send(()).unwrap();
         done.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(slots.available_permits(), 1);
         assert_eq!(budget.usage(), crate::budget::Usage::default());
+        assert!(!owned.retain_owned(false));
         runtime.shutdown_background();
     }
     #[test]

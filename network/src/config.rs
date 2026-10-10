@@ -48,6 +48,20 @@ pub struct StartupConfig {
     pub network: NetworkConfig,
     #[serde(deserialize_with = "required_option")]
     pub server: Option<ServerConfig>,
+    pub routing: RoutingConfig,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfig {
+    pub egress: bool,
+    #[serde(deserialize_with = "required_option")]
+    pub authority: Option<AuthorityConfig>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityConfig {
+    pub core: CoreConfig,
+    pub registry: crate::routing::Registry,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +79,57 @@ pub struct CoreConfig {
     pub membership: String,
     pub allowed_peers: Vec<String>,
     pub initiate: Vec<String>,
+}
+impl CoreConfig {
+    pub fn validate(&self) -> Result<(), NetworkError> {
+        let c = self;
+        parse_peer(&c.peer_id)?;
+        if !c.url.starts_with("tls://")
+            || c.url.len() > 2048
+            || c.url.contains('@')
+            || c.username.is_empty()
+            || c.password.is_empty()
+            || c.username.len() > 4096
+            || c.password.len() > 4096
+            || c.namespace.len() > 256
+            || c.namespace.split('.').any(|t| {
+                t.is_empty()
+                    || t.len() > 64
+                    || t.bytes()
+                        .any(|b| !b.is_ascii_alphanumeric() && !b"_-".contains(&b))
+            })
+        {
+            return Err(NetworkError::InvalidConfiguration);
+        }
+        if c.tls_server_name.as_ref().is_some_and(|n| {
+            crate::Metadata::Tcp {
+                v: crate::NETWORK_VERSION,
+                host: n.clone(),
+                port: 443,
+            }
+            .encode()
+            .is_err()
+        }) {
+            return Err(NetworkError::InvalidConfiguration);
+        }
+        match (c.trust.as_str(), &c.ca_file) {
+            ("system", None) => {}
+            ("managed_ca", Some(path)) if path.is_absolute() => {}
+            _ => return Err(NetworkError::InvalidConfiguration),
+        }
+        if c.allowed_peers.len() > 128 || c.initiate.len() > 128 {
+            return Err(NetworkError::InvalidConfiguration);
+        }
+        for p in c.allowed_peers.iter().chain(&c.initiate) {
+            parse_peer(p)?;
+        }
+        if c.allowed_peers.iter().collect::<BTreeSet<_>>().len() != c.allowed_peers.len()
+            || c.initiate.iter().collect::<BTreeSet<_>>().len() != c.initiate.len()
+        {
+            return Err(NetworkError::InvalidConfiguration);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -232,7 +297,7 @@ impl Limits {
                 max_metadata: 512,
                 open_timeout_ms: 15000,
             },
-            max_peers: if role == Role::Server { 128 } else { 1 },
+            max_peers: if role == Role::Server { 128 } else { 8 },
             max_streams: self.core_streams,
             max_streams_per_peer: self.streams_per_peer,
             receive_budget: self.core_receive_bytes,
@@ -249,6 +314,7 @@ impl Limits {
             + 4 * (lanes + 1))
             * (65588 + 1024)
             + self.manager(role).max_peers * skvoz_core::TRANSPORT_DELIVERY_STATE_BYTES
+            + self.manager(role).max_peers * 2048
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,79 +577,52 @@ impl StartupConfig {
         Ok(config)
     }
     pub fn validate(&self) -> Result<(), NetworkError> {
-        if self.v != 1 {
+        if self.v != 2 {
             return Err(NetworkError::UnsupportedVersion);
         }
         self.network.validate(self.role)?;
         match (self.role, &self.server) {
-            (Role::Client, None) => {}
-            (Role::Server, Some(s)) => s.validate(&self.network)?,
+            (Role::Client, None) if !self.routing.egress && self.routing.authority.is_none() => {}
+            (Role::Server, Some(s)) if self.routing.egress => s.validate(&self.network)?,
+            (Role::Server, None)
+                if !self.routing.egress
+                    && self.routing.authority.is_some()
+                    && self.network.families.is_empty() => {}
             _ => return Err(NetworkError::InvalidConfiguration),
         }
         let c = &self.core;
+        c.validate()?;
         let id = parse_peer(&c.peer_id)?;
-        if !c.url.starts_with("tls://")
-            || c.url.len() > 2048
-            || c.url.contains('@')
-            || c.username.is_empty()
-            || c.password.is_empty()
-            || c.username.len() > 4096
-            || c.password.len() > 4096
-            || c.namespace.len() > 256
-            || c.namespace.split('.').any(|t| {
-                t.is_empty()
-                    || t.len() > 64
-                    || t.bytes()
-                        .any(|b| !b.is_ascii_alphanumeric() && !b"_-".contains(&b))
-            })
-        {
-            return Err(NetworkError::InvalidConfiguration);
-        }
-        if c.tls_server_name.as_ref().is_some_and(|n| {
-            crate::Metadata::Tcp {
-                v: crate::NETWORK_VERSION,
-                host: n.clone(),
-                port: 443,
-            }
-            .encode()
-            .is_err()
-        }) {
-            return Err(NetworkError::InvalidConfiguration);
-        }
-        match (c.trust.as_str(), &c.ca_file) {
-            ("system", None) => {}
-            ("managed_ca", Some(path)) if path.is_absolute() => {}
-            _ => return Err(NetworkError::InvalidConfiguration),
-        }
-        if c.allowed_peers.len() > 128 || c.initiate.len() > 128 {
-            return Err(NetworkError::InvalidConfiguration);
-        }
-        for p in c.allowed_peers.iter().chain(&c.initiate) {
-            parse_peer(p)?;
-        }
-        if c.allowed_peers.iter().collect::<BTreeSet<_>>().len() != c.allowed_peers.len()
-            || c.initiate.iter().collect::<BTreeSet<_>>().len() != c.initiate.len()
-        {
-            return Err(NetworkError::InvalidConfiguration);
-        }
         match self.role {
             Role::Client => {
-                if id == PeerId(0)
+                if !crate::routing::device_id(id.0)
                     || c.membership != "allowlist"
-                    || c.allowed_peers != ["0"]
-                    || c.initiate != ["0"]
-                {
-                    return Err(NetworkError::InvalidConfiguration);
-                }
-            }
-            Role::Server => {
-                if id != PeerId(0)
-                    || c.membership != "broker_authorized"
                     || !c.allowed_peers.is_empty()
                     || !c.initiate.is_empty()
                 {
                     return Err(NetworkError::InvalidConfiguration);
                 }
+            }
+            Role::Server => {
+                if (self.routing.egress && !crate::routing::node_id(id.0))
+                    || (!self.routing.egress && id != PeerId(0))
+                    || c.membership != "allowlist"
+                    || !c.allowed_peers.is_empty()
+                    || !c.initiate.is_empty()
+                {
+                    return Err(NetworkError::InvalidConfiguration);
+                }
+            }
+        }
+        if let Some(authority) = &self.routing.authority {
+            authority.registry.validate()?;
+            authority.core.validate()?;
+            if authority.core.peer_id != "0"
+                || authority.core.membership != "allowlist"
+                || !authority.core.allowed_peers.is_empty()
+                || !authority.core.initiate.is_empty()
+            {
+                return Err(NetworkError::InvalidConfiguration);
             }
         }
         Ok(())

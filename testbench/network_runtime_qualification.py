@@ -10,6 +10,8 @@ import sys
 import tarfile
 import tempfile
 import time
+from network_topology import standalone, users as topology_users
+from fixture_resources import block_device as fixture_block_device
 
 
 def qualify(root, settings, certificate_factory):
@@ -105,6 +107,7 @@ def qualify(root, settings, certificate_factory):
                 'deny':[], 'service_prefixes':[], 'lease_store':'/var/lib/skvoz-network/leases.json',
                 'server_addresses':[U+'.20',E+'.20',V+'::20'],
                 'management_endpoints':[{'address':U+'.20','protocol':6,'port':4222}]}
+            standalone(value, authority_password, [1, 2])
         return value
 
 
@@ -136,15 +139,19 @@ def qualify(root, settings, certificate_factory):
             (OUT/(role+'-container.log')).write_text(run('docker','logs',roles[role],check=False))
 
 
+    # Every fixture actor shares one physical CPU. Namespace-local platform
+    # tools have explicit extra caps; product helper/runtime assertions below
+    # still require NET_ADMIN-only and caps0 respectively.
+    block_device = fixture_block_device(ROOT)
+    io_device = os.stat(block_device).st_rdev
+    io_pair = f'{os.major(io_device)}:{os.minor(io_device)}'
+
     passwords=[secrets.token_hex(24) for _ in range(3)]
+    authority_password = secrets.token_hex(24)
     try:
         certificate_factory(OUT)
-        users=[]
         ns=f'skvoz.runtime.{TOKEN}.joint'
-        for peer,pw in enumerate(passwords):
-            pub = [f'{ns}.join.*.0',f'{ns}.lane.*.*.0.*.0.*'] if peer==0 else [f'{ns}.join.0.{peer}',f'{ns}.lane.0.*.{peer%8}.*.{peer}.*']
-            sub = [f'{ns}.join.0.*',f'{ns}.lane.0.*.*.*.*.*'] if peer==0 else [f'{ns}.join.{peer}.*',f'{ns}.lane.{peer}.*.*.*.*.*']
-            users.append({'user':f'p{peer}','password':pw,'permissions':{'publish':pub,'subscribe':sub}})
+        users = topology_users(ns, passwords, authority_password)
         private(OUT/'nats.json',{'port':4222,'http_port':8222,'max_payload':65588,'max_pending':4194304,
             'tls':{'cert_file':'/fixture/server.pem','key_file':'/fixture/server.key','ca_file':'/fixture/ca.pem','handshake_first':False},
             'authorization':{'users':users}})
@@ -157,12 +164,18 @@ def qualify(root, settings, certificate_factory):
             roles[role]=name
             net=networks[1] if role=='target' else networks[0]
             args=['docker','run','-d','--name',name,'--label','skvoz.joint='+TOKEN,'--pull=never','--network',net,'--ip',addr,
-                  '--user','0','--cap-drop','ALL','--security-opt','no-new-privileges:true','--memory','1g','--cpus','2','--pids-limit','128']
+                  '--user','0','--cap-drop','ALL','--security-opt','no-new-privileges:true',
+                  '--memory','512m' if role in ('server','client') else '128m',
+                  '--memory-swap','512m' if role in ('server','client') else '128m',
+                  '--cpu-period','100000','--cpu-quota','100000','--cpuset-cpus','0','--pids-limit','64',
+                  '--ulimit','core=0','--ulimit','nofile=8192:8192',
+                  '--device-read-bps',block_device+':7864320',
+                  '--device-write-bps',block_device+':2621440']
             if role!='target':
                 suffix={'broker':'2','server':'20','client':'10'}[role]
                 args += ['--ip6',U6+suffix]
             if role in ('server','client'):
-                for cap in ['NET_ADMIN','SETUID','SETGID','SETPCAP','CHOWN','NET_RAW','NET_BIND_SERVICE']:
+                for cap in ['NET_ADMIN','SETUID','SETGID','SETPCAP'] + (['NET_RAW','NET_BIND_SERVICE'] if role == 'client' else []):
                     args += ['--cap-add',cap]
                 args += ['--device','/dev/net/tun','--sysctl','net.ipv4.ipfrag_high_thresh=4194304','--sysctl','net.ipv4.ipfrag_time=15',
                     '--sysctl','net.ipv6.ip6frag_high_thresh=4194304','--sysctl','net.ipv6.ip6frag_time=15']
@@ -170,10 +183,25 @@ def qualify(root, settings, certificate_factory):
                 args += ['--sysctl','net.ipv4.ip_forward=1','--sysctl','net.ipv6.conf.all.forwarding=1',
                     '--sysctl','net.netfilter.nf_conntrack_frag6_timeout=15','--sysctl','net.netfilter.nf_conntrack_frag6_high_thresh=4194304']
             if role=='target':
-                args += ['--ip6',V+'::30','--cap-add','NET_ADMIN','--cap-add','NET_RAW']
+                args += ['--ip6',V+'::30','--cap-add','NET_ADMIN','--cap-add','NET_RAW','--cap-add','NET_BIND_SERVICE']
             args += ['skvoz-network:runtime-fixture']
             run(*args)
             containers.append(name)
+            actual = json.loads(exec_(role, 'python3', '-c',
+                'import json,pathlib,resource; p=pathlib.Path("/sys/fs/cgroup"); assert resource.getrlimit(resource.RLIMIT_CORE)==(0,0); assert not pathlib.Path("/var/run/docker.sock").exists(); print(json.dumps({k:(p/k).read_text().strip() for k in ["cpu.max","cpuset.cpus.effective","memory.max","memory.swap.max","pids.max","io.max"]}))'))
+            assert actual['cpu.max'] == '100000 100000' and actual['cpuset.cpus.effective'] == '0'
+            assert actual['memory.max'] == str((512 if role in ('server','client') else 128)*1024*1024)
+            assert actual['memory.swap.max'] == '0' and actual['pids.max'] == '64'
+            assert io_pair+' rbps=7864320 wbps=2621440' in actual['io.max']
+            inspected = json.loads(run('docker', 'inspect', name))[0]
+            host = inspected['HostConfig']
+            assert host['CpuQuota'] == host['CpuPeriod'] == 100000 and host['CpusetCpus'] == '0'
+            assert host['Memory'] == host['MemorySwap'] == int(actual['memory.max'])
+            assert host['PidsLimit'] == 64 and not host['Privileged'] and host['NetworkMode'] != 'host'
+            assert not any(mount['Destination'] == '/var/run/docker.sock' for mount in inspected['Mounts'])
+            results.append({'group': 'actual-fixture-resource-bound-'+role, 'status': 'passed', 'actual': actual,
+                'host': {key: host[key] for key in ['CpuQuota', 'CpuPeriod', 'CpusetCpus', 'Memory', 'MemorySwap', 'PidsLimit',
+                    'CapAdd', 'CapDrop', 'SecurityOpt', 'Privileged', 'BlkioDeviceReadBps', 'BlkioDeviceWriteBps']}})
             exec_(role,'mkdir','-p','/fixture')
             exec_(role,'chmod','0755','/fixture')
             if role in ('server','client'):
@@ -348,7 +376,7 @@ def qualify(root, settings, certificate_factory):
                 for policy, offered in [('require_all',[4,6]), ('auto',[6] if supported==[4] else [4])]:
                     request=json.dumps({'op':'start','broker':U+'.2','family_policy':policy,'families':offered})
                     rejected=json.loads(run('docker','exec','--user','10001:10001',roles['client'],'python3','/fixture/owner.py','command',request,check=False))
-                    assert rejected=={'ok':False,'error':'unsupported_family'}, rejected
+                    assert rejected=={'ok':False,'error':'START_IP: unsupported_family'}, rejected
                     assert 'skvoz0' not in exec_('client','ip','-j','address','show')
                     assert 'skvoz_network' not in exec_('client','nft','list','tables')
                     assert api('client','status')['mode']=='idle'

@@ -65,6 +65,7 @@ RSpec.describe 'Joint Rust network server', integration: true do
     @server.command('remove', 'slow')
     expect(credentials_work(@server, 'slow', JSON.parse(first.profile.read).fetch('core').fetch('password'))).to be(false)
     expect(transfer(victim.path, echo.port, 'after-revoke')).to eq('after-fin:ekover-retfa')
+    first.wait_for_termination
   end
 
   it 'requires a fresh application process after runtime death and retains committed users' do
@@ -76,8 +77,43 @@ RSpec.describe 'Joint Rust network server', integration: true do
     Process.kill('KILL', runtime)
     wait_until { process_dead(@server.process) }
     @server.stop(kill: true)
+    log = @server.log.read
+    expect(log).to include('"event":"supervised_exit","failure":"network_signal_9"')
+    expect(log).to include('"failure":"network_signal_9"')
+    expect(log).not_to include(users.fetch('password'))
     @server.start
     expect(@server.command('show', 'persistent')['devices']).to include(users.fetch('peer_id'))
     expect(@server.command('health')['healthy']).to be(true)
+  end
+
+  def control_owner(mode)
+    runtime = @directory.join(mode + '-runtime')
+    FileUtils.cp(Pathname.new(__dir__).join('fixtures/control_owner.rb'), runtime)
+    runtime.chmod(0o700)
+    @server = ServerSystem::Server.new(@directory, overrides: { 'runtime_binary' => runtime.to_s })
+    Integer(@server.state.join('control-owner.pid').read)
+  end
+
+  it 'records the actual child signal when control EOF precedes the child exit status' do
+    runtime = control_owner('delayed-sigkill')
+    Process.kill('USR1', runtime)
+    wait_until(timeout: 3) { process_dead(@server.process) }
+    @server.stop(kill: true)
+    expect(@server.log.read).to include('"event":"supervised_exit","failure":"network_signal_9"')
+    expect(@server.log.read).to include('"event":"runtime_fatal","stage":"running","failure":"network_signal_9"')
+    expect(process_dead(runtime)).to be(true)
+  end
+
+  it 'promptly stops a live owner after EOF or malformed control without inventing a child-death cause' do
+    %w[live-eof malformed].each do |mode|
+      runtime = control_owner(mode)
+      Process.kill('USR1', runtime)
+      wait_until(timeout: 3) { process_dead(@server.process) }
+      @server.stop(kill: true)
+      expect(@server.log.read).to include('"event":"runtime_fatal","stage":"running","failure":"runtime_control_failed"')
+      expect(@server.log.read).not_to include('"event":"supervised_exit"')
+      expect(process_dead(runtime)).to be(true)
+      @server.close
+    end
   end
 end

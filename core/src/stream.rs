@@ -598,9 +598,13 @@ impl Stream {
         Ok(())
     }
 
-    pub(crate) fn next_frame_size(&self) -> Option<(usize, bool)> {
+    pub(crate) fn has_pending_open(&self) -> bool {
+        self.terminal_frame.is_none() && matches!(self.handshake_frame, Some(Frame::Open { .. }))
+    }
+
+    pub(crate) fn next_frame_size_for(&self, stream_id: u64) -> Option<(usize, bool)> {
         let describe = |frame: &Frame| {
-            crate::wire::encoded_size(2, frame)
+            crate::wire::encoded_size(stream_id, frame)
                 .ok()
                 .map(|size| (size, matches!(frame, Frame::Data { .. })))
         };
@@ -626,6 +630,42 @@ impl Stream {
         }
         self.fin_frame
             .and_then(|final_offset| describe(&Frame::Fin { final_offset }))
+    }
+
+    pub(crate) fn transport_demand(
+        &self,
+        stream_id: u64,
+        overhead: usize,
+        maximum: usize,
+    ) -> usize {
+        let weight = |frame: &Frame| {
+            crate::wire::encoded_size(stream_id, frame)
+                .unwrap_or(maximum)
+                .saturating_add(overhead)
+        };
+        if let Some(frame) = self.terminal_frame.as_ref() {
+            return weight(frame).min(maximum);
+        }
+        let mut bytes = self.handshake_frame.as_ref().map_or(0, weight);
+        if let Some((limit, probe)) = self.grant_frame {
+            bytes = bytes.saturating_add(weight(&Frame::WindowGrant {
+                consumed: self.consumed,
+                limit,
+                probe,
+            }));
+        } else if let Some(consumed) = self.credit_frame {
+            bytes = bytes.saturating_add(weight(&Frame::WindowUpdate { consumed }));
+        }
+        for frame in &self.outgoing_data {
+            if bytes >= maximum {
+                break;
+            }
+            bytes = bytes.saturating_add(weight(frame));
+        }
+        if let Some(final_offset) = self.fin_frame {
+            bytes = bytes.saturating_add(weight(&Frame::Fin { final_offset }));
+        }
+        bytes.min(maximum)
     }
     fn next_frame(&mut self) -> Option<Frame> {
         if let Some(frame) = self.terminal_frame.take() {

@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return Err("invalid arguments".into());
                 }
-                println!("skvoz-network-runtime 0.4.2 network=4 api=1 core=4.0.1");
+                println!("skvoz-network-runtime 0.5.0 network=5 api=1 core=4.1.0");
                 return Ok(());
             }
             "--help" => {
@@ -72,6 +72,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) if closed_owner(&e, &channel)? => break,
             Err(e) => return Err(e.into()),
         }
         // Drain a bounded batch before sleeping. One record per 2ms artificially
@@ -91,6 +92,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             match channel.try_flush() {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if closed_owner(&e, &channel)? => break 'owner,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -105,4 +107,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .shutdown()
         .map_err(|e| format!("shutdown failed: {e:?}"))?;
     Ok(())
+}
+
+// An owner may close immediately after the shutdown reply, while final state
+// records remain queued. Confirm peer closure before treating a write/reset as
+// EOF; cleanup still runs and any cleanup failure remains an error.
+fn closed_owner(error: &io::Error, channel: &IncrementalUnix) -> io::Result<bool> {
+    Ok(matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ) && skvoz_network_native::owner_closed(channel.as_fd())?)
 }

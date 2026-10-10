@@ -90,6 +90,7 @@ pub enum Operation {
     LocalReady,
     StopIp,
     PrepareShutdown,
+    UpdateRegistry,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +151,52 @@ pub struct Counters {
     pub buffer_bytes: u64,
     pub buffer_records: u64,
     pub errors: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingStatus {
+    pub control_ready: bool,
+    pub eligible_exits: u8,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusSession {
+    pub handle: SessionId,
+    pub state: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeStatus {
+    pub lifecycle: String,
+    pub mode: String,
+    #[serde(deserialize_with = "required_option")]
+    pub session: Option<StatusSession>,
+    pub counters: Counters,
+    pub routing: RoutingStatus,
+}
+impl RuntimeStatus {
+    pub fn validate(&self) -> Result<(), NetworkError> {
+        if !matches!(
+            self.lifecycle.as_str(),
+            "starting" | "ready" | "closing" | "closed"
+        ) || !matches!(self.mode.as_str(), "idle" | "proxy" | "ip" | "server")
+            || self.routing.eligible_exits > 8
+            || self.session.as_ref().is_some_and(|session| {
+                !matches!(
+                    session.state.as_str(),
+                    "negotiating"
+                        | "preparing"
+                        | "awaiting_active"
+                        | "active"
+                        | "closing"
+                        | "closed"
+                )
+            })
+        {
+            return Err(NetworkError::InvalidMetadata);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -249,12 +296,23 @@ impl Request {
         match self.op {
             Operation::Hello => {
                 let a: HelloArgs = arguments(&self.args)?;
-                if a.api != 1 || a.network != 4 {
+                if a.api != 1 || a.network != crate::NETWORK_VERSION {
                     return Err(NetworkError::UnsupportedVersion);
                 }
             }
             Operation::Status | Operation::StopProxy | Operation::PrepareShutdown => {
                 let _: EmptyArgs = arguments(&self.args)?;
+            }
+            Operation::UpdateRegistry => {
+                let registry: crate::routing::Registry = arguments(&self.args)?;
+                registry.validate()?;
+                if serde_json::to_vec(&registry)
+                    .map_err(|_| NetworkError::InvalidRecord)?
+                    .len()
+                    > 16384
+                {
+                    return Err(NetworkError::InvalidRecord);
+                }
             }
             Operation::StartProxy => {
                 let a: ProxyArgs = arguments(&self.args)?;
@@ -445,7 +503,7 @@ impl HelperRequest {
         match self.op {
             HelperOperation::Hello => {
                 let a: HelloArgs = arguments(&self.args)?;
-                if a.api != 1 || a.network != 4 {
+                if a.api != 1 || a.network != crate::NETWORK_VERSION {
                     return Err(NetworkError::UnsupportedVersion);
                 }
             }

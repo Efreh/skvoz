@@ -20,7 +20,9 @@ use crate::message::OutboundMessage;
 use crate::subject::ToSubject;
 use crate::ServerInfo;
 
-use super::{header::HeaderMap, status::StatusCode, Command, Message, Subscriber};
+use super::{
+    header::HeaderMap, status::StatusCode, Command, Message, Subscriber, SubscriptionHandle,
+};
 use crate::error::Error;
 use bytes::Bytes;
 use futures_util::future::TryFutureExt;
@@ -817,6 +819,37 @@ impl Client {
         Ok(Subscriber::new(sid, self.sender.clone(), receiver))
     }
 
+    /// Register one subject into an existing bounded message channel.
+    ///
+    /// Multiple disjoint subjects may share a channel without allocating a queue
+    /// per subject. The caller owns its receiver and aggregate capacity. Dropping
+    /// the returned handle unsubscribes only this subject, never the channel.
+    /// The handle exists before enqueue, including cancellation on a full command
+    /// queue. Flush the client when registration must precede remote publication.
+    pub async fn subscribe_into<S: ToSubject>(
+        &self,
+        subject: S,
+        sender: mpsc::Sender<Message>,
+    ) -> Result<SubscriptionHandle, SubscribeError> {
+        let subject = self
+            .validate_subscribe_subject(subject)
+            .map_err(|e| SubscribeError::with_source(SubscribeErrorKind::InvalidSubject, e))?;
+        if sender.is_closed() {
+            return Err(SubscribeError::new(SubscribeErrorKind::Other));
+        }
+        let sid = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
+        let handle = SubscriptionHandle::new(sid, self.sender.clone());
+        self.sender
+            .send(Command::Subscribe {
+                sid,
+                subject,
+                queue_group: None,
+                sender,
+            })
+            .await?;
+        Ok(handle)
+    }
+
     /// Subscribes to a subject with a queue group to receive [messages][Message].
     ///
     /// Returns an error if the subject is invalid (empty, contains whitespace,
@@ -888,6 +921,20 @@ impl Client {
         rx.await
             .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?;
         Ok(())
+    }
+
+    /// Wait for the broker PONG following all earlier commands on this
+    /// connection. Unlike `flush`, this is a protocol processing barrier.
+    /// Only one barrier may be outstanding. Disconnection fails it instead
+    /// of transferring the observer to a replacement connection.
+    pub async fn broker_barrier(&self) -> Result<(), FlushError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Command::BrokerBarrier { observer: tx })
+            .await
+            .map_err(|err| FlushError::with_source(FlushErrorKind::SendError, err))?;
+        rx.await
+            .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))
     }
 
     /// Drains all subscriptions, stops any new messages from being published, and flushes any remaining

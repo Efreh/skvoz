@@ -44,25 +44,38 @@ module Skvoz
         prune_tls(preserve_candidate: true)
         bootstrap_tls
         start_runtime
-        while !@stopping && children_alive?
+        while !@stopping
+          if @applying
+            task.sleep(0.05)
+            next
+          end
+          raise Error, 'Supervised process exited; container restart required' unless children_alive?
+          raise Error, 'Node credentials changed; container restart required' if @restart_required
           @connector.refresh
           raise Error, 'Runtime control lost' if @connector.failure
-          unless @enrollment&.ready?
+          if @config.control? && !@enrollment&.ready?
             @enrollment&.stop(graceful: true)
             start_enrollment
           end
-          @healthy = @tls.valid? && @failure.nil? && @connector.ready? && @enrollment&.ready?
+          @healthy = @tls.valid? && @failure.nil? && @connector.ready? && (!@config.control? || @enrollment&.ready?)
           raise Error, 'TLS certificate expired' unless @tls.valid?
-          renew if @config.tls['mode'] == 'acme' && @tls.renewal_due? && Time.now >= (@next_renewal || Time.at(0))
+          renew if %w[acme local].include?(@config.tls['mode']) && @tls.renewal_due? && Time.now >= (@next_renewal || Time.at(0))
           task.sleep(0.25)
         end
         raise Error, 'Supervised process exited; container restart required' unless @stopping
       rescue StandardError => error
-        @failure ||= 'runtime_fatal'
+        @healthy = false
+        shutdown_deadline = monotonic + @config['stop_timeout']
+        if @runtime && @connector&.owner_eof? && @connector.failure == 'runtime_control_failed'
+          # EOF can precede waitpid status; leave the remaining stop budget for cleanup.
+          @runtime.await_exit([monotonic + 0.25, shutdown_deadline - 0.25].min)
+        end
+        children_alive?
+        @failure ||= @connector&.failure || 'runtime_fatal'
         Diagnostics.emit('runtime_fatal', stage: @runtime_stage, failure: @failure, **Diagnostics.error_fields(error))
         raise
       ensure
-        shutdown
+        shutdown(shutdown_deadline || monotonic + @config['stop_timeout'])
       end
 
       def stop
@@ -71,14 +84,21 @@ module Skvoz
       end
 
       def healthy?
-        @healthy && !@failure && !@stopping && @tls&.valid? && children_alive? && @connector&.ready? && @enrollment&.ready?
+        @healthy && !@failure && !@stopping && @tls&.valid? && children_alive? && @connector&.ready? && (!@config.control? || @enrollment&.ready?)
       end
 
       private
 
       def bootstrap_tls
         candidate = @state.candidate
-        if @config.tls['mode'] == 'provided'
+        if @config.tls['mode'] == 'local'
+          if candidate['tls']
+            @tls = material_from(candidate['tls'])
+            renew(initial: true) if @tls.renewal_due?
+          else
+            renew(initial: true)
+          end
+        elsif @config.tls['mode'] == 'provided'
           input = @config.tls
           generation = File.join(@state.directory, 'tls-' + SecureRandom.hex(8))
           PrivateFiles.create_directory(generation)
@@ -109,6 +129,7 @@ module Skvoz
       end
 
       def issue_material
+        return LocalCertificateIssuer.issue(@state.directory, @config['address']) if @config.tls['mode'] == 'local'
         config_path = File.join(@state.directory, 'issuer.json')
         result_path = File.join(@state.directory, 'issuer-result.json')
         PrivateFiles.write(config_path, JSON.generate(@config.tls))
@@ -160,7 +181,7 @@ module Skvoz
         renew(initial: true) unless @tls.valid?
         @runtime_stage = 'binary_validation'
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
-        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.4.2 network=4 api=1 core=4.0.1')
+        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.5.0 network=5 api=1 core=4.1.0')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         @runtime_stage = 'nats_validation'
@@ -194,7 +215,7 @@ module Skvoz
         @connector = RuntimeControl.new(control).start(@task)
         wait_ready { @connector.refresh; @connector.ready? }
         @runtime_stage = 'enrollment_start'
-        start_enrollment
+        start_enrollment if @config.control?
         @failure = nil
         clear_candidate
         prune_tls
@@ -215,7 +236,7 @@ module Skvoz
             raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
             candidate, id = @state.enroll(login, token)
             apply(candidate) if candidate
-            { v: 2, namespace: @config['namespace'], peer_id: id, network_runtime: { network: 4, api: 1, version: '0.4.2', core: '4.0.1' } }
+            { v: 3, namespace: @config['namespace'], peer_id: id, network_runtime: State::VERSIONS }
           end
         end.start(@task)
       end
@@ -314,6 +335,7 @@ module Skvoz
           raise Error, 'NATS old credential remains active' unless revoked
         end
         @state.commit(candidate)
+        @connector.request('UPDATE_REGISTRY', @state.registry) if @config.control? && @connector
         @failure = nil
         @healthy = @connector&.ready? && @tls.valid?
         true
@@ -385,7 +407,15 @@ module Skvoz
         end
         result = Async::Task.current.with_timeout(15) { @mutation.acquire { command(request) } }
         Async::Task.current.with_timeout(2) { socket.write(JSON.generate('ok' => true, 'result' => result) + "\n") }
+        if @restart_after_admin
+          @restart_required = true
+          @applying = false
+        end
       rescue StandardError => error
+        if @restart_after_admin
+          @restart_required = true
+          @applying = false
+        end
         Diagnostics.emit('administration_failed', **Diagnostics.error_fields(error))
         socket.write(JSON.generate('ok' => false, 'error' => 'Administration request failed') + "\n") rescue nil
       ensure
@@ -393,16 +423,44 @@ module Skvoz
       end
 
       def command(request)
-        raise Error, 'Invalid administration schema' unless request.is_a?(Hash) && (request.keys - %w[operation login password]).empty?
+        raise Error, 'Invalid administration schema' unless request.is_a?(Hash) && (request.keys - %w[operation login password identity]).empty?
         operation = request['operation']
-        raise Error, 'Invalid administration operation' unless %w[health list show add device-add reset-password remove].include?(operation)
+        raise Error, 'Invalid administration operation' unless %w[health list show add device-add reset-password remove node-add node-list node-show node-rotate node-revoke].include?(operation)
         raise Error, 'Invalid administration login type' unless request['login'].nil? || request['login'].is_a?(String)
         raise Error, 'Invalid administration password' unless request['password'].nil? || request['password'].is_a?(String)
-        unless %w[health list].include?(operation)
+        unless %w[health list node-add node-list node-show node-rotate node-revoke].include?(operation)
           raise Error, 'Invalid administration login' unless request['login'].is_a?(String) && request['login'].match?(State::LOGIN)
         end
         return { 'healthy' => healthy?, 'revision' => @state.revision, 'failure' => @failure, 'connector' => @connector&.statistics } if operation == 'health'
         raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
+        if operation.start_with?('node-')
+          raise Error, 'Node administration requires control component' unless @config.control?
+          return @state.value.fetch('nodes').map { |identity, node| { 'identity' => identity, 'node_id' => node.fetch('node_id') } } if operation == 'node-list'
+          if operation == 'node-show'
+            identity = request['identity']
+            raise Error, 'Invalid node identity' unless identity.is_a?(String) && identity.match?(/\A[0-9a-f]{32}\z/)
+            node = @state.value.fetch('nodes').fetch(identity) { raise Error, 'Node does not exist' }
+            return { 'identity' => identity, 'node_id' => node.fetch('node_id'), 'address' => @config['address'], 'port' => @config['advertised_leaf_port'] }
+          end
+          candidate, result = @state.mutate_node(operation, request['identity'])
+          if operation == 'node-add'
+            apply(candidate)
+          else
+            path = File.join(@state.directory, 'candidate.conf')
+            PrivateFiles.write(path, @state.nats_config(candidate))
+            validate_nats(path)
+            @applying = true
+            @healthy = false
+            @state.commit(candidate)
+            # Once durable credentials change, every failure must close this
+            # generation; a failed stop must never resume the old broker.
+            @restart_after_admin = true
+            @nats.stop(monotonic + 5)
+            raise Error, 'Broker revoke closure unconfirmed' if @nats.alive?
+          end
+          return result
+        end
+        raise Error, 'Client administration requires control component' unless @config.control?
         return @state.value.fetch('users').map { |login, user| { 'login' => login, 'devices' => user.fetch('assigned').length, 'capacity' => user.fetch('ids').length } } if operation == 'list'
         login = request.fetch('login')
         if operation == 'show'
@@ -433,9 +491,31 @@ module Skvoz
           result = Process.waitpid2(@helper_pid, Process::WNOHANG)
           @helper_status = result.last if result
         end
-        @nats&.alive? && (@runtime.nil? || @runtime.alive?) && @helper_status.nil?
+        return false unless @nats
+        return child_failure(@nats.exit_category) unless @nats.alive?
+        return child_failure(@runtime.exit_category) if @runtime && !@runtime.alive?
+        if @helper_status
+          cause = if @helper_status == :reaped
+                    'helper_reaped'
+                  elsif @helper_status.signaled?
+                    "helper_signal_#{@helper_status.termsig}"
+                  else
+                    "helper_exit_#{@helper_status.exitstatus}"
+                  end
+          return child_failure(cause)
+        end
+        true
       rescue Errno::ECHILD
         @helper_status = :reaped
+        child_failure('helper_reaped')
+      end
+
+      def child_failure(cause)
+        unless @stopping || @failure
+          fixed = @connector&.failure
+          @failure = fixed && (fixed != 'runtime_control_failed' || !@connector.owner_eof?) ? fixed : cause
+          Diagnostics.emit('supervised_exit', failure: cause)
+        end
         false
       end
       def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -476,15 +556,14 @@ module Skvoz
         nil
       end
 
-      def shutdown
-        deadline = monotonic + @config['stop_timeout']
+      def shutdown(deadline)
         stop
         @listener&.close
         @enrollment&.stop
         begin
           @connector&.prepare_shutdown(timeout: [5, deadline - monotonic].min)
         rescue Error
-          @failure = 'network_shutdown_failed'
+          @failure ||= 'network_shutdown_failed'
         ensure
           @connector&.stop
         end

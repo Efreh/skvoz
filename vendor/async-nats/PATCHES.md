@@ -5,7 +5,7 @@
 revision `9b382a2a01b5404cd66bee6c2b4f0c82c9943063`.
 Лицензия Apache-2.0 сохранена в `LICENSE` из корня той же revision.
 
-Изменённые upstream файлы: `src/lib.rs`, `src/options.rs`, `src/connector.rs`, `src/connection.rs`.
+Изменённые upstream файлы: `src/lib.rs`, `src/client.rs`, `src/options.rs`, `src/connector.rs`, `src/connection.rs`.
 `ConnectOptions::subscription_backpressure_timeout` включает ограниченную
 обратную нагрузку: одна декодированная `Message` ожидает свободное место в
 подписке, последующие входящие операции остаются в сокете. Исходящие команды,
@@ -13,6 +13,20 @@ revision `9b382a2a01b5404cd66bee6c2b4f0c82c9943063`.
 соединение завершается; пропуск `Message` с продолжением передачи запрещён.
 По умолчанию поведение upstream не изменено. `NatsRuntime` включает этот режим
 с существующим I/O timeout; пользовательского параметра нет.
+
+`Client::subscribe_into` регистрирует обычный NATS SUB в уже существующий
+bounded `mpsc::Sender<Message>` и возвращает `SubscriptionHandle`. Несколько
+непересекающихся subjects используют одну очередь; ёмкость задаёт её владелец.
+Handle создаётся до ожидания enqueue, поэтому отмена регистрации не оставляет
+подписку без владельца. Explicit unsubscribe и Drop удаляют только свой SID,
+не закрывая общую очередь. При заполненной очереди команд Drop использует
+существующую асинхронную модель unsubscribe; обычные API Subscriber не меняются.
+Core применяет этот hook для буквального source ID в DATA/control подписках
+на прежнем shard-соединении. Проверки идентичности, generation и токена остаются;
+публикационные права, wire framing и окна не расширяются. На peer добавлены
+две конечные записи подписки, но не две очереди пакетов. При обновлении upstream
+нужно также проверить отмену enqueue, общую ёмкость, снятие одной подписки без
+закрытия другой и повторную регистрацию после reconnect.
 
 В режиме `raw_message_limit`, выбранном текущим Runtime, максимум тела
 65 588 байт устанавливается до первого INFO и сохраняется при TLS upgrade и
@@ -33,3 +47,16 @@ reconnect. MSG и управляющая строка ограничены 512 �
 duplex передачу и изоляцию потери shard. Корневой Cargo patch использует этот
 каталог; метаданные crate cache и тестовые зависимости upstream не входят в
 поставку.
+
+`Client::broker_barrier` добавляет отдельный PING/PONG barrier на текущем
+соединении, не меняя локальную семантику `flush`. Один observer и две checked
+ordinal-записи учитывают все клиентские PING, включая heartbeat и drain.
+Observer завершается только соответствующим PONG; disconnect удаляет его до
+reconnect, повторный concurrent barrier отклоняется. Отмена caller не создаёт
+дополнительных observer: прежний остаётся конечным до PONG или disconnect.
+Core использует этот barrier после exact-source UNSUB, продолжая driving
+существующие bounded входящие очереди, затем дожидается применения их
+захваченного конечного префикса перед повторным использованием receive credit.
+CONNECT handshake теперь явно потребляет свой PONG, обрабатывая предшествующие
+INFO/PING/+OK в пределах прежнего общего connect timeout. Это исключает
+подтверждение позднейшего barrier оставшимся handshake PONG.

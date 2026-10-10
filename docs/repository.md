@@ -74,9 +74,11 @@ Ubuntu — настольное приложение, Android — мобильн
 | Локальные владельцы и обслуживание Core | `daemon/src/driver.rs`, `endpoint.rs` |
 | Профиль демона и IPC | `daemon/src/config.rs`, `protocol.rs`, `daemon/tests/fixtures/` |
 | TCP/IP-сессии, native I/O и управление | `network/src/{engine,runtime,tcp,proxy,local_api,config,budget,policy}.rs` |
+| Назначение выхода, leases и admission | `network/src/routing.rs`, `network/src/routing/{state,transport}.rs` |
 | FD/TUN, gateway и C ABI | `network/native/`, `network/helper/`, `network/ffi/` |
 | Сервер: процессы, пользователи, TLS | `connectors/server/lib/skvoz/server/{service,process,state,tls,enrollment}.rb` |
 | Сервер: bootstrap, static policy и runtime control | `connectors/server/lib/skvoz/server/{bootstrap,network_configuration,runtime_control}.rb` |
+| Сервер: служебный join и состав одного образа | `connectors/server/lib/skvoz/server/node_join.rb`, `connectors/server/compose{,.entry,.exit}.yaml` |
 | Ubuntu: подключение, выделение устройства и настройки | `clients/ubuntu/src/{backend,enrollment,settings}.rs` |
 | Android: UI, lifecycle, storage, VpnService | `clients/android/app/src/main/java/org/skvoz/android/` |
 | Android: JNI, ABI builds, APK checks | `clients/android/native/`, `clients/android/tools/` |

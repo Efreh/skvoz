@@ -1,4 +1,4 @@
-//! Shared enrollment2 transport and strict current-component negotiation.
+//! Shared enrollment3 transport and strict current-component negotiation.
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::{path::PathBuf, time::Duration};
@@ -53,6 +53,7 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         .ignore_discovered_servers()
         .client_capacity(8)
         .subscription_capacity(8)
+        .raw_message_limit(512)
         .custom_inbox_prefix(format!("skvoz.enroll.reply.{}", credentials.username));
         if !credentials.ca_file.is_empty() {
             options = options.add_root_certificates(PathBuf::from(&credentials.ca_file));
@@ -128,11 +129,11 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             .flush()
             .await
             .map_err(|_| Error("enrollment_failed"))?;
-        let body = serde_json::to_vec(&serde_json::json!({"v":2,"device":device}))
+        let body = serde_json::to_vec(&serde_json::json!({"v":3,"device":device}))
             .map_err(|_| Error("enrollment_failed"))?;
         client
             .publish_with_reply(
-                format!("skvoz.enroll.v2.{}", credentials.username),
+                format!("skvoz.enroll.v3.{}", credentials.username),
                 reply,
                 body.into(),
             )
@@ -158,15 +159,15 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         }
         let result: Enrollment =
             serde_json::from_value(value).map_err(|_| Error("version_mismatch"))?;
-        if result.v != 2
+        if result.v != 3
             || result.network_runtime.version != env!("CARGO_PKG_VERSION")
             || result.network_runtime.api != 1
-            || result.network_runtime.network != 4
-            || result.network_runtime.core != "4.0.1"
+            || result.network_runtime.network != crate::NETWORK_VERSION
+            || result.network_runtime.core != "4.1.0"
         {
             return Err(Error("version_mismatch"));
         }
-        if result.peer_id == 0
+        if !crate::routing::device_id(result.peer_id)
             || result.namespace.len() > 256
             || result.namespace.split('.').any(|part| {
                 part.is_empty()

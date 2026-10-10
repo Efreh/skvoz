@@ -173,7 +173,7 @@ async fn configuration(profile: Profile) -> Result<StartupConfig> {
     .await
     .map_err(|_| Failure("server_unavailable"))??;
     let config = StartupConfig {
-        v: 1,
+        v: 2,
         role: Role::Client,
         core: CoreConfig {
             url: format!("tls://{}", SocketAddr::new(ip, profile.port)),
@@ -189,8 +189,8 @@ async fn configuration(profile: Profile) -> Result<StartupConfig> {
             namespace: enrollment.namespace,
             peer_id: enrollment.peer_id.to_string(),
             membership: "allowlist".into(),
-            allowed_peers: vec!["0".into()],
-            initiate: vec!["0".into()],
+            allowed_peers: vec![],
+            initiate: vec![],
         },
         network: NetworkConfig {
             families: vec![4, 6],
@@ -199,6 +199,10 @@ async fn configuration(profile: Profile) -> Result<StartupConfig> {
             limits: Limits::canonical(Role::Client),
         },
         server: None,
+        routing: skvoz_network::config::RoutingConfig {
+            egress: false,
+            authority: None,
+        },
     };
     config
         .validate()

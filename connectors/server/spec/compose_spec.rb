@@ -112,8 +112,10 @@ RSpec.describe 'Server deployment through Compose', compose: true do
 
         command.call('stop', '--timeout', '15')
         expect(JSON.parse(execute('docker', 'inspect', cid)).first.fetch('State').fetch('ExitCode')).to eq(0)
+        device.wait_for_termination
         command.call('up', '-d', '--pull', 'never')
         wait_until(timeout: 30, &health)
+        device.restart
         wait_until { device_ready(device.path) }
         expect(admin.call('list')).to eq(users)
         expect(transfer(device.path, target.port, 'recreate', host: 'host.docker.internal')).to eq('after-fin:etaercer')
@@ -123,7 +125,9 @@ RSpec.describe 'Server deployment through Compose', compose: true do
         execute('docker', 'exec', '--user', '10001:10001', cid, 'ruby', '-rjson', '-e',
                 'owner = JSON.parse(File.read("/var/lib/skvoz/admin-owner.json")).fetch("pid"); children = File.read("/proc/#{owner}/task/#{owner}/children").split.map(&:to_i); runtime = children.find { |pid| File.read("/proc/#{pid}/comm").strip == "skvoz-network-r" }; abort "Runtime child missing" unless runtime && runtime != 1; Process.kill("KILL", runtime)')
         wait_until(timeout: 10) { old_pids.all? { |pid| process_dead(pid) } }
+        device.wait_for_termination
         wait_until(timeout: 30, &health)
+        device.restart
         wait_until { device_ready(device.path) }
         expect(admin.call('list')).to eq(users)
         expect(transfer(device.path, target.port, 'kill', host: 'host.docker.internal')).to eq('after-fin:llik')

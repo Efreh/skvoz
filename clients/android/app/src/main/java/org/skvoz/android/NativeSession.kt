@@ -45,9 +45,9 @@ internal class NativeSession(config: String, private val onEvent: (JsonObject) -
         throw ClientFailure("timeout")
     }
     suspend fun hello() {
-        val hello = call("HELLO", buildJsonObject { put("api", 1); put("network", 4) }).jsonObject
+        val hello = call("HELLO", buildJsonObject { put("api", 1); put("network", 5) }).jsonObject
         val cap = hello["capabilities"]?.jsonObject ?: throw ClientFailure("version_mismatch")
-        if (hello["api"]?.jsonPrimitive?.intOrNull != 1 || hello["network"]?.jsonPrimitive?.intOrNull != 4 ||
+        if (hello["api"]?.jsonPrimitive?.intOrNull != 1 || hello["network"]?.jsonPrimitive?.intOrNull != 5 ||
             hello["role"]?.jsonPrimitive?.content != "client" ||
             cap["profiles"] != buildJsonArray { add("tcp"); add("ip") } ||
             cap["families"] != buildJsonArray { add(4); add(6) } ||

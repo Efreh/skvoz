@@ -24,14 +24,16 @@ module Skvoz
         @callers = 0
         @ready = false
         @closed = false
+        @owner_eof = false
         @counters = {}
+        @routing = { 'control_ready' => false, 'eligible_exits' => 0 }
         @seq = 0
       end
 
       def start(task)
         @reader = task.async { reader }
-        hello = request('HELLO', { 'api' => 1, 'network' => 4 })
-        raise Error, 'Incompatible runtime HELLO' unless hello.is_a?(Hash) && hello.keys.sort == %w[api capabilities network role] && hello['api'].is_a?(Integer) && hello['api'] == 1 && hello['network'].is_a?(Integer) && hello['network'] == 4 && hello['role'] == 'server' && capabilities?(hello['capabilities'])
+        hello = request('HELLO', { 'api' => 1, 'network' => 5 })
+        raise Error, 'Incompatible runtime HELLO' unless hello.is_a?(Hash) && hello.keys.sort == %w[api capabilities network role] && hello['api'].is_a?(Integer) && hello['api'] == 1 && hello['network'].is_a?(Integer) && hello['network'] == 5 && hello['role'] == 'server' && capabilities?(hello['capabilities'])
         self
       rescue StandardError
         close
@@ -70,11 +72,15 @@ module Skvoz
       end
 
       def ready? = @ready && !@closed
-      def statistics = @counters
+      def owner_eof? = @owner_eof
+      def statistics = @counters.merge('routing' => @routing)
 
       def refresh
         value = request('STATUS')
-        raise Error, 'Invalid runtime STATUS' unless value.is_a?(Hash) && value.keys.sort == %w[counters lifecycle mode session] && LIFECYCLE.include?(value['lifecycle']) && value['mode'] == 'server' && value['session'].nil?
+        raise Error, 'Invalid runtime STATUS' unless value.is_a?(Hash) && value.keys.sort == %w[counters lifecycle mode routing session] && LIFECYCLE.include?(value['lifecycle']) && value['mode'] == 'server' && value['session'].nil?
+        routing = value['routing']
+        raise Error, 'Invalid runtime routing status' unless routing.is_a?(Hash) && routing.keys.sort == %w[control_ready eligible_exits] && [true, false].include?(routing['control_ready']) && routing['eligible_exits'].is_a?(Integer) && routing['eligible_exits'].between?(0, 8)
+        @routing = routing
         @ready = value['lifecycle'] == 'ready'
         @counters = counters(value['counters'])
         value
@@ -96,14 +102,20 @@ module Skvoz
             @socket.wait_readable
             next
           end
+          owner_eof! if message.nil?
           data, _address, flags, *rights = message
           received = rights.flat_map { |right| right.unix_rights || [] }
           received.each(&:close)
           raise Error, 'Unexpected runtime descriptors' unless received.empty? && rights.empty? && flags & Socket::MSG_CTRUNC == 0
-          raise Error, 'Runtime control EOF' if data.empty?
+          owner_eof! if data.empty?
           bytes << data
         end
         bytes
+      end
+
+      def owner_eof!
+        @owner_eof = true
+        raise Error, 'Runtime control EOF'
       end
 
       def reader
@@ -128,6 +140,10 @@ module Skvoz
             when 'RUNTIME_STATE'
               raise Error, 'Invalid runtime state event' unless value['data'].keys.sort == %w[error state] && LIFECYCLE.include?(value['data']['state']) && valid_error?(value['data']['error'])
               @ready = value['data']['state'] == 'ready'
+              if value['data']['error'] && !@failure
+                @failure = 'runtime_' + value['data']['error']
+                Diagnostics.emit('runtime_state_failed', state: value['data']['state'], failure: @failure)
+              end
             when 'STATS'
               raise Error, 'Invalid runtime statistics event' unless value['data'].keys == ['counters']
               @counters = counters(value['data'].fetch('counters'))
@@ -137,7 +153,7 @@ module Skvoz
           end
         end
       rescue StandardError => error
-        @failure = 'runtime_control_failed'
+        @failure ||= 'runtime_control_failed'
         Diagnostics.emit('runtime_control_failed', **Diagnostics.error_fields(error)) unless @closed
         close
       end

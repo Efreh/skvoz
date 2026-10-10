@@ -2,7 +2,7 @@ use crate::{IpPrefix, NetworkError};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, net::IpAddr};
 
-pub const NETWORK_VERSION: u8 = 4;
+pub const NETWORK_VERSION: u8 = 5;
 pub const METADATA_MAX: usize = 512;
 pub const CONTROL_MAX: usize = 16384;
 pub const RECORD_HEADER: usize = 8;
@@ -66,6 +66,12 @@ impl From<SessionId> for String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum Metadata {
+    #[serde(rename = "assigned")]
+    Assigned {
+        v: u8,
+        admission: crate::routing::Admission,
+        target: Box<Metadata>,
+    },
     #[serde(rename = "tcp")]
     Tcp { v: u8, host: String, port: u16 },
     #[serde(rename = "ip-session")]
@@ -114,18 +120,36 @@ impl Metadata {
         if header.v != NETWORK_VERSION {
             return Err(NetworkError::UnsupportedVersion);
         }
-        if !matches!(header.kind.as_str(), "tcp" | "ip-session" | "ip-data") {
+        if !matches!(
+            header.kind.as_str(),
+            "tcp" | "ip-session" | "ip-data" | "assigned"
+        ) {
             return Err(NetworkError::UnsupportedType);
         }
         let mut value: Self =
             serde_json::from_slice(bytes).map_err(|_| NetworkError::InvalidMetadata)?;
         let v = match &value {
-            Self::Tcp { v, .. } | Self::IpSession { v, .. } | Self::IpData { v, .. } => *v,
+            Self::Tcp { v, .. }
+            | Self::IpSession { v, .. }
+            | Self::IpData { v, .. }
+            | Self::Assigned { v, .. } => *v,
         };
         if v != NETWORK_VERSION {
             return Err(NetworkError::UnsupportedVersion);
         }
         match &mut value {
+            Self::Assigned {
+                admission, target, ..
+            } => {
+                if admission.sequence == 0
+                    || crate::routing::epoch_number(&admission.authority) == 0
+                    || crate::routing::epoch_number(&admission.token) == 0
+                    || !matches!(target.as_ref(), Self::Tcp { .. } | Self::IpSession { .. })
+                {
+                    return Err(NetworkError::InvalidMetadata);
+                }
+                target.encode()?;
+            }
             Self::Tcp { host, port, .. } => {
                 if *port == 0 || !valid_host(host) {
                     return Err(NetworkError::InvalidMetadata);

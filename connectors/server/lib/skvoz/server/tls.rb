@@ -145,6 +145,57 @@ module Skvoz
       def serial = @leaf.serial.to_s
     end
 
+    # Private loopback TLS for egress-only nodes; no public ACME dependency.
+    class LocalCertificateIssuer
+      def self.issue(directory, identity)
+        ca_path, key_path = File.join(directory, 'local-ca.pem'), File.join(directory, 'local-ca-key.pem')
+        if File.exist?(ca_path) && File.exist?(key_path)
+          ca = OpenSSL::X509::Certificate.new(PrivateFiles.read(ca_path))
+          key = OpenSSL::PKey.read(PrivateFiles.read(key_path, maximum: 16384))
+          raise Error, 'Invalid local issuer' unless ca.check_private_key(key) && ca.not_after > Time.now + 86400
+        else
+          key = OpenSSL::PKey::EC.generate('prime256v1')
+          ca = certificate(identity: 'SKVOZ local node CA', key:, days: 3650)
+          extensions = OpenSSL::X509::ExtensionFactory.new(ca, ca)
+          ca.add_extension(extensions.create_extension('basicConstraints', 'CA:TRUE', true))
+          ca.add_extension(extensions.create_extension('keyUsage', 'keyCertSign,cRLSign', true))
+          ca.sign(key, OpenSSL::Digest.new('SHA256'))
+          PrivateFiles.write(ca_path, ca.to_pem)
+          PrivateFiles.write(key_path, key.private_to_pem)
+        end
+        leaf_key = OpenSSL::PKey::EC.generate('prime256v1')
+        leaf = certificate(identity:, key: leaf_key, days: 30)
+        leaf.issuer = ca.subject
+        extensions = OpenSSL::X509::ExtensionFactory.new(ca, leaf)
+        leaf.add_extension(extensions.create_extension('basicConstraints', 'CA:FALSE', true))
+        leaf.add_extension(extensions.create_extension('keyUsage', 'digitalSignature', true))
+        leaf.add_extension(extensions.create_extension('extendedKeyUsage', 'serverAuth'))
+        san = begin
+          IPAddr.new(identity)
+          "IP:#{identity}"
+        rescue IPAddr::InvalidAddressError
+          "DNS:#{identity}"
+        end
+        leaf.add_extension(extensions.create_extension('subjectAltName', san))
+        leaf.sign(key, OpenSSL::Digest.new('SHA256'))
+        generation = File.join(directory, 'tls-' + SecureRandom.hex(8))
+        PrivateFiles.create_directory(generation)
+        material = { 'certificate' => File.join(generation, 'certificate.pem'), 'key' => File.join(generation, 'key.pem'), 'ca' => ca_path }
+        PrivateFiles.write(material['certificate'], leaf.to_pem)
+        PrivateFiles.write(material['key'], leaf_key.private_to_pem)
+        material
+      end
+
+      def self.certificate(identity:, key:, days:)
+        value = OpenSSL::X509::Certificate.new
+        value.version, value.serial = 2, SecureRandom.random_number(1 << 128) + 1
+        value.subject = OpenSSL::X509::Name.new([['CN', identity]])
+        value.issuer, value.public_key = value.subject, key
+        value.not_before, value.not_after = Time.now - 60, Time.now + days * 86400
+        value
+      end
+    end
+
     class CertificateIssuer
       def initialize(config, state_dir)
         @config, @state_dir = config, state_dir

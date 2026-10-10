@@ -66,7 +66,7 @@ internal fun diagnosticSnapshot(raw: String): DiagnosticSnapshot {
 }
 // Explicit fields only: never stringify profile, raw events, exceptions or device state.
 internal fun diagnosticReport(state: ConnectionState, diagnostics: DiagnosticState): String = buildString {
-    appendLine("SKVOZ Android ${BuildConfig.VERSION_NAME}; runtime=0.4.2; API=1; network=4; Core=4.0.1")
+    appendLine("SKVOZ Android ${BuildConfig.VERSION_NAME}; runtime=0.5.0; API=1; network=5; Core=4.1.0")
     appendLine("phase=${journalCode(state.phase)}; error=${state.error?.let(::journalCode) ?: "none"}")
     BASIC_METRICS.forEach { key -> diagnostics.basic[key]?.let { appendLine("$key=$it") } }
     val detail = diagnostics.detail

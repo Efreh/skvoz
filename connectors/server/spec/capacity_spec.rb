@@ -24,10 +24,10 @@ RSpec.describe 'Server container TCP resources', integration: true, capacity: tr
           'lease_identities' => 1, 'core_receive_bytes' => 33554432, 'core_send_bytes' => 2097152,
           'runtime_buffer_bytes' => 100663296, 'runtime_buffer_records' => 16384)
         profile = directory.join("client#{index}.json")
-        private_json(profile, { v: 1, role: 'client', server: nil,
+        private_json(profile, { v: 2, role: 'client', server: nil, routing: { egress: false, authority: nil },
           core: { url: "tls://127.0.0.1:#{bundle.fetch('port')}", tls_server_name: bundle.fetch('address'), trust: 'managed_ca',
             ca_file: ca.to_s, username: bundle.fetch('username'), password: bundle.fetch('password'), namespace: bundle.fetch('namespace'),
-            peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: ['0'], initiate: ['0'] },
+            peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: [], initiate: [] },
           network: { families: [4], max_mtu: 1400, channels: 1, limits: } })
         profile.to_s
       end

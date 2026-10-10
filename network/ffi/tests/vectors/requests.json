@@ -1,5 +1,5 @@
 [
-  {"name":"hello","valid":true,"json":"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":4},\"fd_count\":0}"},
+  {"name":"hello","valid":true,"json":"{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}"},
   {"name":"status","valid":true,"json":"{\"v\":1,\"id\":2,\"op\":\"STATUS\",\"args\":{},\"fd_count\":0}"},
   {"name":"open-tcp","valid":true,"json":"{\"v\":1,\"id\":3,\"op\":\"OPEN_TCP\",\"args\":{\"host\":\"127.0.0.1\",\"port\":8080},\"fd_count\":0}"},
   {"name":"api-only-proxy","valid":true,"json":"{\"v\":1,\"id\":4,\"op\":\"START_PROXY\",\"args\":{\"http_bind\":null,\"socks_bind\":null},\"fd_count\":0}"},
