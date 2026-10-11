@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#181A1D</color>
+    <color name="skvoz_notification_accent">#76D99C</color>
 </resources>

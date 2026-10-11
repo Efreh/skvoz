@@ -3,7 +3,6 @@ package org.skvoz.android
 import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.BitmapFactory
 import android.net.VpnService
 import android.os.Build
 import android.os.IBinder
@@ -29,7 +28,6 @@ internal class Foreground(private val service: Service, private val owner: Conne
     private val cadence = NotificationCadence()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val app get() = service.application as SkvozApplication
-    private val brandIcon by lazy { BitmapFactory.decodeResource(service.resources, R.drawable.skvoz_brand) }
     fun start() {
         val manager = service.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Соединение", NotificationManager.IMPORTANCE_DEFAULT).apply {
@@ -51,8 +49,8 @@ internal class Foreground(private val service: Service, private val owner: Conne
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val action = if (owner.alwaysOn) PendingIntent.getActivity(service, 1, Intent(AndroidSettings.ACTION_VPN_SETTINGS), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             else PendingIntent.getService(service, 1, Intent(service, service.javaClass).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        return NotificationCompat.Builder(service, CHANNEL).setSmallIcon(R.drawable.ic_connection)
-            .setLargeIcon(brandIcon)
+        return NotificationCompat.Builder(service, CHANNEL).setSmallIcon(R.drawable.ic_notification_skvoz)
+            .setColor(service.getColor(R.color.skvoz_notification_accent))
             .setContentTitle(content.title).setContentText(content.status).setContentIntent(open).setOngoing(true)
             .setStyle(NotificationCompat.BigTextStyle().bigText(content.expanded))
             .setOnlyAlertOnce(true).setSilent(true).setShowWhen(false).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
