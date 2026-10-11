@@ -28,6 +28,7 @@ internal fun errorText(code: String): String = when (code) {
     "empty_app_selection" -> "Для режима «Только выбранные» нужно выбрать приложение."
     "selected_app_missing" -> "Выбранное приложение удалено. Обновите список."
     "foreground_start_denied" -> "Android запретил запуск фонового соединения. Проверьте разрешения и настройки ВПН."
+    "background_execution_unavailable" -> "Android не разрешил поддерживать соединение при выключенном экране."
     "vpn_permission_required" -> "Нужно разрешение Android на ВПН."
     "notifications_denied" -> "Уведомления запрещены. Соединение видно в диспетчере активных приложений Android."
     "credential_key_missing", "credential_decrypt_failed", "credential_corrupt" -> "Сохранённый пароль не удалось расшифровать. Очистите данные приложения и настройте профиль заново."

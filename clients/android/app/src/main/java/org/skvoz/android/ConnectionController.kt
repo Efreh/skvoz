@@ -88,7 +88,7 @@ internal class ConnectionController(private val app: SkvozApplication) {
             while (currentCoroutineContext().isActive) {
                 try {
                     transition(if (attempt == 0) "preparing" else "reconnecting", owner)
-                    runAttempt(owner, signals, started) { attempt = 0 }
+                    withConnectionPower(app) { runAttempt(owner, signals, started) { attempt = 0 } }
                 } catch (cancel: CancellationException) { throw cancel }
                   catch (error: Exception) {
                     val code = failureCode(error)

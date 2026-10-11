@@ -88,6 +88,7 @@ private val JOURNAL_CODES = setOf(
     "server_unavailable", "network_unavailable", "runtime_lost", "timeout", "unsupported_version", "unsupported_family", "version_mismatch",
     "invalid_request", "invalid_state", "unknown_handle", "forbidden", "closed", "random_failed", "invalid_login", "invalid_password", "overloaded", "local_setup_failed", "permission_denied", "foreground_start_denied",
     "foreground_start_failed", "vpn_permission_required", "vpn_establish_failed", "selected_app_missing", "empty_app_selection",
+    "background_execution_unavailable",
     "invalid_address", "invalid_configuration", "invalid_settings", "unsupported_settings", "profile_incomplete", "mode_mismatch",
     "settings_read_failed", "settings_write_failed", "settings_budget_exceeded", "credential_key_missing", "credential_decrypt_failed",
     "credential_encrypt_failed", "credential_corrupt", "trusted_ca_unavailable", "trusted_ca_export_failed", "ca_budget_exceeded", "invalid_ca",
