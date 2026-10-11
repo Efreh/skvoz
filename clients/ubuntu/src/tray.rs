@@ -368,13 +368,8 @@ impl Tray {
         }
     }
 }
-fn icon(state: &str) -> &'static str {
-    match state {
-        "connected" => "network-transmit-receive-symbolic",
-        "connecting" | "reconnecting" => "network-idle-symbolic",
-        "error" => "network-error-symbolic",
-        _ => "network-offline-symbolic",
-    }
+fn icon(_state: &str) -> &'static str {
+    "org.skvoz.Client"
 }
 impl Drop for Tray {
     fn drop(&mut self) {

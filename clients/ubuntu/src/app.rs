@@ -31,6 +31,7 @@ pub fn run() -> glib::ExitCode {
     let view: Rc<RefCell<Option<Rc<View>>>> = Rc::new(RefCell::new(None));
     let existing = view.clone();
     app.connect_activate(move |app| {
+        gtk::Window::set_default_icon_name("org.skvoz.Client");
         if let Some(view) = existing.borrow().as_ref() {
             view.window.present();
             return;

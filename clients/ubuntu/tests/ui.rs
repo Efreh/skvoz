@@ -343,7 +343,7 @@ fn qualify_desktop(view: &std::rc::Rc<View>) {
             .unwrap()
             .get::<String>()
             .unwrap(),
-        "network-offline-symbolic"
+        "org.skvoz.Client"
     );
     // Re-registration after an indicator host restart uses the same item path.
     gio::bus_unown_name(owner);

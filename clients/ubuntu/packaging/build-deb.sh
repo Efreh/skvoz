@@ -15,7 +15,7 @@ mkdir -p "$output"
 stage=$(mktemp -d)
 chmod 755 "$stage"
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
-install -d "$stage/DEBIAN" "$stage/usr/lib/skvoz-client" "$stage/usr/bin" "$stage/usr/share/applications" "$stage/usr/share/icons/hicolor/scalable/apps" "$stage/usr/share/doc/skvoz-client"
+install -d "$stage/DEBIAN" "$stage/usr/lib/skvoz-client" "$stage/usr/bin" "$stage/usr/share/applications" "$stage/usr/share/doc/skvoz-client"
 install -m 755 "$runtime" "$stage/usr/lib/skvoz-client/skvoz-network-runtime"
 install -d "$stage/usr/libexec" "$stage/usr/lib/systemd/system" "$stage/usr/lib/tmpfiles.d" "$stage/usr/share/polkit-1/actions"
 install -m 755 "$helper" "$stage/usr/libexec/skvoz-network-helper"
@@ -27,7 +27,11 @@ install -m 755 "$root/clients/ubuntu/packaging/prerm" "$stage/DEBIAN/prerm"
 install -m 755 "$binary" "$stage/usr/lib/skvoz-client/skvoz-client"
 ln -s ../lib/skvoz-client/skvoz-client "$stage/usr/bin/skvoz-client"
 install -m 644 "$root/clients/ubuntu/packaging/org.skvoz.Client.desktop" "$stage/usr/share/applications/"
-install -m 644 "$root/clients/ubuntu/packaging/org.skvoz.Client.svg" "$stage/usr/share/icons/hicolor/scalable/apps/"
+for size in 16 24 32 48 64 96 128 256 512; do
+    icons="$stage/usr/share/icons/hicolor/${size}x${size}/apps"
+    install -d "$icons"
+    install -m 644 "$root/clients/ubuntu/assets/icons/$size.png" "$icons/org.skvoz.Client.png"
+done
 install -m 644 "$root/LICENSE" "$stage/usr/share/doc/skvoz-client/copyright"
 cat > "$stage/DEBIAN/control" <<CONTROL
 Package: skvoz-client

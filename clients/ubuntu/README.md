@@ -1,5 +1,7 @@
 # SKVOZ для Ubuntu
 
+<img src="../../assets/branding/skvoz-256.png" alt="Знак SKVOZ" width="96" height="96">
+
 Нативное Rust-приложение с GTK4/libadwaita управляет общим
 `skvoz-network-runtime`: локальными интерфейсами
 HTTP/HTTPS CONNECT и SOCKS5 CONNECT либо передачей IP-пакетов через Linux TUN.
@@ -15,7 +17,9 @@ amd64 включает runtime и узкий системный `skvoz-network-h
 управляющему сокету; полезные данные через этот сокет не проходят.
 `tests/` содержит GTK-проверку, `spec/` — обычные RSpec процессные сценарии
 с независимым Rust-приложением и реальным TLS NATS, `packaging/` — сборку deb,
-desktop/icon files и обслуживание системных socket instances.
+desktop files и обслуживание системных socket instances. Цветные иконки в
+`assets/icons/` устанавливаются в `hicolor`; общие исходники и правила —
+[в каталоге знака проекта](../../assets/branding/README.md).
 
 Для проверок управляющего слоя без GTK:
 

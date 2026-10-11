@@ -1,5 +1,7 @@
 # Клиент SKVOZ для Android
 
+<img src="../../assets/branding/skvoz-256.png" alt="Знак SKVOZ" width="96" height="96">
+
 Kotlin/Compose-приложение с тем же Rust Core и сетевым runtime внутри APK.
 Два режима: локальный HTTP/CONNECT/SOCKS5 TCP-прокси и L3 ВПН через Android
 `VpnService`. Трафик обрабатывается в Rust; Kotlin управляет интерфейсом,

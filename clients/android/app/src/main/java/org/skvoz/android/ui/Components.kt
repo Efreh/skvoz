@@ -1,6 +1,7 @@
 package org.skvoz.android.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -25,8 +26,10 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.Dp
 import org.skvoz.android.*
+import org.skvoz.android.R
 
 internal fun Modifier.panelTone() = drawWithCache {
     val brush = Brush.linearGradient(listOf(lerp(SkvozColors.Panel, SkvozColors.Line, 0.2f), SkvozColors.Panel,
@@ -43,7 +46,11 @@ internal fun Modifier.accentTone(enabled: Boolean = true) = if (!enabled) this e
     onMenu: (Boolean) -> Unit, up: () -> Unit, settings: () -> Unit, diagnostics: () -> Unit) {
     Column(Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         Row(Modifier.fillMaxWidth().heightIn(min = SkvozLayout.HeaderHeight).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (!home) IconButton(up) { Symbol(Glyph.BACK, "Назад") } else Spacer(Modifier.width(8.dp))
+            if (!home) IconButton(up) { Symbol(Glyph.BACK, "Назад") } else {
+                Spacer(Modifier.width(8.dp))
+                Image(painterResource(R.drawable.skvoz_brand), null, Modifier.size(40.dp))
+                Spacer(Modifier.width(8.dp))
+            }
             Text(title, Modifier.weight(1f).padding(vertical = 8.dp), style = MaterialTheme.typography.titleLarge,
                 maxLines = if (LocalDensity.current.fontScale >= 1.5f) 1 else 2, overflow = TextOverflow.Ellipsis)
             if (home && loaded) Box {

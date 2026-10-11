@@ -8,6 +8,7 @@
 skvoz/
 ├── Cargo.toml          # общий Rust workspace
 ├── Cargo.lock          # зависимости Rust-компонентов
+├── assets/branding/    # общий цветной знак и правила использования
 ├── core/               # подпроект ядра, package skvoz-core
 │   ├── Cargo.toml
 │   ├── src/

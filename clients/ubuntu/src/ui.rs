@@ -195,9 +195,12 @@ impl View {
             .margin_end(24)
             .build();
         let hero = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        let icon = gtk::Image::from_icon_name("network-transmit-receive-symbolic");
+        let texture = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(include_bytes!(
+            "../assets/icons/256.png"
+        )))
+        .expect("Bundled SKVOZ icon must be a valid PNG");
+        let icon = gtk::Image::from_paintable(Some(&texture));
         icon.set_pixel_size(48);
-        icon.add_css_class("accent");
         hero.append(&icon);
         hero.append(&label("Соединение SKVOZ:", "title-1"));
         let modes = gtk::Box::builder()
