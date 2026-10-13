@@ -72,7 +72,7 @@ jobs:
         env:
           SKVOZ_INTEGRATION: '1'
         run: |
-          image=nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
+          image=nats:2.15.1-alpine@sha256:9e47060a6c099ce118566e425245adc5c78139d02e1cc6fc48747b776445c4f8
           docker pull "$image"
           container=$(docker create "$image")
           trap 'docker rm -v "$container" >/dev/null' EXIT
