@@ -1240,7 +1240,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "skvoz-android-native"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "jni",
  "serde",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "skvoz-ubuntu-client"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "async-nats",
  "futures-util",

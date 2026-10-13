@@ -78,8 +78,8 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         } else {
             dial_host
         };
-        let client = options
-            .connect(format!("tls://{host}:{}", credentials.port))
+        let address = format!("tls://{host}:{}", credentials.port);
+        let client = connect_with_auth_retry(options, &address)
             .await
             .map_err(|error| {
                 let mut text = error.to_string().to_ascii_lowercase();
@@ -95,10 +95,10 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
                         .replace(&credentials.password.to_ascii_lowercase(), "[redacted]")
                         .replace(&credentials.username.to_ascii_lowercase(), "[redacted]");
                     eprintln!(
-                        "Enrollment connection failed: address={host}:{}, kind={:?}, details={details}",
-                        credentials.port,
-                        error.kind()
-                    );
+                    "Enrollment connection failed: address={host}:{}, kind={:?}, details={details}",
+                    credentials.port,
+                    error.kind()
+                );
                 }
                 if text.contains("authorization") || text.contains("authentication") {
                     Error("authentication_failed")
@@ -189,6 +189,24 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             eprintln!("Enrollment deadline exceeded");
             Error("server_unavailable")
         })?
+}
+
+async fn connect_with_auth_retry(
+    options: async_nats::ConnectOptions,
+    address: &str,
+) -> Result<async_nats::Client, async_nats::ConnectError> {
+    // NATS also reports authorization violation before its callout is subscribed.
+    // Keep retries finite, inside the enclosing enrollment deadline.
+    for delay in [1, 2] {
+        match options.clone().connect(address).await {
+            Ok(client) => return Ok(client),
+            Err(error) if error.kind() != async_nats::ConnectErrorKind::AuthorizationViolation => {
+                return Err(error);
+            }
+            Err(_) => tokio::time::sleep(Duration::from_secs(delay)).await,
+        }
+    }
+    options.connect(address).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

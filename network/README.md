@@ -45,6 +45,10 @@ FFI не создаёт второй engine или собственную оче
 получает проверенный owned TUN FD от [мобильного клиента](../docs/android-client.md).
 Общий enrollment4 используется Ubuntu и Android; host lifecycle/trusted anchor
 storage остаются ответственностью платформы. Core wire2, API1 и ABI1 сохранены; network6 и StartupConfig3 проверяются явно.
+При `AuthorizationViolation` подключение enrollment повторяется ещё два раза
+с паузами 1 и 2 секунды: NATS может начать принимать соединения до запуска
+Auth Callout. Сохраняются проверка TLS и общий таймаут enrollment 20 секунд;
+после исчерпания повторов отказ авторизации возвращает `authentication_failed`.
 
 Из корня репозитория:
 
