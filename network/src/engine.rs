@@ -4,7 +4,6 @@ use skvoz_core::{Event, ManagerConfig, PeerId, PeerLimits, SendOutcome};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
-    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -192,7 +191,7 @@ mod profile_tests {
             match case {
                 0 => invalid.stream.receive_window = 16384,
                 1 => invalid.stream.max_frame = 1,
-                2 => invalid.max_peers = 9,
+                2 => invalid.max_peers = 2,
                 3 => invalid.max_streams = canonical.max_streams + 1,
                 4 => invalid.send_budget_per_peer = CONTROL_MAX + 7,
                 5 => invalid.receive_budget_per_peer = 65536,
@@ -382,24 +381,57 @@ pub struct NetworkEngine {
     ip_turn: BTreeMap<PeerId, (usize, usize)>,
     ip_reservations: BTreeMap<PeerId, crate::budget::Reservation>,
     tcp_enabled: bool,
+    open_failure_reported: bool,
     tcp: BTreeSet<RuntimeKey>,
     tcp_closing: Vec<RuntimeKey>,
     backend: VecDeque<BackendEvent>,
     dynamic: Option<(Vec<u8>, u16, u8)>,
     reservations: BTreeMap<RuntimeKey, PendingReservation>,
     reserved_config: Option<(RuntimeKey, SessionConfig, Instant)>,
-    admission: Option<Arc<Mutex<crate::routing::Egress>>>,
+    devices: Option<BTreeSet<PeerId>>,
 }
 impl NetworkEngine {
-    pub(crate) fn set_admission(&mut self, table: Arc<Mutex<crate::routing::Egress>>) {
-        self.admission = Some(table);
+    pub(crate) fn set_devices(&mut self, devices: BTreeSet<PeerId>) {
+        self.devices = Some(devices);
     }
-    pub(crate) fn route_live(&self, key: RuntimeKey, ip: bool) -> bool {
-        if ip {
-            self.sessions.get(&key.stream.peer).is_some_and(|session| session.control == key) || self.reservations.contains_key(&key) || self.backend.iter().any(|event| matches!(event, BackendEvent::Retire{key:owned,..}|BackendEvent::Reserve{key:owned,..}|BackendEvent::Activate{key:owned,..} if *owned==key))
-        } else {
-            self.tcp.contains(&key) || self.runtime.snapshot(key).is_some()
+    pub(crate) fn device_admitted(&self, id: PeerId) -> bool {
+        self.devices.as_ref().is_none_or(|ids| ids.contains(&id))
+    }
+    pub(crate) fn revoke_device(&mut self, id: PeerId) -> Result<(), NetworkError> {
+        if let Some(devices) = self.devices.as_mut() {
+            devices.remove(&id);
         }
+        let mut keys: BTreeSet<_> = self
+            .tcp
+            .iter()
+            .copied()
+            .filter(|k| k.stream.peer == id)
+            .collect();
+        keys.extend(
+            self.reservations
+                .keys()
+                .copied()
+                .filter(|k| k.stream.peer == id),
+        );
+        keys.extend(self.sessions.get(&id).map(|s| s.control));
+        for key in keys {
+            self.close_owned(key);
+        }
+        Ok(())
+    }
+    pub(crate) fn device_drained(&self, id: PeerId) -> bool {
+        self.runtime.peer_streams_drained(id)
+            && !self.sessions.contains_key(&id)
+            && !self.tcp.iter().any(|k| k.stream.peer == id)
+            && !self.streams.keys().any(|k| k.stream.peer == id)
+            && !self.reservations.keys().any(|k| k.stream.peer == id)
+            && !self.backend.iter().any(|e| match e {
+                BackendEvent::TcpOpen { key, .. }
+                | BackendEvent::Tcp { key, .. }
+                | BackendEvent::Reserve { key, .. }
+                | BackendEvent::Activate { key, .. }
+                | BackendEvent::Retire { key, .. } => key.stream.peer == id,
+            })
     }
     pub(crate) fn close_owned(&mut self, key: RuntimeKey) {
         if let Some(session) = self
@@ -462,13 +494,14 @@ impl NetworkEngine {
             ip_turn: BTreeMap::new(),
             ip_reservations: BTreeMap::new(),
             tcp_enabled: false,
+            open_failure_reported: false,
             tcp: BTreeSet::new(),
             tcp_closing: Vec::with_capacity(2048),
             backend: VecDeque::new(),
             dynamic: None,
             reservations: BTreeMap::new(),
             reserved_config: None,
-            admission: None,
+            devices: None,
         })
     }
     #[cfg(feature = "portable-runtime")]
@@ -578,28 +611,6 @@ impl NetworkEngine {
         host: String,
         port: u16,
     ) -> Result<RuntimeKey, NetworkError> {
-        self.open_tcp_admission(peer, host, port, None)
-    }
-    pub fn open_tcp_assigned(
-        &mut self,
-        assignment: &crate::routing::Assignment,
-        host: String,
-        port: u16,
-    ) -> Result<RuntimeKey, NetworkError> {
-        self.open_tcp_admission(
-            PeerId(assignment.owner),
-            host,
-            port,
-            Some(assignment.admission()),
-        )
-    }
-    fn open_tcp_admission(
-        &mut self,
-        peer: PeerId,
-        host: String,
-        port: u16,
-        admission: Option<crate::routing::Admission>,
-    ) -> Result<RuntimeKey, NetworkError> {
         if !self.tcp_enabled || !matches!(self.role, EngineRole::Client) {
             return Err(NetworkError::InvalidState);
         }
@@ -608,16 +619,53 @@ impl NetworkEngine {
             host,
             port,
         };
-        let metadata = if let Some(admission) = admission {
-            Metadata::Assigned {
-                v: crate::NETWORK_VERSION,
-                admission,
-                target: Box::new(target),
+        let key = self.runtime.open(peer, &target.encode()?).map_err(|error| {
+            if !self.open_failure_reported {
+                self.open_failure_reported = true;
+                let status = self.runtime.status();
+                let session = self.runtime.peer_status(peer);
+                // One bounded diagnostic per engine; exclude destinations,
+                // credentials, pair tokens and handshake nonces.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "{}",
+                    serde_json::json!({
+                        "event": "network_first_open_failure",
+                        "error": match error {
+                            skvoz_core::runtime::RuntimeError::Config => "Config",
+                            skvoz_core::runtime::RuntimeError::Random => "Random",
+                            skvoz_core::runtime::RuntimeError::Tls => "Tls",
+                            skvoz_core::runtime::RuntimeError::Authentication => "Authentication",
+                            skvoz_core::runtime::RuntimeError::Authorization => "Authorization",
+                            skvoz_core::runtime::RuntimeError::Timeout => "Timeout",
+                            skvoz_core::runtime::RuntimeError::Transport => "Transport",
+                            skvoz_core::runtime::RuntimeError::Protocol => "Protocol",
+                            skvoz_core::runtime::RuntimeError::Admission => "Admission",
+                            skvoz_core::runtime::RuntimeError::PeerUnavailable => "PeerUnavailable",
+                            skvoz_core::runtime::RuntimeError::StaleKey => "StaleKey",
+                            skvoz_core::runtime::RuntimeError::IdentityExhausted => "IdentityExhausted",
+                            skvoz_core::runtime::RuntimeError::TerminalDrainTimeout => "TerminalDrainTimeout",
+                            skvoz_core::runtime::RuntimeError::RetryExhausted => "RetryExhausted",
+                            skvoz_core::runtime::RuntimeError::Manager(_) => "Manager"
+                        },
+                        "peer": peer.0,
+                        "lifecycle": format!("{:?}", status.lifecycle),
+                        "peer_ready": self.runtime.peer_ready(peer),
+                        "generation": session.map(|s| format!("{:032x}", s.generation)),
+                        "incarnation": session.map(|s| s.incarnation),
+                        "sent_frames": session.map(|s| s.sent_frames),
+                        "received_frames": session.map(|s| s.received_frames),
+                        "joins": status.counters.joins,
+                        "retries": status.counters.retries,
+                        "invalid_input": status.counters.invalid_input,
+                        "peer_timeouts": status.counters.peer_timeouts,
+                        "shard_failures": status.counters.shard_failures
+                    })
+                );
             }
-        } else {
-            target
-        };
-        let key = self.runtime.open(peer, &metadata.encode()?)?;
+            error
+        })?;
         self.tcp.insert(key);
         Ok(key)
     }
@@ -719,7 +767,10 @@ impl NetworkEngine {
         let Some(p) = self.reservations.remove(&key) else {
             return Ok(false);
         };
-        if Instant::now() >= p.deadline || self.runtime.snapshot(key).is_none() {
+        if !self.device_admitted(key.stream.peer)
+            || Instant::now() >= p.deadline
+            || self.runtime.snapshot(key).is_none()
+        {
             self.ip_reservations.remove(&key.stream.peer);
             return Ok(false);
         }
@@ -753,6 +804,9 @@ impl NetworkEngine {
         key: RuntimeKey,
         id: &SessionId,
     ) -> Result<bool, NetworkError> {
+        if !self.device_admitted(key.stream.peer) {
+            return Ok(false);
+        }
         self.reject_expired_setup(key.stream.peer)?;
         let Some(s) = self.sessions.get_mut(&key.stream.peer) else {
             return Ok(false);
@@ -856,34 +910,6 @@ impl NetworkEngine {
         max_mtu: u16,
         channels: u8,
     ) -> Result<RuntimeKey, NetworkError> {
-        self.open_ip_admission(peer, families, family_policy, max_mtu, channels, None)
-    }
-    pub fn open_ip_assigned(
-        &mut self,
-        assignment: &crate::routing::Assignment,
-        families: Vec<u8>,
-        family_policy: FamilyPolicy,
-        max_mtu: u16,
-        channels: u8,
-    ) -> Result<RuntimeKey, NetworkError> {
-        self.open_ip_admission(
-            PeerId(assignment.owner),
-            families,
-            family_policy,
-            max_mtu,
-            channels,
-            Some(assignment.admission()),
-        )
-    }
-    fn open_ip_admission(
-        &mut self,
-        peer: PeerId,
-        families: Vec<u8>,
-        family_policy: FamilyPolicy,
-        max_mtu: u16,
-        channels: u8,
-        admission: Option<crate::routing::Admission>,
-    ) -> Result<RuntimeKey, NetworkError> {
         if !matches!(self.role, EngineRole::Client)
             || self.sessions.contains_key(&peer)
             || self.sessions.len() >= self.config.ip_sessions
@@ -898,16 +924,7 @@ impl NetworkEngine {
             max_mtu,
             channels,
         };
-        let encoded = if let Some(admission) = admission {
-            Metadata::Assigned {
-                v: crate::NETWORK_VERSION,
-                admission,
-                target: Box::new(m),
-            }
-            .encode()?
-        } else {
-            m.encode()?
-        };
+        let encoded = m.encode()?;
         self.reserve_ip(peer, channels)?;
         let key = match self.runtime.open(peer, &encoded) {
             Ok(k) => k,
@@ -950,6 +967,12 @@ impl NetworkEngine {
         Ok(())
     }
     fn incoming(&mut self, key: RuntimeKey, metadata: &[u8]) -> Result<(), NetworkError> {
+        // A queued open from a retired device cannot recreate host resources.
+        if !self.device_admitted(key.stream.peer) {
+            // Preserve the authenticated terminal path while denying all host setup.
+            self.runtime.close(key)?;
+            return Ok(());
+        }
         let m = match Metadata::decode(metadata) {
             Ok(m) => m,
             Err(e) => {
@@ -964,53 +987,12 @@ impl NetworkEngine {
                 );
             }
         };
-        let m = match m {
-            Metadata::Assigned {
-                admission, target, ..
-            } => {
-                let Some(table) = self.admission.clone() else {
-                    return self.reject(key, Metadata::request_type(metadata), "forbidden");
-                };
-                let Some(peer) = self.runtime.peer_status(key.stream.peer) else {
-                    return self.reject(key, Metadata::request_type(metadata), "forbidden");
-                };
-                let accepted = table
-                    .lock()
-                    .map_err(|_| NetworkError::InvalidState)?
-                    .consume(
-                        key,
-                        &crate::routing::epoch(peer.generation),
-                        &admission,
-                        &target,
-                        Instant::now(),
-                    )
-                    .is_ok();
-                if !accepted {
-                    return self.reject(key, Metadata::request_type(metadata), "forbidden");
-                }
-                *target
-            }
-            Metadata::Tcp { .. } if self.admission.is_some() => {
-                return self.reject(key, "tcp", "forbidden");
-            }
-            Metadata::IpSession { .. }
-                if self.admission.is_some()
-                    && self
-                        .reserved_config
-                        .as_ref()
-                        .is_none_or(|(reserved, _, _)| *reserved != key) =>
-            {
-                return self.reject(key, "ip-session", "forbidden");
-            }
-            other => other,
-        };
         if (matches!(&m, Metadata::IpSession { .. } | Metadata::IpData { .. }) || self.tcp_enabled)
             && !compatible_peer_profile(self.runtime.peer_limits(key))
         {
             return self.reject(key, Metadata::request_type(metadata), "invalid_request");
         }
         match m {
-            Metadata::Assigned { .. } => return self.reject(key, "assigned", "forbidden"),
             Metadata::IpSession {
                 families,
                 family_policy,

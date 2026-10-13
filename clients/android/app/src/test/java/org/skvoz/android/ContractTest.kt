@@ -9,6 +9,16 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class ContractTest {
+    @Test fun currentClientStatusRejectsAuthorityRevisionAndLegacyRouting() {
+        fun status(extra: String) = kotlinx.serialization.json.Json.parseToJsonElement(
+            """{"lifecycle":"ready","mode":"proxy","session":null,"counters":{},$extra}"""
+        ) as kotlinx.serialization.json.JsonObject
+        validateClientStatus(status("\"access_revision\":0"))
+        assertThrows(ClientFailure::class.java) { validateClientStatus(status("\"access_revision\":0").let { kotlinx.serialization.json.JsonObject(it + ("mode" to kotlinx.serialization.json.JsonPrimitive("server"))) }) }
+        for (extra in listOf("\"access_revision\":1", "\"access_revision\":\"0\"", "\"routing\":{}", "\"access_revision\":0,\"routing\":{}")) {
+            assertThrows(ClientFailure::class.java) { validateClientStatus(status(extra)) }
+        }
+    }
     @Test fun rapidDetailedToggleResetsNativeAndRejectsOldCallbacksWithoutDefaultClocks() {
         val control = DiagnosticControl()
         var shown: DiagnosticSnapshot? = null

@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY clients/ubuntu/Cargo.toml clients/ubuntu/Cargo.toml
 COPY clients/android/native/Cargo.toml clients/android/native/Cargo.toml
 RUN mkdir -p clients/android/native/src && printf "// Metadata-only workspace stub.\n" > clients/android/native/src/lib.rs
-RUN mkdir -p clients/ubuntu/src/bin && printf "fn main() {}\n" > clients/ubuntu/src/main.rs && printf "// Metadata-only workspace stub.\n" > clients/ubuntu/src/lib.rs && printf "fn main() {}\n" > clients/ubuntu/src/bin/test_driver.rs
+RUN mkdir -p clients/ubuntu/src/bin clients/ubuntu/tests && printf "fn main() {}\n" > clients/ubuntu/src/main.rs && printf "// Metadata-only workspace stub.\n" > clients/ubuntu/src/lib.rs && printf "fn main() {}\n" > clients/ubuntu/src/bin/test_driver.rs && touch clients/ubuntu/tests/child_guard.rs clients/ubuntu/tests/ui.rs
 COPY vendor/async-nats vendor/async-nats
 COPY core core
 COPY daemon daemon
@@ -14,11 +14,20 @@ COPY connectors/tcp connectors/tcp
 COPY testbench testbench
 RUN CARGO_BUILD_JOBS=1 cargo build --release --locked -p skvoz-daemon -p skvoz-network --features skvoz-network/linux-runtime -p skvoz-network-helper
 
-FROM nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4 AS broker
+FROM core-builder AS broker
+# The server image currently targets Linux amd64; use the exact official release.
+ADD --checksum=sha256:bf5edc7b1ce98e885c368cb43a886eb148dc5d0551d99f3cf6141fb5e1954c70 https://github.com/nats-io/nats-server/releases/download/v2.15.1/nats-server-v2.15.1-linux-amd64.tar.gz /opt/broker-build/nats.tar.gz
+RUN test "$(uname -m)" = x86_64 \
+    && tar -xzf /opt/broker-build/nats.tar.gz -C /opt/broker-build \
+    && install -m 0755 /opt/broker-build/nats-server-v2.15.1-linux-amd64/nats-server /usr/local/bin/nats-server \
+    && test "$(nats-server --version)" = 'nats-server: v2.15.1' \
+    && rm -rf /opt/broker-build
 FROM ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199 AS acme-test
 
 FROM ruby:4.0.7-bookworm@sha256:119a36c51c7893215202220eabfdcb561638735de4d45bacf2e8619be3de47f2 AS base
 WORKDIR /opt/skvoz/server
+RUN apt-get update && apt-get install -y --no-install-recommends libsodium23=1.0.18-1+deb12u1 \
+    && rm -rf /var/lib/apt/lists/*
 COPY connectors/server/Gemfile connectors/server/Gemfile.lock ./
 RUN gem install bundler --version 4.0.22 --no-document \
     && bundle config set deployment true \
@@ -39,6 +48,7 @@ COPY --from=broker /usr/local/bin/nats-server /usr/local/bin/nats-server
 COPY --from=acme-test /app /usr/local/bin/pebble
 COPY connectors/server/spec spec
 COPY connectors/server/deployment deployment
+COPY deploy/nats /opt/deploy/nats
 COPY daemon/tests/fixtures /opt/daemon/tests/fixtures
 COPY clients/ruby /opt/clients/ruby
 COPY --from=core-builder /src/target/release/skvoz-network-runtime /usr/local/bin/skvoz-network-runtime
@@ -48,7 +58,7 @@ USER 10001:10001
 CMD ["bundle", "exec", "rspec", "spec"]
 
 FROM ruby:4.0.7-slim-bookworm@sha256:b21bc6c2360f7b7b615ff8860f239b12b2c6634ec026712745743b0661ac14b9 AS deploy
-RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates iproute2 nftables conntrack \
+RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates iproute2 nftables conntrack libsodium23=1.0.18-1+deb12u1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 skvoz && useradd --uid 10001 --gid 10001 --no-create-home skvoz \
     && install -d -o skvoz -g skvoz -m 0700 /var/lib/skvoz \

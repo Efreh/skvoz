@@ -77,14 +77,17 @@ static int next(uint64_t handle, int *fd) {
     return 1;
 }
 
-static int response(uint64_t handle, uint32_t id) {
+static int response_until(uint64_t handle, uint32_t id, double deadline,
+                          int awaiting_join) {
     char needle[32];
     snprintf(needle, sizeof(needle), "\"id\":%u,", id);
-    double deadline = now() + 10;
     while (now() < deadline) {
         int fd;
         if (!next(handle, &fd)) continue;
         if (strstr(message, needle)) {
+            if (awaiting_join && fd == -1 &&
+                    strstr(message, "\"error\":\"network_unavailable\""))
+                return -2;
             if (!strstr(message, "\"error\":null")) fail("response error");
             return fd;
         }
@@ -94,8 +97,12 @@ static int response(uint64_t handle, uint32_t id) {
     return -1;
 }
 
+static int response(uint64_t handle, uint32_t id) {
+    return response_until(handle, id, now() + 10, 0);
+}
+
 static void hello_ready(uint64_t handle) {
-    request(handle, "HELLO", "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":5},\"fd_count\":0}", 1);
+    request(handle, "HELLO", "{\"v\":1,\"id\":1,\"op\":\"HELLO\",\"args\":{\"api\":1,\"network\":6},\"fd_count\":0}", 1);
     int hello = 0, ready = 0;
     double deadline = now() + 30;
     while (now() < deadline && (!hello || !ready)) {
@@ -103,7 +110,7 @@ static void hello_ready(uint64_t handle) {
         if (!next(handle, &fd)) continue;
         if (fd != -1) { close(fd); fail("startup descriptor"); }
         if (strstr(message, "\"id\":1,") && strstr(message, "\"error\":null") &&
-                strstr(message, "\"api\":1") && strstr(message, "\"network\":5"))
+                strstr(message, "\"api\":1") && strstr(message, "\"network\":6"))
             hello = 1;
         if (strstr(message, "\"event\":\"RUNTIME_STATE\"") &&
                 strstr(message, "\"state\":\"ready\"")) ready = 1;
@@ -112,12 +119,25 @@ static void hello_ready(uint64_t handle) {
     if (!hello || !ready) fail("startup readiness deadline");
 }
 
-static int open_tcp(const char *address, uint32_t id) {
+static int open_tcp(const char *address, uint32_t *next_id) {
     char json[512];
-    int count = snprintf(json, sizeof(json), "{\"v\":1,\"id\":%u,\"op\":\"OPEN_TCP\",\"args\":{\"host\":\"%s\",\"port\":4444},\"fd_count\":0}", id, address);
-    if (count < 0 || (size_t)count >= sizeof(json)) fail("OPEN length");
-    request(client_handle, "OPEN_TCP", json, id);
-    int fd = response(client_handle, id);
+    double deadline = now() + 10;
+    unsigned int attempts = 0;
+    int fd;
+    do {
+        if (now() >= deadline || ++attempts > 100) fail("peer JOIN admission deadline");
+        uint32_t id = (*next_id)++;
+        int count = snprintf(json, sizeof(json), "{\"v\":1,\"id\":%u,\"op\":\"OPEN_TCP\",\"args\":{\"host\":\"%s\",\"port\":4444},\"fd_count\":0}", id, address);
+        if (count < 0 || (size_t)count >= sizeof(json)) fail("OPEN length");
+        request(client_handle, "OPEN_TCP", json, id);
+        fd = response_until(client_handle, id, deadline, 1);
+        if (fd == -2 && poll(NULL, 0, 50) < 0 && errno != EINTR)
+            fail("JOIN progress poll");
+    } while (fd == -2);
+    /* Runtime readiness does not prove reciprocal peer JOIN. A returned actual FD is
+     * the admission proof; no other rejection is retried or treated as success. */
+    printf("FFI JOIN admission: attempts=%u remaining=%.3f\n", attempts,
+           deadline - now());
     if (fd < 0 || !(fcntl(fd, F_GETFD) & FD_CLOEXEC)) fail("owned CLOEXEC socket");
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
@@ -148,7 +168,8 @@ int main(int argc, char **argv) {
     hello_ready(client_handle);
     request(client_handle, "START_PROXY", "{\"v\":1,\"id\":2,\"op\":\"START_PROXY\",\"args\":{\"http_bind\":null,\"socks_bind\":null},\"fd_count\":0}", 2);
     if (response(client_handle, 2) != -1) fail("START descriptor");
-    int fd = open_tcp(argv[3], 3);
+    uint32_t next_id = 3;
+    int fd = open_tcp(argv[3], &next_id);
     unsigned char bytes[32771], received[4096];
     for (size_t i = 0; i < sizeof(bytes); i++) bytes[i] = (unsigned char)(i * 31 + i / 255);
     write_all(fd, bytes, sizeof(bytes));
@@ -174,7 +195,7 @@ int main(int argc, char **argv) {
     /* A fresh stream must survive the preceding clean half-close. Its owned FD
      * is retained across insufficient-buffer queries, then the owner is destroyed
      * while this delivered FD remains caller-owned. It must reach terminal EOF. */
-    fd = open_tcp(argv[3], 4);
+    fd = open_tcp(argv[3], &next_id);
     uint64_t stale = client_handle;
     if (skvoz_network_destroy(client_handle)) fail("destroy");
     client_handle = 0;

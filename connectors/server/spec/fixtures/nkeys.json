@@ -1,0 +1,17 @@
+{
+  "source": "https://github.com/nats-io/nats-server/blob/v2.15.1/server/auth_callout_test.go",
+  "license": "Apache-2.0",
+  "purpose": "Public upstream test key-format pairs only; not JWT/Box vectors or operational credentials.",
+  "vectors": [
+    {
+      "kind": "user",
+      "seed": "SUAP277QP7U4JMFFPVZHLJYEQJ2UHOTYVEIZJYAWRJXQLP4FRSEHYZJJOU",
+      "public_key": "UBO2MQV67TQTVIRV3XFTEZOACM4WLOCMCDMAWN5QVN5PI2N6JHTVDRON"
+    },
+    {
+      "kind": "curve",
+      "seed": "SXAAXMRAEP6JWWHNB6IKFL554IE6LZVT6EY5MBRICPILTLOPHAG73I3YX4",
+      "public_key": "XAB3NANV3M6N7AHSQP2U5FRWKKUT7EG2ZXXABV4XVXYQRJGM4S2CZGHT"
+    }
+  ]
+}

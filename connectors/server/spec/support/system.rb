@@ -126,7 +126,7 @@ module ServerSystem
     cert.serial = SecureRandom.random_number(1 << 120)
     cert.subject = OpenSSL::X509::Name.parse("/CN=#{name}")
     cert.issuer = issuer ? issuer.subject : cert.subject
-    cert.public_key = key.public_key
+    cert.public_key = OpenSSL::PKey.read(key.public_to_der)
     cert.not_before = Time.now - 60
     cert.not_after = expires
     factory = OpenSSL::X509::ExtensionFactory.new
@@ -245,57 +245,23 @@ module ServerSystem
     raw&.close unless raw&.closed?
   end
 
-  # Exercise the LEAFNODE-only principal using the pinned ordinary NATS server,
-  # rather than a STANDARD CONNECT which rejects even a valid node credential.
-  def leaf_credentials_work(join)
-    Dir.mktmpdir('skvoz-leaf-auth-') do |root|
-      monitor = free_port
-      path, log = File.join(root, 'probe.json'), File.join(root, 'probe.log')
-      remote = Skvoz::Server::NodeJoin.new(join).remote(ca_path: File.join(root, 'ca.pem'))
-      private_json(path, { 'server_name' => "leaf-auth-#{SecureRandom.hex(8)}", 'host' => '127.0.0.1', 'port' => free_port,
-        'http' => "127.0.0.1:#{monitor}", 'accounts' => { 'APP' => {} },
-        'max_payload' => 65588, 'max_pending' => 4194304, 'leafnodes' => { 'compression' => 'off', 'remotes' => [remote] } })
-      output = File.open(log, File::WRONLY | File::CREAT | File::EXCL, 0o600)
-      pid = Process.spawn(NATS, '--config', path, out: output, err: output)
-      output.close
-      http = Net::HTTP.new('127.0.0.1', monitor, nil)
-      http.open_timeout = http.read_timeout = 0.5
-      deadline = monotonic + 3
-      loop do
-        return false if File.read(log).match?(/Authorization Violation/i)
-        raise IOError, 'Native leaf credential probe exited' if process_dead(pid)
-        begin
-          return true if JSON.parse(http.get('/leafz').body).fetch('leafnodes') == 1
-        rescue SystemCallError, Net::ReadTimeout, Net::OpenTimeout, EOFError
-          # The finite startup interval includes native monitor availability.
-        end
-        return false if File.read(log).match?(/Authorization Violation/i)
-        raise Timeout::Error, 'Native leaf authentication outcome unavailable' if monotonic >= deadline
-        sleep 0.02
-      end
-    ensure
-      output&.close unless output&.closed?
-      terminate(pid, timeout: 3) if pid
-    end
-  end
-
   class Server
     attr_reader :directory, :state, :config, :value, :port, :monitor, :process, :log, :cli
-    def initialize(directory, overrides: {}, nats: NATS, allow: [])
+    def initialize(directory, overrides: {}, nats: NATS, allow: [], autostart: true)
       @directory = Pathname.new(directory)
       @cli = [RbConfig.ruby, COMPONENT.join('bin/skvoz-server').to_s]
       @state, @config, @log = %w[server-state server.json server.log].map { |name| @directory.join(name) }
-      selected = overrides.values_at('port', 'monitor_port', 'leaf_port')
+      selected = overrides.values_at('port', 'monitor_port')
       excluded = selected.compact + [overrides.dig('tls', 'challenge_port')].compact
       available = ServerSystem.free_ports(selected.count(nil), except: excluded)
-      @port, @monitor, leaf_port = selected.map { |port| port || available.shift }
+      @port, @monitor = selected.map { |port| port || available.shift }
       @value = { 'state_dir' => @state.to_s, 'address' => 'localhost', 'bind' => '127.0.0.1', 'port' => @port,
-                 'monitor_port' => @monitor, 'leaf_port' => leaf_port, 'nats_binary' => nats.to_s, 'runtime_binary' => RUNTIME, 'allow' => allow, 'network' => {},
+                 'monitor_port' => @monitor, 'nats_binary' => nats.to_s, 'runtime_binary' => RUNTIME, 'allow' => allow, 'network' => {},
                  'tls' => { 'mode' => 'provided', 'certificate' => @directory.join('server.pem').to_s,
                             'key' => @directory.join('server.key').to_s, 'ca' => @directory.join('ca.pem').to_s } }.merge(overrides)
       ServerSystem.private_json(@config, @value)
       @output = File.open(@log, 'ab')
-      start
+      start if autostart
     rescue Exception
       stop(kill: true)
       @output&.close unless @output&.closed?
@@ -303,7 +269,8 @@ module ServerSystem
     end
 
     def start
-      @process = Process.spawn(*@cli, 'serve', '--config', @config.to_s, out: @output, err: @output)
+      launcher = ENV['SKVOZ_TEST_LAUNCHER'] ? [RbConfig.ruby, ENV.fetch('SKVOZ_TEST_LAUNCHER')] : @cli
+      @process = Process.spawn(*launcher, 'serve', '--config', @config.to_s, out: @output, err: @output)
       ServerSystem.wait_until(timeout: 25) do
         raise IOError, "Server startup failed: #{@log.read[-2000, 2000] || @log.read}" if ServerSystem.process_dead(@process)
         stdout, _, status = ServerSystem.capture(*@cli, 'health', '--state', @state, timeout: 5)
@@ -314,8 +281,8 @@ module ServerSystem
     def command(operation, login = nil, password = nil)
       argv = @cli + if operation == 'health'
           ['health']
-        elsif operation.start_with?('node-')
-          ['node', operation.delete_prefix('node-')]
+        elsif operation == 'auth-public'
+          ['auth-public']
         else
           ['user', operation]
         end
@@ -327,6 +294,12 @@ module ServerSystem
         raise IOError, "Administration failed: #{stderr} #{@log.read[-2000, 2000] || @log.read}"
       end
       JSON.parse(stdout)
+    end
+
+    def configure(**changes)
+      raise IOError, 'Stop server before changing configuration' if @process
+      @value.merge!(changes.transform_keys(&:to_s))
+      ServerSystem.private_json(@config, @value)
     end
 
     def stop(kill: false)
@@ -355,10 +328,10 @@ module ServerSystem
       limits = Skvoz::Server::NetworkConfiguration::LIMITS.merge('ip_sessions' => 1, 'core_streams' => 512,
         'lease_identities' => 1, 'core_receive_bytes' => 33554432, 'core_send_bytes' => 2097152,
         'runtime_buffer_bytes' => 100663296, 'runtime_buffer_records' => 16384)
-      ServerSystem.private_json(@profile, { v: 2, role: 'client', server: nil, routing: { egress: false, authority: nil },
+      ServerSystem.private_json(@profile, { v: 3, role: 'client', server: nil, access: nil,
         core: { url: "tls://127.0.0.1:#{bundle.fetch('port')}", tls_server_name: bundle.fetch('address'),
           trust: 'managed_ca', ca_file: ca.to_s, username: bundle.fetch('username'), password: bundle.fetch('password'),
-          namespace: bundle.fetch('namespace'), peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: [], initiate: [] },
+          namespace: bundle.fetch('namespace'), peer_id: bundle.fetch('peer_id').to_s, membership: 'allowlist', allowed_peers: ['0'], initiate: ['0'] },
         network: { families: [4], max_mtu: 1400, channels: 1, limits: } })
       @output = File.open(@log, 'ab')
       start
@@ -373,7 +346,7 @@ module ServerSystem
       @process = Process.spawn(RUNTIME, '--config', @profile.to_s, '--control-fd', '3', 3 => child, out: @output, err: @output)
       child.close
       @path = RuntimeClient.new(owner)
-      hello, = @path.request('HELLO', { api: 1, network: 5 })
+      hello, = @path.request('HELLO', { api: 1, network: 6 })
       raise IOError, 'Runtime HELLO rejected' if hello['error']
       ServerSystem.wait_until do
         raise IOError, "Device startup failed: #{@log.read}" if ServerSystem.process_dead(@process)

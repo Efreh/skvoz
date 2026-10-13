@@ -90,7 +90,7 @@ pub enum Operation {
     LocalReady,
     StopIp,
     PrepareShutdown,
-    UpdateRegistry,
+    UpdateDevices,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -154,12 +154,6 @@ pub struct Counters {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RoutingStatus {
-    pub control_ready: bool,
-    pub eligible_exits: u8,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StatusSession {
     pub handle: SessionId,
     pub state: String,
@@ -172,7 +166,7 @@ pub struct RuntimeStatus {
     #[serde(deserialize_with = "required_option")]
     pub session: Option<StatusSession>,
     pub counters: Counters,
-    pub routing: RoutingStatus,
+    pub access_revision: u64,
 }
 impl RuntimeStatus {
     pub fn validate(&self) -> Result<(), NetworkError> {
@@ -180,7 +174,7 @@ impl RuntimeStatus {
             self.lifecycle.as_str(),
             "starting" | "ready" | "closing" | "closed"
         ) || !matches!(self.mode.as_str(), "idle" | "proxy" | "ip" | "server")
-            || self.routing.eligible_exits > 8
+            || self.access_revision > i64::MAX as u64
             || self.session.as_ref().is_some_and(|session| {
                 !matches!(
                     session.state.as_str(),
@@ -303,16 +297,9 @@ impl Request {
             Operation::Status | Operation::StopProxy | Operation::PrepareShutdown => {
                 let _: EmptyArgs = arguments(&self.args)?;
             }
-            Operation::UpdateRegistry => {
-                let registry: crate::routing::Registry = arguments(&self.args)?;
-                registry.validate()?;
-                if serde_json::to_vec(&registry)
-                    .map_err(|_| NetworkError::InvalidRecord)?
-                    .len()
-                    > 16384
-                {
-                    return Err(NetworkError::InvalidRecord);
-                }
+            Operation::UpdateDevices => {
+                let devices: crate::access::DeviceSet = arguments(&self.args)?;
+                devices.validate()?;
             }
             Operation::StartProxy => {
                 let a: ProxyArgs = arguments(&self.args)?;

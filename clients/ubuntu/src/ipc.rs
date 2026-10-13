@@ -209,6 +209,9 @@ impl Session {
             let status: skvoz_network::local_api::RuntimeStatus =
                 skvoz_network::local_api::arguments(&result).map_err(|_| Error("ipc_failed"))?;
             status.validate().map_err(|_| Error("ipc_failed"))?;
+            if status.access_revision != 0 || status.mode == "server" {
+                return Err(Error("ipc_failed"));
+            }
         }
         Ok(result)
     }
@@ -222,7 +225,7 @@ impl Session {
         if r.fd_count != u8::from(op == "PREPARE_CLIENT") {
             return Err(Error("helper_failed"));
         }
-        if op == "HELLO" && r.result != Some(json!({"api":1,"network":5,"role":"client"})) {
+        if op == "HELLO" && r.result != Some(json!({"api":1,"network":6,"role":"client"})) {
             return Err(Error("version_mismatch"));
         }
         if matches!(op, "ACTIVATE_CLIENT" | "ABORT_CLIENT" | "RESTORE_CLIENT")
@@ -292,6 +295,33 @@ mod tests {
     use super::*;
     use skvoz_network_native::FramedUnix;
     #[tokio::test]
+    async fn client_status_rejects_authority_revision_and_legacy_routing() {
+        for status in [
+            json!({"lifecycle":"ready","mode":"proxy","session":null,"access_revision":1,"counters":skvoz_network::local_api::Counters::default()}),
+            json!({"lifecycle":"ready","mode":"server","session":null,"access_revision":0,"counters":skvoz_network::local_api::Counters::default()}),
+            json!({"lifecycle":"ready","mode":"proxy","session":null,"routing":{"control_ready":true,"eligible_exits":0},"counters":skvoz_network::local_api::Counters::default()}),
+        ] {
+            let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+            local.set_nonblocking(true).unwrap();
+            remote.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut channel = FramedUnix::from_owned_fd(remote.into()).unwrap();
+                let frame = channel
+                    .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+                let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(request["op"], "STATUS");
+                channel.send_frame(&serde_json::to_vec(&json!({"v":1,"id":request["id"],"result":status,"error":null,"fd_count":0})).unwrap(), None).unwrap();
+            });
+            let session = Session::new(local.into(), false).unwrap();
+            assert_eq!(
+                session.call("STATUS", json!({})).await.unwrap_err(),
+                Error("ipc_failed")
+            );
+            server.join().unwrap();
+        }
+    }
+    #[tokio::test]
     async fn owner_reads_events_while_waiting_for_correlated_reply() {
         let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
         local.set_nonblocking(true).unwrap();
@@ -305,14 +335,14 @@ mod tests {
             assert_eq!(request["op"], "HELLO");
             channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":3,"event":"RUNTIME_STATE","data":{"state":"ready","error":null},"fd_count":0})).unwrap(),None).unwrap();
             channel.send_frame(&serde_json::to_vec(&json!({"v":1,"seq":5,"event":"STATS","data":{"counters":skvoz_network::local_api::Counters::default()},"fd_count":0})).unwrap(),None).unwrap();
-            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"id":request["id"],"result":{"api":1,"network":5},"error":null,"fd_count":0})).unwrap(),None).unwrap();
+            channel.send_frame(&serde_json::to_vec(&json!({"v":1,"id":request["id"],"result":{"api":1,"network":6},"error":null,"fd_count":0})).unwrap(),None).unwrap();
             channel
                 .receive_frame_until(std::time::Instant::now() + Duration::from_secs(5))
                 .unwrap();
             channel
                 .send_frame(
                     &serde_json::to_vec(
-                        &json!({"v":1,"id":2,"result":{"lifecycle":"ready","mode":"proxy","session":null,"routing":{"control_ready":true,"eligible_exits":0},"counters":skvoz_network::local_api::Counters::default()},"error":null,"fd_count":0}),
+                        &json!({"v":1,"id":2,"result":{"lifecycle":"ready","mode":"proxy","session":null,"access_revision":0,"counters":skvoz_network::local_api::Counters::default()},"error":null,"fd_count":0}),
                     )
                     .unwrap(),
                     None,
@@ -322,7 +352,7 @@ mod tests {
         let mut session = Session::new(local.into(), false).unwrap();
         assert_eq!(
             session
-                .call("HELLO", json!({"api":1,"network":5}))
+                .call("HELLO", json!({"api":1,"network":6}))
                 .await
                 .unwrap()["api"],
             1
@@ -350,7 +380,7 @@ mod tests {
         let session = Session::new(local.into(), false).unwrap();
         assert!(
             session
-                .call("HELLO", json!({"api":1,"network":5}))
+                .call("HELLO", json!({"api":1,"network":6}))
                 .await
                 .is_err()
         );
@@ -380,7 +410,7 @@ mod tests {
         let session = Session::new(local.into(), false).unwrap();
         assert!(
             session
-                .call("HELLO", json!({"api":1,"network":5}))
+                .call("HELLO", json!({"api":1,"network":6}))
                 .await
                 .is_err()
         );
@@ -412,7 +442,7 @@ mod tests {
         let session = Session::new(local.into(), false).unwrap();
         assert!(
             session
-                .call("HELLO", json!({"api":1,"network":5}))
+                .call("HELLO", json!({"api":1,"network":6}))
                 .await
                 .is_err()
         );

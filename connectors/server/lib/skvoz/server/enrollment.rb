@@ -11,13 +11,6 @@ module Skvoz
     # NATS publish ACLs bind the literal request subject to its login. Reply
     # subjects are separately scoped to the same login; payload identity is absent.
     class Enrollment
-      class Object < Hash
-        def []=(key, value)
-          raise Error, 'Duplicate enrollment field' if key?(key)
-          super
-        end
-      end
-
       def initialize(config, state, &operation)
         @config, @state, @operation = config, state, operation
         @queue = []
@@ -31,7 +24,8 @@ module Skvoz
         task.with_timeout(5) do
           raw = TCPSocket.new('127.0.0.1', @config['port'])
           @socket = BrokerTLS.connect(raw, identity: @config['address'], ca: @state.value.fetch('tls')['ca'])
-          send_bytes('CONNECT ' + JSON.generate(user: State::INTERNAL, pass: @state.value.fetch('internal_password'), verbose: false, protocol: 1) + "\r\nSUB skvoz.enroll.v3.* 1\r\nPING\r\n")
+          credential = @state.service('enrollment')
+          send_bytes('CONNECT ' + JSON.generate(user: credential.fetch('username'), pass: credential.fetch('password'), verbose: false, protocol: 1) + "\r\nSUB skvoz.enroll.v4.* 1\r\nPING\r\n")
           loop do
             line = @socket.gets("\r\n", 4096)
             raise Error, 'Enrollment authentication failed' unless line && !line.start_with?('-ERR')
@@ -109,13 +103,13 @@ module Skvoz
           raise Error, 'Invalid enrollment terminator' unless exact(2) == "\r\n"
           next unless parts.length == 5
           subject, reply = parts[1], parts[3]
-          login = subject.delete_prefix('skvoz.enroll.v3.')
-          next unless login.match?(State::LOGIN) && login != State::INTERNAL && subject == "skvoz.enroll.v3.#{login}"
+          login = subject.delete_prefix('skvoz.enroll.v4.')
+          next unless State.login?(login) && subject == "skvoz.enroll.v4.#{login}"
           next unless reply.match?(/\Askvoz\.enroll\.reply\.#{Regexp.escape(login)}\.[0-9a-f]{32}\z/)
           if !payload
-            respond(reply, { v: 3, error: 'invalid_request' })
+            respond(reply, { v: 4, error: 'invalid_request' })
           elsif @queue.length >= 16
-            respond(reply, { v: 3, error: 'overloaded' })
+            respond(reply, { v: 4, error: 'overloaded' })
           else
             @queue << [login, reply, payload]
             @work.signal
@@ -133,15 +127,15 @@ module Skvoz
           login, reply, payload = @queue.shift
           begin
           result = Async::Task.current.with_timeout(15) do
-            request = JSON.parse(payload, object_class: Object)
-            raise Error, 'Invalid enrollment request' unless request.is_a?(Hash) && request.keys.sort == %w[device v] && request['v'] == 3
+            request = JSON.parse(payload, max_nesting: 8, allow_duplicate_key: false)
+            raise Error, 'Invalid enrollment request' unless request.is_a?(Hash) && request.keys.sort == %w[device v] && request['v'] == 4
             @operation.call(login, request.fetch('device'))
           end
           respond(reply, result) if @ready
           rescue JSON::ParserError, KeyError, Error, Async::TimeoutError => error
             code = error.message == 'Device pool exhausted' ? 'device_limit' : 'enrollment_failed'
             Diagnostics.emit('enrollment_failed', reason: code, **Diagnostics.error_fields(error))
-            respond(reply, { v: 3, error: code }) if @ready
+            respond(reply, { v: 4, error: code }) if @ready
           end
         end
       rescue StandardError => error

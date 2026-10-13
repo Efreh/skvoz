@@ -1,0 +1,18 @@
+{
+  "v": 5,
+  "address": "127.0.0.1",
+  "bind": "127.0.0.1",
+  "state_dir": "/var/lib/skvoz",
+  "namespace": "skvoz.application",
+  "leaf_remotes": null,
+  "client_address": null,
+  "client_ca": null,
+  "port": 4222,
+  "advertised_port": 4222,
+  "tls": { "mode": "local" },
+  "allow": [],
+  "network": {
+    "ipv4": { "pool": "10.203.0.0/16", "egress": "nat44", "interface": "eth0" },
+    "dns_servers": ["1.1.1.1"]
+  }
+}

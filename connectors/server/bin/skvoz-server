@@ -6,27 +6,51 @@ require 'optparse'
 require 'io/console'
 require_relative '../lib/skvoz/server/service'
 require_relative '../lib/skvoz/server/bootstrap'
+require_relative '../lib/skvoz/server/migration'
 
 module Skvoz
   module Server
     module CLI
       def self.main(arguments)
         command = arguments.shift
-        return puts('skvoz-server 6.0.0') if command == '--version'
+        return puts('skvoz-server 7.0.0') if command == '--version'
         if command.nil? || %w[-h --help].include?(command)
-          puts 'Usage: skvoz-server serve [--config FILE] | health [--state DIR] | node add|list|show|rotate|revoke [IDENTITY] [--state DIR] | user add|list|show|device-add|reset-password|remove [LOGIN] [--state DIR] [--password-stdin|--prompt-password]'
+          puts 'Usage: skvoz-server serve [--config FILE] | migrate-state --source DIR --config FILE | auth-public --offline --config FILE | health|auth-public [--state DIR] | user add|list|show|device-add|reset-password|remove [LOGIN] [--state DIR] [--password-stdin|--prompt-password]'
           return
         end
         options = { state: ENV.fetch('SKVOZ_STATE_DIR', '/var/lib/skvoz') }
-        if command == 'serve'
+        if command == 'auth-public' && arguments.include?('--offline')
+          raise Error, 'Offline bootstrap must run as the unprivileged state owner' if Process.euid.zero?
+          offline = false
+          OptionParser.new do |parser|
+            parser.on('--offline') { offline = true }
+            parser.on('--config FILE') { |path| options[:config] = File.expand_path(path) }
+          end.parse!(arguments)
+          raise Error, 'Offline bootstrap configuration required' unless offline && arguments.empty? && options[:config]
+          config = Configuration.new(JSON.parse(PrivateFiles.read(options[:config]), allow_duplicate_key: false))
+          state = State.new(config)
+          begin
+            puts JSON.pretty_generate(state.auth_public.merge('namespace' => config['namespace']))
+          ensure
+            state.close
+          end
+        elsif command == 'migrate-state'
+          raise Error, 'Migration must run as the unprivileged state owner' if Process.euid.zero?
+          OptionParser.new do |parser|
+            parser.on('--source DIR') { |path| options[:source] = File.expand_path(path) }
+            parser.on('--config FILE') { |path| options[:config] = File.expand_path(path) }
+          end.parse!(arguments)
+          raise Error, 'Migration source and configuration required' unless arguments.empty? && options[:source] && options[:config]
+          config = Configuration.new(JSON.parse(PrivateFiles.read(options[:config]), allow_duplicate_key: false))
+          puts JSON.pretty_generate(Migration.copy(options[:source], config))
+        elsif command == 'serve'
           OptionParser.new { |parser| parser.on('--config FILE') { |path| options[:config] = path } }.parse!(arguments)
           raise Error, 'Unexpected arguments' unless arguments.empty?
           value = if options[:config]
             JSON.parse(PrivateFiles.read(File.expand_path(options[:config])), allow_duplicate_key: false)
           else
             { 'state_dir' => options[:state], 'address' => ENV['SKVOZ_ADDRESS'],
-              'components' => ENV.fetch('SKVOZ_COMPONENTS', 'control,egress').split(','), 'upstream' => ENV['SKVOZ_UPSTREAM'],
-              'leaf_port' => Integer(ENV.fetch('SKVOZ_LEAF_PORT', '7422')), 'advertised_leaf_port' => Integer(ENV.fetch('SKVOZ_ADVERTISED_LEAF_PORT', ENV.fetch('SKVOZ_LEAF_PORT', '7422'))),
+              'leaf_remotes' => ENV['SKVOZ_LEAF_REMOTES'], 'client_address' => ENV['SKVOZ_CLIENT_ADDRESS'], 'client_ca' => ENV['SKVOZ_CLIENT_CA'],
               'port' => Integer(ENV.fetch('SKVOZ_PORT', '4222')),
               'advertised_port' => Integer(ENV.fetch('SKVOZ_ADVERTISED_PORT', ENV.fetch('SKVOZ_PORT', '4222'))),
               'runtime_binary' => ENV.fetch('SKVOZ_RUNTIME_BINARY', 'skvoz-network-runtime'),
@@ -47,11 +71,9 @@ module Skvoz
             exec('setpriv', '--no-new-privs', '--reuid', '10001', '--regid', '10001', '--clear-groups',
               '--bounding-set=-all', '--inh-caps=-all', '--ambient-caps=-all', RbConfig.ruby, __FILE__, command, *arguments)
           end
-          operation = command == 'health' ? 'health' : arguments.shift
-          raise Error, 'Unsupported command' unless %w[health user node].include?(command)
-          identity = arguments.shift if command == 'node' && %w[show rotate revoke].include?(operation)
-          login = arguments.shift unless command == 'node' || %w[health list].include?(operation)
-          operation = 'node-' + operation if command == 'node'
+          operation = %w[health auth-public].include?(command) ? command : arguments.shift
+          raise Error, 'Unsupported command' unless %w[health auth-public user].include?(command)
+          login = arguments.shift unless %w[health auth-public list].include?(operation)
           parser = OptionParser.new do |flags|
             flags.on('--state DIR') { |path| options[:state] = path }
             flags.on('--password-stdin') { options[:stdin] = true }
@@ -68,7 +90,7 @@ module Skvoz
             IO.console.getpass('Password: ')
           end
           raise Error, 'device-add requires password stdin or prompt' if operation == 'device-add' && password.nil?
-          result = request(File.expand_path(options[:state]), operation:, login:, password:, identity:)
+          result = request(File.expand_path(options[:state]), operation:, login:, password:)
           puts JSON.pretty_generate(result)
           exit 1 if operation == 'health' && result['healthy'] != true
         end

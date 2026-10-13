@@ -8,6 +8,8 @@ require_relative 'tls'
 require_relative 'state'
 require_relative 'runtime_control'
 require_relative 'enrollment'
+require_relative 'auth_callout'
+require_relative 'revocation'
 
 module Skvoz
   module Server
@@ -50,14 +52,16 @@ module Skvoz
             next
           end
           raise Error, 'Supervised process exited; container restart required' unless children_alive?
-          raise Error, 'Node credentials changed; container restart required' if @restart_required
           @connector.refresh
           raise Error, 'Runtime control lost' if @connector.failure
-          if @config.control? && !@enrollment&.ready?
+          recover_authentication
+          @revocation.refresh if @revocation.connected?
+          finish_startup_access
+          if !@startup_access_pending && !@enrollment&.ready?
             @enrollment&.stop(graceful: true)
             start_enrollment
           end
-          @healthy = @tls.valid? && @failure.nil? && @connector.ready? && (!@config.control? || @enrollment&.ready?)
+          @healthy = @tls.valid? && @failure.nil? && @connector.ready? && @auth.ready? && @revocation.ready? && @enrollment&.ready? && @state.access_ready?
           raise Error, 'TLS certificate expired' unless @tls.valid?
           renew if %w[acme local].include?(@config.tls['mode']) && @tls.renewal_due? && Time.now >= (@next_renewal || Time.at(0))
           task.sleep(0.25)
@@ -84,7 +88,7 @@ module Skvoz
       end
 
       def healthy?
-        @healthy && !@failure && !@stopping && @tls&.valid? && children_alive? && @connector&.ready? && (!@config.control? || @enrollment&.ready?)
+        @healthy && !@failure && !@stopping && @tls&.valid? && children_alive? && @connector&.ready? && @auth&.ready? && @revocation&.ready? && @enrollment&.ready? && @state.access_ready?
       end
 
       private
@@ -178,10 +182,14 @@ module Skvoz
       def start_runtime
         @runtime_stage = 'tls'
         @nats = @runtime = nil
+        @startup_access_pending = true
+        fence = @state.candidate
+        fence['security_pending'] = true
+        @state.commit(fence)
         renew(initial: true) unless @tls.valid?
         @runtime_stage = 'binary_validation'
-        validate_binary(@config['nats_binary'], 'nats-server: v2.15.0')
-        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.5.0 network=5 api=1 core=4.1.0')
+        validate_binary(@config['nats_binary'], 'nats-server: v2.15.1')
+        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.6.0 network=6 api=1 core=4.1.0')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         @runtime_stage = 'nats_validation'
@@ -189,12 +197,20 @@ module Skvoz
         @runtime_stage = 'nats_start'
         @nats = ChildProcess.new([@config['nats_binary'], '--config', @nats_path], label: 'nats').start(@task)
         @children << @nats
+        @serving_tls = [@nats, @tls]
+        @tls_guard = @task.async { guard_tls_expiry }
         wait_ready { probe }
+        @runtime_stage = 'authentication_start'
+        @revocation = Revocation.new(@config, @state)
+        @revocation.start(@task)
+        @auth = AuthCallout.new(@config, @state, @revocation)
+        @auth.pause!
+        @auth.start(@task)
         @runtime_stage = 'network_start'
         policy = NetworkConfiguration.new(@config)
         policy.inventory!(@config) unless policy.ip? && @helper_owner && ENV['SKVOZ_BOOTSTRAPPED'] == '1'
         profile_path = File.join(@state.directory, 'network-profile.json')
-        profile = JSON.generate(@state.profile(policy))
+        profile = JSON.generate(@state.profile(policy, pending: true))
         raise Error, 'Network startup configuration exceeds limit' if profile.bytesize > 32768
         PrivateFiles.write(profile_path, profile)
         control, child_control = UNIXSocket.pair
@@ -214,14 +230,15 @@ module Skvoz
         helper&.close
         @connector = RuntimeControl.new(control).start(@task)
         wait_ready { @connector.refresh; @connector.ready? }
+        finish_startup_access
         @runtime_stage = 'enrollment_start'
-        start_enrollment if @config.control?
+        start_enrollment unless @startup_access_pending
         @failure = nil
         clear_candidate
         prune_tls
-        @healthy = @tls.valid?
+        @healthy = @tls.valid? && !@startup_access_pending
         @runtime_stage = 'running'
-        Diagnostics.emit('runtime_ready', revision: @state.revision)
+        Diagnostics.emit(@startup_access_pending ? 'runtime_reconciliation_pending' : 'runtime_ready', revision: @state.revision)
       rescue StandardError
         control&.close unless control&.closed?
         raise
@@ -235,8 +252,8 @@ module Skvoz
           @mutation.acquire do
             raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
             candidate, id = @state.enroll(login, token)
-            apply(candidate) if candidate
-            { v: 3, namespace: @config['namespace'], peer_id: id, network_runtime: State::VERSIONS }
+            apply_access(candidate) if candidate
+            { v: 4, namespace: @config['namespace'], peer_id: id, network_runtime: State::VERSIONS }
           end
         end.start(@task)
       end
@@ -277,7 +294,7 @@ module Skvoz
         end
       end
 
-      def probe(login: State::INTERNAL, password: @state.value.fetch('internal_password'), serial: nil)
+      def probe(login: @state.service('probe').fetch('username'), password: @state.service('probe').fetch('password'), serial: nil)
         Async::Task.current.with_timeout(2) do
           socket = TCPSocket.new('127.0.0.1', @config['port'])
           tls = BrokerTLS.connect(socket, identity: @config['address'], ca: @state.value.fetch('tls')['ca'])
@@ -309,8 +326,9 @@ module Skvoz
         JSON.parse(body).fetch('config_load_time')
       end
 
-      def apply(candidate, credentials: nil, old_credentials: nil, expected_serial: nil)
+      def apply(candidate, expected_serial: nil)
         raise Error, 'Runtime not ready for configuration apply' unless @nats&.alive?
+        previous_tls = @serving_tls
         candidate_path = File.join(@state.directory, 'candidate.json')
         candidate_config = File.join(@state.directory, 'candidate.conf')
         previous_config = @state.nats_config
@@ -325,32 +343,71 @@ module Skvoz
         @task.sleep(0.02) while monitor_revision == previous && monotonic < deadline
         raise Error, 'NATS reload apply unconfirmed' if monitor_revision == previous
         probe(serial: expected_serial)
-        probe(login: credentials[0], password: credentials[1]) if credentials
-        if old_credentials
-          begin
-            probe(login: old_credentials[0], password: old_credentials[1])
-          rescue Error
-            revoked = true
-          end
-          raise Error, 'NATS old credential remains active' unless revoked
-        end
+        @serving_tls = [@nats, material_from(candidate.fetch('tls'))] if expected_serial
         @state.commit(candidate)
-        @connector.request('UPDATE_REGISTRY', @state.registry) if @config.control? && @connector
         @failure = nil
         @healthy = @connector&.ready? && @tls.valid?
         true
       rescue StandardError, Async::Stop => error
         Diagnostics.emit('configuration_apply_failed', revision: candidate['revision'], **Diagnostics.error_fields(error))
-        @failure = 'configuration_apply_uncertain'
+        @failure = 'configuration_apply_uncertain' unless @stopping
         @healthy = false
         @connector&.stop
         @enrollment&.stop
+        @auth&.pause!
         PrivateFiles.write(@nats_path, previous_config) if previous_config
+        @serving_tls = previous_tls if previous_tls
         @nats&.signal('HUP')
         raise if error.is_a?(Async::Stop)
         raise Error, 'Configuration apply failed; recovery required'
       ensure
         clear_candidate unless @failure == 'configuration_apply_uncertain'
+      end
+
+      def apply_access(candidate)
+        raise Error, 'Runtime not ready for access update' unless @connector&.ready?
+        previous = @state.value
+        candidate['security_pending'] = true
+        @state.commit(candidate)
+        @connector.update_devices(@state.access_set(previous: previous))
+        confirmed = @state.candidate
+        confirmed['security_pending'] = false
+        @state.commit(confirmed)
+        @failure = nil
+      rescue StandardError, Async::Stop => error
+        @failure = 'configuration_apply_uncertain'
+        @healthy = false
+        @auth&.pause!
+        @enrollment&.stop
+        @connector&.stop
+        Diagnostics.emit('access_apply_failed', **Diagnostics.error_fields(error))
+        raise
+      end
+
+      def recover_authentication
+        return if monotonic < (@next_auth_recovery || 0)
+        @next_auth_recovery = monotonic + 1
+        @revocation.start(@task) unless @revocation.connected?
+        unless @auth.ready?
+          @auth.stop
+          @auth = AuthCallout.new(@config, @state, @revocation).start(@task)
+        end
+      rescue Error, Async::TimeoutError, IOError, SystemCallError => error
+        Diagnostics.emit('authentication_recovery_pending', **Diagnostics.error_fields(error))
+      end
+
+      def finish_startup_access
+        return unless @startup_access_pending && @revocation.ready? && @connector.ready?
+        @mutation.acquire do
+          # The initial runtime has no admitted devices. Only complete native
+          # inventory permits the current durable set, including retained IDs.
+          @connector.update_devices(@state.access_set)
+          confirmed = @state.candidate
+          confirmed['security_pending'] = false
+          @state.commit(confirmed)
+          @auth.resume!
+          @startup_access_pending = false
+        end
       end
 
       def clear_candidate
@@ -407,15 +464,7 @@ module Skvoz
         end
         result = Async::Task.current.with_timeout(15) { @mutation.acquire { command(request) } }
         Async::Task.current.with_timeout(2) { socket.write(JSON.generate('ok' => true, 'result' => result) + "\n") }
-        if @restart_after_admin
-          @restart_required = true
-          @applying = false
-        end
       rescue StandardError => error
-        if @restart_after_admin
-          @restart_required = true
-          @applying = false
-        end
         Diagnostics.emit('administration_failed', **Diagnostics.error_fields(error))
         socket.write(JSON.generate('ok' => false, 'error' => 'Administration request failed') + "\n") rescue nil
       ensure
@@ -423,67 +472,41 @@ module Skvoz
       end
 
       def command(request)
-        raise Error, 'Invalid administration schema' unless request.is_a?(Hash) && (request.keys - %w[operation login password identity]).empty?
+        raise Error, 'Invalid administration schema' unless request.is_a?(Hash) && (request.keys - %w[operation login password]).empty?
         operation = request['operation']
-        raise Error, 'Invalid administration operation' unless %w[health list show add device-add reset-password remove node-add node-list node-show node-rotate node-revoke].include?(operation)
-        raise Error, 'Invalid administration login type' unless request['login'].nil? || request['login'].is_a?(String)
-        raise Error, 'Invalid administration password' unless request['password'].nil? || request['password'].is_a?(String)
-        unless %w[health list node-add node-list node-show node-rotate node-revoke].include?(operation)
-          raise Error, 'Invalid administration login' unless request['login'].is_a?(String) && request['login'].match?(State::LOGIN)
-        end
-        return { 'healthy' => healthy?, 'revision' => @state.revision, 'failure' => @failure, 'connector' => @connector&.statistics } if operation == 'health'
-        raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain'
-        if operation.start_with?('node-')
-          raise Error, 'Node administration requires control component' unless @config.control?
-          return @state.value.fetch('nodes').map { |identity, node| { 'identity' => identity, 'node_id' => node.fetch('node_id') } } if operation == 'node-list'
-          if operation == 'node-show'
-            identity = request['identity']
-            raise Error, 'Invalid node identity' unless identity.is_a?(String) && identity.match?(/\A[0-9a-f]{32}\z/)
-            node = @state.value.fetch('nodes').fetch(identity) { raise Error, 'Node does not exist' }
-            return { 'identity' => identity, 'node_id' => node.fetch('node_id'), 'address' => @config['address'], 'port' => @config['advertised_leaf_port'] }
-          end
-          candidate, result = @state.mutate_node(operation, request['identity'])
-          if operation == 'node-add'
-            apply(candidate)
-          else
-            path = File.join(@state.directory, 'candidate.conf')
-            PrivateFiles.write(path, @state.nats_config(candidate))
-            validate_nats(path)
-            @applying = true
-            @healthy = false
-            @state.commit(candidate)
-            # Once durable credentials change, every failure must close this
-            # generation; a failed stop must never resume the old broker.
-            @restart_after_admin = true
-            @nats.stop(monotonic + 5)
-            raise Error, 'Broker revoke closure unconfirmed' if @nats.alive?
-          end
-          return result
-        end
-        raise Error, 'Client administration requires control component' unless @config.control?
+        raise Error, 'Invalid administration operation' unless %w[health auth-public list show add device-add reset-password remove].include?(operation)
+        raise Error, 'Invalid administration password' unless request['password'].nil? || State.password?(request['password'])
+        return { 'healthy' => healthy?, 'revision' => @state.revision, 'failure' => @failure,
+                 'connector' => @connector&.statistics, 'revocation' => @revocation&.statistics,
+                 'authentication' => { 'overloaded' => @auth&.overloaded } } if operation == 'health'
+        raise Error, 'Configuration recovery required' if @failure == 'configuration_apply_uncertain' || !@state.access_ready?
+        return @state.auth_public.merge('namespace' => @config['namespace']) if operation == 'auth-public'
         return @state.value.fetch('users').map { |login, user| { 'login' => login, 'devices' => user.fetch('assigned').length, 'capacity' => user.fetch('ids').length } } if operation == 'list'
         login = request.fetch('login')
+        raise Error, 'Invalid administration login' unless State.login?(login)
         if operation == 'show'
           user = @state.value.fetch('users').fetch(login)
-          return { 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login, 'devices' => user.fetch('assigned'), 'trust' => @state.value.fetch('tls')['ca'] ? 'managed_ca' : 'system' }
+          return { 'address' => @config['client_address'], 'port' => @config['advertised_port'], 'username' => login,
+                   'devices' => user.fetch('assigned'), 'trust' => @state.client_ca ? 'managed_ca' : 'system' }
         end
         password = request['password']
         password ||= SecureRandom.urlsafe_base64(32) if %w[add reset-password].include?(operation)
-        candidate, id = @state.mutate(operation, login, password:)
-        credentials = [login, password] if %w[add reset-password device-add].include?(operation)
+        hash = @auth.hash_password(password) if %w[add reset-password].include?(operation)
+        verified = @auth.verify_password(login, password) if operation == 'device-add'
+        candidate, id = @state.mutate(operation, login, password: password, hash: hash, verified: verified)
         if id
           result = @state.export(login, id, password)
-          result['ca_pem'] = PrivateFiles.read(@state.value.fetch('tls')['ca']) if @state.value.fetch('tls')['ca']
+          result['ca_pem'] = PrivateFiles.read(@state.client_ca) if @state.client_ca
           raise Error, 'Export exceeds administration response limit' if JSON.generate(result).bytesize > 65_472
         end
-        apply(candidate, credentials:)
-        if id
-          result
-        elsif operation == 'reset-password'
-          { 'address' => @config['address'], 'port' => @config['advertised_port'], 'username' => login, 'password' => password }
-        else
-          { 'removed' => login }
-        end
+        apply_access(candidate)
+        retirement = @revocation.revoke
+        result ||= if operation == 'reset-password'
+                     { 'address' => @config['client_address'], 'port' => @config['advertised_port'], 'username' => login, 'password' => password }
+                   else
+                     { 'removed' => login }
+                   end
+        result.merge(retirement)
       end
 
       def children_alive?
@@ -493,6 +516,7 @@ module Skvoz
         end
         return false unless @nats
         return child_failure(@nats.exit_category) unless @nats.alive?
+        return child_failure('certificate_guard_unavailable') if @tls_guard && !@tls_guard.alive?
         return child_failure(@runtime.exit_category) if @runtime && !@runtime.alive?
         if @helper_status
           cause = if @helper_status == :reaped
@@ -519,6 +543,30 @@ module Skvoz
         false
       end
       def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      def guard_tls_expiry
+        loop do
+          child, material = @serving_tls
+          unless material.valid?
+            # This binding names the owned broker and its confirmed serving generation.
+            # Issuance, reload and mutation waits must not extend certificate access.
+            @failure = 'certificate_expired'
+            stop
+            @auth&.pause!
+            child.signal('KILL')
+            Diagnostics.emit('certificate_expired', serial: material.serial)
+            @task.cancel
+            return
+          end
+          Async::Task.current.sleep(0.1)
+        end
+      rescue StandardError => error
+        @failure = 'certificate_guard_unavailable'
+        stop
+        @nats&.signal('KILL')
+        Diagnostics.emit(@failure, **Diagnostics.error_fields(error))
+        @task.cancel
+      end
 
       def sleep_until(deadline)
         @task.sleep([0.1, deadline - monotonic].min) while !@stopping && monotonic < deadline
@@ -558,8 +606,11 @@ module Skvoz
 
       def shutdown(deadline)
         stop
+        @tls_guard&.stop if @tls_guard&.alive?
         @listener&.close
         @enrollment&.stop
+        @auth&.stop
+        @revocation&.stop
         begin
           @connector&.prepare_shutdown(timeout: [5, deadline - monotonic].min)
         rescue Error

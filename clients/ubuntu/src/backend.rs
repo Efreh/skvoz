@@ -203,13 +203,13 @@ impl Engine {
         .map_err(|_| Error("version_mismatch"))??;
         if !output.status.success()
             || String::from_utf8_lossy(&output.stdout).trim()
-                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=5 api=1 core=4.1.0")
+                != format!("skvoz-network-runtime {RUNTIME_VERSION} network=6 api=1 core=4.1.0")
         {
             return Err(Error("version_mismatch"));
         }
         let endpoint = std::net::SocketAddr::new(broker, credentials.port);
         let config = StartupConfig {
-            v: 2,
+            v: 3,
             role: Role::Client,
             core: CoreConfig {
                 url: format!("tls://{endpoint}"),
@@ -230,8 +230,8 @@ impl Engine {
                 namespace: enrollment.namespace,
                 peer_id: enrollment.peer_id.to_string(),
                 membership: "allowlist".into(),
-                allowed_peers: vec![],
-                initiate: vec![],
+                allowed_peers: vec!["0".into()],
+                initiate: vec!["0".into()],
             },
             network: NetworkConfig {
                 families: preferences.runtime_families(),
@@ -240,10 +240,7 @@ impl Engine {
                 limits: Limits::canonical(Role::Client),
             },
             server: None,
-            routing: skvoz_network::config::RoutingConfig {
-                egress: false,
-                authority: None,
-            },
+            access: None,
         };
         config
             .validate()
@@ -281,7 +278,7 @@ impl Engine {
         remember_child(&runtime, child_id)?;
         self.control = Some(Session::new(local.into(), false)?);
         let session = self.control.as_mut().ok_or(Error("ipc_failed"))?;
-        let hello = session.call("HELLO", json!({"api":1,"network":5})).await?;
+        let hello = session.call("HELLO", json!({"api":1,"network":6})).await?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Capabilities {
@@ -300,7 +297,7 @@ impl Engine {
         }
         let hello: Hello = serde_json::from_value(hello).map_err(|_| Error("version_mismatch"))?;
         if hello.api != 1
-            || hello.network != 5
+            || hello.network != 6
             || hello.role != Role::Client
             || hello.capabilities.profiles != ["tcp", "ip"]
             || hello.capabilities.families != preferences.runtime_families()
@@ -460,7 +457,7 @@ impl Engine {
             let socket = socket.into_std()?;
             let helper = Session::new(socket.into(), true)?;
             helper
-                .helper_call("HELLO", json!({"api":1,"network":5}))
+                .helper_call("HELLO", json!({"api":1,"network":6}))
                 .await?;
             self.helper = Some(helper);
         }

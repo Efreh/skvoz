@@ -1,4 +1,4 @@
-//! Shared enrollment3 transport and strict current-component negotiation.
+//! Shared enrollment4 transport and strict current-component negotiation.
 use futures_util::StreamExt;
 use serde::Deserialize;
 use std::{path::PathBuf, time::Duration};
@@ -129,11 +129,11 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             .flush()
             .await
             .map_err(|_| Error("enrollment_failed"))?;
-        let body = serde_json::to_vec(&serde_json::json!({"v":3,"device":device}))
+        let body = serde_json::to_vec(&serde_json::json!({"v":4,"device":device}))
             .map_err(|_| Error("enrollment_failed"))?;
         client
             .publish_with_reply(
-                format!("skvoz.enroll.v3.{}", credentials.username),
+                format!("skvoz.enroll.v4.{}", credentials.username),
                 reply,
                 body.into(),
             )
@@ -148,8 +148,8 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         if message.payload.len() > 512 {
             return Err(Error("enrollment_failed"));
         }
-        let value: serde_json::Value =
-            serde_json::from_slice(&message.payload).map_err(|_| Error("enrollment_failed"))?;
+        let value = crate::local_api::parse_strict_json(&message.payload)
+            .map_err(|_| Error("enrollment_failed"))?;
         if let Some(error) = value.get("error") {
             return Err(Error(if error == "device_limit" {
                 "device_limit"
@@ -159,7 +159,7 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         }
         let result: Enrollment =
             serde_json::from_value(value).map_err(|_| Error("version_mismatch"))?;
-        if result.v != 3
+        if result.v != 4
             || result.network_runtime.version != env!("CARGO_PKG_VERSION")
             || result.network_runtime.api != 1
             || result.network_runtime.network != crate::NETWORK_VERSION
@@ -167,10 +167,11 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
         {
             return Err(Error("version_mismatch"));
         }
-        if !crate::routing::device_id(result.peer_id)
+        if !crate::access::device_id(result.peer_id)
             || result.namespace.len() > 256
             || result.namespace.split('.').any(|part| {
                 part.is_empty()
+                    || part.len() > 64
                     || !part
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')

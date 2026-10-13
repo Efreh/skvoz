@@ -26,14 +26,14 @@ module Skvoz
         @closed = false
         @owner_eof = false
         @counters = {}
-        @routing = { 'control_ready' => false, 'eligible_exits' => 0 }
+        @access_revision = 0
         @seq = 0
       end
 
       def start(task)
         @reader = task.async { reader }
-        hello = request('HELLO', { 'api' => 1, 'network' => 5 })
-        raise Error, 'Incompatible runtime HELLO' unless hello.is_a?(Hash) && hello.keys.sort == %w[api capabilities network role] && hello['api'].is_a?(Integer) && hello['api'] == 1 && hello['network'].is_a?(Integer) && hello['network'] == 5 && hello['role'] == 'server' && capabilities?(hello['capabilities'])
+        hello = request('HELLO', { 'api' => 1, 'network' => 6 })
+        raise Error, 'Incompatible runtime HELLO' unless hello.is_a?(Hash) && hello.keys.sort == %w[api capabilities network role] && hello['api'].is_a?(Integer) && hello['api'] == 1 && hello['network'].is_a?(Integer) && hello['network'] == 6 && hello['role'] == 'server' && capabilities?(hello['capabilities'])
         self
       rescue StandardError
         close
@@ -73,14 +73,28 @@ module Skvoz
 
       def ready? = @ready && !@closed
       def owner_eof? = @owner_eof
-      def statistics = @counters.merge('routing' => @routing)
+      def statistics = @counters.merge('access_revision' => @access_revision)
+
+      def update_devices(access)
+        valid = access.is_a?(Hash) && access.keys.sort == %w[devices revision revoke] && access['revision'].is_a?(Integer) && access['revision'].between?(1, (1 << 63) - 1)
+        valid &&= %w[devices revoke].all? do |key|
+          ids = access[key]
+          ids.is_a?(Array) && ids.size <= 128 && ids.all? { |id| id.is_a?(Integer) && id.positive? && id < 1 << 63 } && ids == ids.uniq.sort
+        end
+        valid &&= (access['devices'] & access['revoke']).empty?
+        raise Error, 'Invalid local device set' unless valid
+        response = request('UPDATE_DEVICES', access, timeout: 3)
+        unless response.is_a?(Hash) && response.keys == ['revision'] && response['revision'] == access.fetch('revision')
+          close
+          raise Error, 'Runtime access update unconfirmed'
+        end
+        @access_revision = response.fetch('revision')
+      end
 
       def refresh
         value = request('STATUS')
-        raise Error, 'Invalid runtime STATUS' unless value.is_a?(Hash) && value.keys.sort == %w[counters lifecycle mode routing session] && LIFECYCLE.include?(value['lifecycle']) && value['mode'] == 'server' && value['session'].nil?
-        routing = value['routing']
-        raise Error, 'Invalid runtime routing status' unless routing.is_a?(Hash) && routing.keys.sort == %w[control_ready eligible_exits] && [true, false].include?(routing['control_ready']) && routing['eligible_exits'].is_a?(Integer) && routing['eligible_exits'].between?(0, 8)
-        @routing = routing
+        raise Error, 'Invalid runtime STATUS' unless value.is_a?(Hash) && value.keys.sort == %w[access_revision counters lifecycle mode session] && LIFECYCLE.include?(value['lifecycle']) && value['mode'] == 'server' && value['session'].nil? && value['access_revision'].is_a?(Integer) && value['access_revision'].between?(@access_revision, (1 << 63) - 1)
+        @access_revision = value['access_revision']
         @ready = value['lifecycle'] == 'ready'
         @counters = counters(value['counters'])
         value

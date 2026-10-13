@@ -107,7 +107,7 @@ def qualify(root, settings, certificate_factory):
                 'deny':[], 'service_prefixes':[], 'lease_store':'/var/lib/skvoz-network/leases.json',
                 'server_addresses':[U+'.20',E+'.20',V+'::20'],
                 'management_endpoints':[{'address':U+'.20','protocol':6,'port':4222}]}
-            standalone(value, authority_password, [1, 2])
+            standalone(value, [1, 2])
         return value
 
 
@@ -147,11 +147,10 @@ def qualify(root, settings, certificate_factory):
     io_pair = f'{os.major(io_device)}:{os.minor(io_device)}'
 
     passwords=[secrets.token_hex(24) for _ in range(3)]
-    authority_password = secrets.token_hex(24)
     try:
         certificate_factory(OUT)
         ns=f'skvoz.runtime.{TOKEN}.joint'
-        users = topology_users(ns, passwords, authority_password)
+        users = topology_users(ns, passwords)
         private(OUT/'nats.json',{'port':4222,'http_port':8222,'max_payload':65588,'max_pending':4194304,
             'tls':{'cert_file':'/fixture/server.pem','key_file':'/fixture/server.key','ca_file':'/fixture/ca.pem','handshake_first':False},
             'authorization':{'users':users}})

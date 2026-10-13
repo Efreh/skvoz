@@ -12,7 +12,7 @@ module Skvoz
       def self.connect(raw, identity:, ca:)
         line = raw.gets("\r\n", 4096)
         raise Error, 'Invalid NATS greeting' unless line && line.start_with?('INFO ') && line.end_with?("\r\n")
-        info = JSON.parse(line.delete_prefix('INFO '))
+        info = JSON.parse(line.delete_prefix('INFO '), max_nesting: 8, allow_duplicate_key: false)
         raise Error, 'NATS TLS required' unless info.is_a?(Hash) && info['tls_required'] == true
         context = OpenSSL::SSL::SSLContext.new
         context.ca_file = ca if ca
@@ -22,6 +22,7 @@ module Skvoz
         tls.hostname = identity
         tls.connect
         tls.post_connection_check(identity)
+        yield(info) if block_given?
         tls
       rescue StandardError
         tls ? tls.close : raw.close

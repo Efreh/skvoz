@@ -1,0 +1,7 @@
+[Unit]
+Description=Retry failed native NATS certificate renewal
+
+[Timer]
+OnActiveSec=5min
+AccuracySec=1s
+Unit=skvoz-nats-renew.service

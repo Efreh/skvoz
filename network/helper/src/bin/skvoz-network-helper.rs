@@ -22,7 +22,7 @@ fn main() {
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args == ["--version"] {
-        println!("skvoz-network-helper 0.5.0 api=1 network=5");
+        println!("skvoz-network-helper 0.6.0 api=1 network=6");
         return Ok(());
     }
     if args == ["--help"] {

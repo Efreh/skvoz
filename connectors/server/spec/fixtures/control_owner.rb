@@ -4,12 +4,14 @@ require 'json'
 require 'socket'
 
 if ARGV == ['--version']
-  puts 'skvoz-network-runtime 0.5.0 network=5 api=1 core=4.1.0'
+  puts 'skvoz-network-runtime 0.6.0 network=6 api=1 core=4.1.0'
   exit
 end
 
 socket = UNIXSocket.for_fd(Integer(ARGV.fetch(ARGV.index('--control-fd') + 1)))
 profile = ARGV.fetch(ARGV.index('--config') + 1)
+startup = JSON.parse(File.read(profile), allow_duplicate_key: false)
+access = startup.fetch('access')
 pid_path = File.join(File.dirname(profile), 'control-owner.pid')
 File.write(pid_path, Process.pid.to_s)
 File.chmod(0o600, pid_path)
@@ -39,10 +41,15 @@ begin
     end
     result = case request.fetch('op')
              when 'HELLO'
-               { api: 1, network: 5, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }
+               { api: 1, network: 6, role: 'server', capabilities: { profiles: ['tcp'], families: [], max_mtu: 1500, max_channels: 1 } }
              when 'STATUS'
                names = %w[tcp_open ip_sessions packet_in packet_out packet_dropped queue_bytes queue_records buffer_bytes buffer_records errors uploaded downloaded]
-               { lifecycle: 'ready', mode: 'server', session: nil, routing: { control_ready: true, eligible_exits: 1 }, counters: names.to_h { |name| [name, 0] } }
+               { lifecycle: 'ready', mode: 'server', session: nil, access_revision: access.fetch('revision'), counters: names.to_h { |name| [name, 0] } }
+             when 'UPDATE_DEVICES'
+               access = request.fetch('args')
+               raise IOError unless access.keys.sort == %w[devices revision revoke] && access.fetch('devices').is_a?(Array) && access.fetch('revoke').is_a?(Array)
+               File.write(File.join(File.dirname(profile), 'control-owner-access.json'), JSON.generate(access))
+               { revision: access.fetch('revision') + (mode == 'unconfirmed-startup-runtime' ? 1 : 0) }
              when 'PREPARE_SHUTDOWN' then {}
              else raise IOError
              end

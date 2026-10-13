@@ -26,7 +26,7 @@ def qualify(root, settings, certificates, mode='capacity'):
             sub = ['tcp_capacity.join.0.*','tcp_capacity.lane.0.*.*.*.*.*'] if peer == 0 else [f'tcp_capacity.join.{peer}.*',f'tcp_capacity.lane.{peer}.*.*.*.*.*']
             users.append({'user':f'p{peer}', 'password':secrets.token_hex(24), 'permissions':{'publish':pub,'subscribe':sub}})
         if not settings.tcp_capacity_baseline_binary:
-            users = topology_users('tcp_capacity', [user['password'] for user in users], secrets.token_hex(24))
+            users = topology_users('tcp_capacity', [user['password'] for user in users])
         nats = {'port':4222, 'http_port':8222, 'max_payload':65588, 'max_pending':4194304,
             'tls':{'cert_file':'/work/server.pem','key_file':'/work/server.key','ca_file':'/work/ca.pem','handshake_first':False},
             'authorization':{'users':users}}

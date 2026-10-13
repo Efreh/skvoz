@@ -89,7 +89,7 @@ RSpec.describe 'Embedded Android JNI host on the Linux JVM', integration: true d
       expect(status.success?).to be(true), stderr
       expect(stdout).to include('CLOSED_RECOVERABLE_REPLACED_HANDLES0_DIAGNOSTICS_RESET_BOUNDED')
       warn stdout.strip
-      # Fifty fresh incarnations may each wait for the prior device's 9s fence.
+      # Fifty fresh incarnations exercise the same durable device identity.
       # The Java owner still checks READY, closure, handles and final FD count.
       stdout, stderr, status = capture('java', '-Xmx128m', "-Djava.library.path=#{native}", '-cp', directory, 'org.skvoz.android.NativeBridge', path, 'cycles', timeout: 600)
       expect(status.success?).to be(true), stderr

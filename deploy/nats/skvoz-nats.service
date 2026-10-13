@@ -1,0 +1,27 @@
+[Unit]
+Description=SKVOZ native NATS entry
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skvoz-nats
+Group=skvoz-nats
+EnvironmentFile=/etc/skvoz-nats/entry.env
+ExecStartPre=/usr/local/lib/skvoz-nats/tls.sh check
+ExecStart=/usr/local/bin/nats-server -c /var/lib/skvoz-nats/nats.conf
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStartPost=+/usr/local/lib/skvoz-nats/tls.sh schedule
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/skvoz-nats
+LimitCORE=0
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

@@ -1,10 +1,8 @@
 #![cfg(feature = "real-nats")]
 //! Safe orchestration of an actual C ABI consumer and isolated private target.
-use skvoz_network::config::{
-    AuthorityConfig, CoreConfig, Limits, Role, ServerConfig, StartupConfig,
-};
+use skvoz_network::access::DeviceSet;
+use skvoz_network::config::{CoreConfig, Limits, Role, ServerConfig, StartupConfig};
 use skvoz_network::local_api::parse_strict_json;
-use skvoz_network::routing::Registry;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -49,11 +47,7 @@ fn configured(role: Role, target: &str, directory: &Path) -> StartupConfig {
     ))
     .unwrap();
     let credential = if role == Role::Server { 0 } else { 1 };
-    let node_id = std::env::var("SKVOZ_NATS_FFI_NODE_ID")
-        .unwrap()
-        .parse::<u64>()
-        .unwrap();
-    let id = if role == Role::Server { node_id } else { 1 };
+    let id = if role == Role::Server { 0 } else { 1 };
     config.role = role;
     config.core = CoreConfig {
         url: std::env::var("SKVOZ_NATS_URL").unwrap(),
@@ -68,23 +62,18 @@ fn configured(role: Role, target: &str, directory: &Path) -> StartupConfig {
         ),
         peer_id: id.to_string(),
         membership: "allowlist".into(),
-        allowed_peers: vec![],
+        allowed_peers: vec![(1 - id).to_string()],
         initiate: vec![],
     };
+    if role == Role::Client {
+        config.core.initiate = vec!["0".into()];
+    }
     config.network.limits = Limits::canonical(role);
     if role == Role::Server {
-        let mut authority = config.core.clone();
-        authority.peer_id = "0".into();
-        authority.username = "ffi-authority".into();
-        authority.password = std::env::var("SKVOZ_NATS_FFI_AUTHORITY_PASSWORD").unwrap();
-        config.routing.egress = true;
-        config.routing.authority = Some(AuthorityConfig {
-            core: authority,
-            registry: Registry {
-                revision: 1,
-                devices: vec![1],
-                nodes: vec![node_id],
-            },
+        config.access = Some(DeviceSet {
+            revision: 1,
+            devices: vec![1],
+            revoke: vec![],
         });
         config.network.families.clear();
         let value = parse_strict_json(format!(
@@ -139,6 +128,8 @@ fn actual_c_abi_binary_tcp_and_fd_ownership_over_verified_tls_nats() {
         "--network",
         &target.network,
         "--pull=never",
+        "--user",
+        "0:0",
         "--cap-drop=ALL",
         "--security-opt",
         "no-new-privileges",
@@ -158,7 +149,12 @@ fn actual_c_abi_binary_tcp_and_fd_ownership_over_verified_tls_nats() {
         "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
         &target.container,
     ]);
-    let _: std::net::Ipv4Addr = address.parse().unwrap();
+    assert!(
+        address.parse::<std::net::Ipv4Addr>().is_ok(),
+        "Echo target has no valid IPv4 address: {address:?}; state={}; logs={:?}",
+        capture(&["inspect", "--format", "{{json .State}}", &target.container]),
+        docker(&["logs", "--tail", "20", &target.container])
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         // BusyBox may bind the dual-stack wildcard through an IPv6 socket.

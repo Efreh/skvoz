@@ -8,9 +8,13 @@ fn shared_runtime_profiles_bound_aggregate_server_input_without_growing_queues()
     assert_eq!(runtime.max_incoming_per_turn, 32);
     assert_eq!(runtime.max_outgoing_per_turn, 32);
     client.role = Role::Server;
-    client.core.peer_id = ((1u64 << 63) + 8).to_string();
+    client.core.peer_id = "0".into();
     client.core.membership = "allowlist".into();
-    client.routing.egress = true;
+    client.access = Some(skvoz_network::access::DeviceSet {
+        revision: 1,
+        devices: vec![],
+        revoke: vec![],
+    });
     client.core.allowed_peers.clear();
     client.core.initiate.clear();
     client.network.limits = Limits::canonical(Role::Server);
@@ -117,7 +121,7 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     let config = StartupConfig::parse_json(CLIENT).unwrap();
     assert_eq!(
         config.network.limits.transport_reservation(Role::Client),
-        13_322_400 + 8 * 2048 + 8 * 512
+        13_322_400 + 2048 + 512
     );
     assert_eq!(
         Limits::canonical(Role::Server).transport_reservation(Role::Server),
@@ -126,6 +130,7 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     let value: Value = serde_json::from_slice(CLIENT).unwrap();
     for (parent, key) in [
         ("", "server"),
+        ("", "access"),
         ("core", "tls_server_name"),
         ("core", "ca_file"),
     ] {
@@ -140,7 +145,7 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     }
     let duplicate = String::from_utf8(CLIENT.to_vec())
         .unwrap()
-        .replace("\"v\": 2", "\"v\": 2, \"v\": 2");
+        .replace("\"v\": 3", "\"v\": 3, \"v\": 3");
     assert_ne!(duplicate.as_bytes(), CLIENT);
     assert!(StartupConfig::parse_json(duplicate.as_bytes()).is_err());
     let mut bad = value.clone();
@@ -378,19 +383,19 @@ fn events_have_exact_typed_data_and_allow_independent_local_session_handle() {
 }
 
 #[test]
-fn current_status_requires_bounded_routing_and_strict_complete_counters() {
+fn current_status_requires_current_access_revision_and_strict_complete_counters() {
     let value = json!({"lifecycle":"ready", "mode":"server", "session":null,
-        "routing":{"control_ready":true,"eligible_exits":2},
+        "access_revision":2,
         "counters":Counters::default()});
     let status: RuntimeStatus = arguments(&value).unwrap();
     status.validate().unwrap();
-    for field in ["routing", "session", "counters"] {
+    for field in ["access_revision", "session", "counters"] {
         let mut bad = value.clone();
         bad.as_object_mut().unwrap().remove(field);
         assert!(arguments::<RuntimeStatus>(&bad).is_err());
     }
     let mut bad = value.clone();
-    bad["routing"]["eligible_exits"] = json!(9);
+    bad["access_revision"] = json!(1u64 << 63);
     assert!(
         arguments::<RuntimeStatus>(&bad)
             .unwrap()
@@ -398,9 +403,81 @@ fn current_status_requires_bounded_routing_and_strict_complete_counters() {
             .is_err()
     );
     bad = value.clone();
-    bad["routing"]["legacy"] = json!(false);
+    bad["routing"] = json!({"legacy":false});
     assert!(arguments::<RuntimeStatus>(&bad).is_err());
     bad = value;
     bad["counters"].as_object_mut().unwrap().remove("tcp_open");
     assert!(arguments::<RuntimeStatus>(&bad).is_err());
+}
+
+#[test]
+fn startup_has_one_direct_server_and_exact_local_assigned_set_without_legacy_roles() {
+    let mut client: Value = serde_json::from_slice(CLIENT).unwrap();
+    for (field, value) in [
+        ("v", json!(2)),
+        ("routing", json!({"egress":false,"authority":null})),
+    ] {
+        let mut bad = client.clone();
+        bad[field] = value;
+        assert!(StartupConfig::parse_json(&wire(&bad)).is_err());
+    }
+    client["core"]["allowed_peers"] = json!([]);
+    assert!(StartupConfig::parse_json(&wire(&client)).is_err());
+    let mut server = StartupConfig::parse_json(CLIENT).unwrap();
+    server.role = Role::Server;
+    server.core.peer_id = "0".into();
+    server.core.allowed_peers = vec!["1".into()];
+    server.core.initiate.clear();
+    server.network.limits = Limits::canonical(Role::Server);
+    server.network.families.clear();
+    server.server = Some(serde_json::from_value(json!({"ipv4":null,"ipv6":null,"dns_servers":[],"allow":[],"deny":[],"service_prefixes":[],"lease_store":std::env::temp_dir().join("leases.json"),"server_addresses":[],"management_endpoints":[]})).unwrap());
+    server.access = Some(skvoz_network::access::DeviceSet {
+        revision: 1,
+        devices: vec![1],
+        revoke: vec![],
+    });
+    server.validate().unwrap();
+    server.access.as_mut().unwrap().devices.clear();
+    assert!(server.validate().is_err());
+    server.access.as_mut().unwrap().devices.push(1);
+    let assigned = server.clone();
+    server.core.allowed_peers.clear();
+    server.access = Some(skvoz_network::access::DeviceSet {
+        revision: 0,
+        devices: vec![],
+        revoke: vec![],
+    });
+    StartupConfig::parse_json(&serde_json::to_vec(&server).unwrap()).unwrap();
+    for key in ["devices", "revoke"] {
+        let mut bad = serde_json::to_value(&server).unwrap();
+        bad["access"][key] = json!([1]);
+        assert!(StartupConfig::parse_json(&wire(&bad)).is_err());
+    }
+    let mut client_zero: Value = serde_json::from_slice(CLIENT).unwrap();
+    client_zero["access"] = json!({"revision":0,"devices":[],"revoke":[]});
+    assert!(StartupConfig::parse_json(&wire(&client_zero)).is_err());
+    let fenced = server.access.as_ref().unwrap();
+    assert!(fenced.transition(assigned.access.as_ref().unwrap()).is_ok());
+    assert!(fenced.transition(fenced).is_err());
+    server = assigned;
+    server.core.peer_id = ((1u64 << 63) + 1).to_string();
+    assert!(server.validate().is_err());
+}
+#[test]
+fn local_assigned_set_request_is_strict_finite_and_has_no_remote_registry() {
+    let valid = json!({"v":1,"id":1,"op":"UPDATE_DEVICES","args":{"revision":2,"devices":[2,3],"revoke":[1]},"fd_count":0});
+    Request::parse_json(&wire(&valid)).unwrap();
+    for (field, value) in [
+        ("devices", json!([1, 1])),
+        ("revoke", json!([2])),
+        ("revision", json!(0)),
+        ("nodes", json!([5])),
+    ] {
+        let mut bad = valid.clone();
+        bad["args"][field] = value;
+        assert!(Request::parse_json(&wire(&bad)).is_err());
+    }
+    let mut old = valid;
+    old["op"] = json!("UPDATE_REGISTRY");
+    assert!(Request::parse_json(&wire(&old)).is_err());
 }

@@ -56,9 +56,19 @@ fn private_loader_checks_bound_mode_link_and_symlink() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(read_private_config(&path, 100).is_err());
-    // Root configuration/state never accept a user-writable/sticky ancestor.
-    assert!(read_root_config(&path, 100).is_err());
     assert!(SecureStateDir::open(&dir.0).is_err());
+    // Root configuration/state reject an explicitly unsafe ancestor even when
+    // the final directory and config have private modes.
+    let unsafe_parent = Scratch::new();
+    let private_child = unsafe_parent.0.join("private");
+    fs::create_dir(&private_child).unwrap();
+    fs::set_permissions(&private_child, fs::Permissions::from_mode(0o700)).unwrap();
+    let unsafe_path = private_child.join("config.json");
+    fs::write(&unsafe_path, b"private configuration").unwrap();
+    fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&unsafe_parent.0, fs::Permissions::from_mode(0o1777)).unwrap();
+    assert!(read_root_config(&unsafe_path, 100).is_err());
+    assert!(SecureStateDir::open(&private_child).is_err());
 }
 #[test]
 fn multiple_child_mappings_keep_sources_separate_and_parent_owned() {

@@ -24,6 +24,9 @@ clients/android/native/**
 !connectors/server/**
 !testbench/
 !testbench/**
+!deploy/
+!deploy/nats/
+!deploy/nats/**
 **/.*
 **/*.md
 **/target

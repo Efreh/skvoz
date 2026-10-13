@@ -34,7 +34,7 @@ REDUCED_RUNTIME_BYTES = 32 * 1024 * 1024
 
 
 class Owner:
-    def __init__(self, binary, config, directory, peer, *, network_version=5):
+    def __init__(self, binary, config, directory, peer, *, network_version=6):
         self.lock = threading.Lock()
         self.responses = queue.Queue()
         self.events = {}
@@ -302,8 +302,7 @@ def configuration(template, directory, nats, peer, baseline=False):
             'deny': [], 'service_prefixes': [], 'lease_store': str(directory/'leases.json'), 'server_addresses': [], 'management_endpoints': []}
         if not baseline:
             credentials = nats['authorization']['users']
-            standalone(config, next(user['password'] for user in credentials if user['user'] == 'authority'),
-                       [int(user['user'][1:]) for user in credentials if user['user'].startswith('p') and user['user'] != 'p0'])
+            standalone(config, [int(user['user'][1:]) for user in credentials if user['user'].startswith('p') and user['user'] != 'p0'])
     return config
 
 
@@ -344,7 +343,7 @@ def run(args):
                 limits.update(core_streams=2,streams_per_peer=2,core_receive_bytes=131072,core_receive_peer_bytes=131072,
                     api_queue_bytes=34816,api_queue_records=6)
                 limits['runtime_buffer_bytes'] = REDUCED_RUNTIME_BYTES
-            owners.append(Owner(args.binary, config, directory, peer, network_version=3 if baseline else 5))
+            owners.append(Owner(args.binary, config, directory, peer, network_version=3 if baseline else 6))
         endpoints = [owner.call('START_PROXY', {'http_bind': f'127.0.0.1:{10080+peer}', 'socks_bind': f'127.0.0.1:{11080+peer}'})[0] for peer, owner in enumerate(owners[1:])]
         report['samples'].append({'phase': 'before', 'runtime': [resource(o) for o in owners]})
         def capacity():

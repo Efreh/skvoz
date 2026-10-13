@@ -71,8 +71,14 @@ RSpec.describe 'Server deployment through Compose', compose: true do
         base += ['-f', ServerSystem::COMPONENT.join('compose.source.yaml').to_s] if source
         base += ['-f', overlay.to_s]
         command = ->(*arguments, timeout: 30) { execute(*base, *arguments, timeout:) }
+        previous_health = nil
         health = lambda do
-          _, _, status = ServerSystem.capture(*base, 'exec', '-T', 'server', 'skvoz-server', 'health', timeout: 8)
+          stdout, stderr, status = ServerSystem.capture(*base, 'exec', '-T', 'server', 'skvoz-server', 'health', timeout: 8)
+          snapshot = { exit: status.exitstatus, result: stdout[0, 8192], error: stderr[0, 2048] }
+          if snapshot != previous_health
+            warn JSON.generate(event: 'compose_server_health', **snapshot)
+            previous_health = snapshot
+          end
           status.success?
         end
         admin = lambda do |operation, login = nil|

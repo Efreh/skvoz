@@ -48,20 +48,8 @@ pub struct StartupConfig {
     pub network: NetworkConfig,
     #[serde(deserialize_with = "required_option")]
     pub server: Option<ServerConfig>,
-    pub routing: RoutingConfig,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoutingConfig {
-    pub egress: bool,
     #[serde(deserialize_with = "required_option")]
-    pub authority: Option<AuthorityConfig>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorityConfig {
-    pub core: CoreConfig,
-    pub registry: crate::routing::Registry,
+    pub access: Option<crate::access::DeviceSet>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -297,7 +285,7 @@ impl Limits {
                 max_metadata: 512,
                 open_timeout_ms: 15000,
             },
-            max_peers: if role == Role::Server { 128 } else { 8 },
+            max_peers: if role == Role::Server { 128 } else { 1 },
             max_streams: self.core_streams,
             max_streams_per_peer: self.streams_per_peer,
             receive_budget: self.core_receive_bytes,
@@ -577,53 +565,42 @@ impl StartupConfig {
         Ok(config)
     }
     pub fn validate(&self) -> Result<(), NetworkError> {
-        if self.v != 2 {
+        if self.v != 3 {
             return Err(NetworkError::UnsupportedVersion);
         }
         self.network.validate(self.role)?;
-        match (self.role, &self.server) {
-            (Role::Client, None) if !self.routing.egress && self.routing.authority.is_none() => {}
-            (Role::Server, Some(s)) if self.routing.egress => s.validate(&self.network)?,
-            (Role::Server, None)
-                if !self.routing.egress
-                    && self.routing.authority.is_some()
-                    && self.network.families.is_empty() => {}
-            _ => return Err(NetworkError::InvalidConfiguration),
-        }
         let c = &self.core;
         c.validate()?;
         let id = parse_peer(&c.peer_id)?;
-        match self.role {
-            Role::Client => {
-                if !crate::routing::device_id(id.0)
-                    || c.membership != "allowlist"
-                    || !c.allowed_peers.is_empty()
-                    || !c.initiate.is_empty()
-                {
-                    return Err(NetworkError::InvalidConfiguration);
-                }
-            }
-            Role::Server => {
-                if (self.routing.egress && !crate::routing::node_id(id.0))
-                    || (!self.routing.egress && id != PeerId(0))
-                    || c.membership != "allowlist"
-                    || !c.allowed_peers.is_empty()
-                    || !c.initiate.is_empty()
-                {
-                    return Err(NetworkError::InvalidConfiguration);
-                }
-            }
+        if c.membership != "allowlist" {
+            return Err(NetworkError::InvalidConfiguration);
         }
-        if let Some(authority) = &self.routing.authority {
-            authority.registry.validate()?;
-            authority.core.validate()?;
-            if authority.core.peer_id != "0"
-                || authority.core.membership != "allowlist"
-                || !authority.core.allowed_peers.is_empty()
-                || !authority.core.initiate.is_empty()
-            {
-                return Err(NetworkError::InvalidConfiguration);
+        match (self.role, &self.server, &self.access) {
+            (Role::Client, None, None) => {
+                if !crate::access::device_id(id.0)
+                    || c.allowed_peers != ["0"]
+                    || c.initiate != ["0"]
+                {
+                    return Err(NetworkError::InvalidConfiguration);
+                }
             }
+            (Role::Server, Some(server), Some(access)) => {
+                server.validate(&self.network)?;
+                // Revision zero is only the empty startup admission fence.
+                // UPDATE_DEVICES still validates strictly positive revisions.
+                if access.revision != 0 || !access.devices.is_empty() || !access.revoke.is_empty() {
+                    access.validate()?;
+                }
+                let expected: Vec<_> = access.devices.iter().map(u64::to_string).collect();
+                if id != PeerId(0)
+                    || !c.initiate.is_empty()
+                    || c.allowed_peers != expected
+                    || !access.revoke.is_empty()
+                {
+                    return Err(NetworkError::InvalidConfiguration);
+                }
+            }
+            _ => return Err(NetworkError::InvalidConfiguration),
         }
         Ok(())
     }
@@ -648,16 +625,12 @@ impl StartupConfig {
             },
             namespace: c.namespace.clone(),
             id: parse_peer(&c.peer_id)?,
-            membership: if c.membership == "broker_authorized" {
-                Membership::BrokerAuthorized
-            } else {
-                Membership::Allowlist(
-                    c.allowed_peers
-                        .iter()
-                        .map(|p| parse_peer(p))
-                        .collect::<Result<_, _>>()?,
-                )
-            },
+            membership: Membership::Allowlist(
+                c.allowed_peers
+                    .iter()
+                    .map(|p| parse_peer(p))
+                    .collect::<Result<_, _>>()?,
+            ),
             initiate: c
                 .initiate
                 .iter()

@@ -6,6 +6,15 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.*
 import java.io.Closeable
 
+internal fun validateClientStatus(status: JsonObject) {
+    val revision = status["access_revision"] as? JsonPrimitive
+    val mode = status["mode"] as? JsonPrimitive
+    if (status.keys != setOf("lifecycle", "mode", "session", "counters", "access_revision") ||
+        revision == null || revision.isString || revision.longOrNull != 0L ||
+        mode == null || !mode.isString || mode.content !in setOf("idle", "proxy", "ip"))
+        throw ClientFailure("version_mismatch")
+}
+
 internal class NativeSession(config: String, private val onEvent: (JsonObject) -> Unit, private val detailedWanted: () -> Long, private val onDiagnostic: (Long, DiagnosticSnapshot?, String?) -> Unit, private val cleanupFailed: () -> Unit) : Closeable {
     private var handle = NativeBridge.start(config)
     private var nextId = 1
@@ -45,9 +54,9 @@ internal class NativeSession(config: String, private val onEvent: (JsonObject) -
         throw ClientFailure("timeout")
     }
     suspend fun hello() {
-        val hello = call("HELLO", buildJsonObject { put("api", 1); put("network", 5) }).jsonObject
+        val hello = call("HELLO", buildJsonObject { put("api", 1); put("network", 6) }).jsonObject
         val cap = hello["capabilities"]?.jsonObject ?: throw ClientFailure("version_mismatch")
-        if (hello["api"]?.jsonPrimitive?.intOrNull != 1 || hello["network"]?.jsonPrimitive?.intOrNull != 5 ||
+        if (hello["api"]?.jsonPrimitive?.intOrNull != 1 || hello["network"]?.jsonPrimitive?.intOrNull != 6 ||
             hello["role"]?.jsonPrimitive?.content != "client" ||
             cap["profiles"] != buildJsonArray { add("tcp"); add("ip") } ||
             cap["families"] != buildJsonArray { add(4); add(6) } ||
@@ -58,6 +67,7 @@ internal class NativeSession(config: String, private val onEvent: (JsonObject) -
             if (state["state"]?.jsonPrimitive?.content == "ready") ready = true
             else if (state["error"] != JsonNull) throw ClientFailure("network_unavailable")
         }
+        validateClientStatus(call("STATUS").jsonObject)
     }
     suspend fun pump() {
         if (receive() != null) throw ClientFailure("native_unexpected_response")

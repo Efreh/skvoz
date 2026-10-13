@@ -1,0 +1,6 @@
+[Unit]
+Description=Schedule native NATS certificate retry in five minutes
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart skvoz-nats-retry.timer

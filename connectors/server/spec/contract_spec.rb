@@ -20,6 +20,18 @@ RSpec.describe 'Server network and durable identity contract' do
     expect { JSON.parse('{"network":{"families":[],"families":[4]}}', allow_duplicate_key: false) }.to raise_error(JSON::ParserError)
   end
 
+  it 'matches public upstream NKey seed/public pairs and rejects wrong type or checksum' do
+    fixture = JSON.parse(File.read(File.join(__dir__, 'fixtures/nkeys.json')), allow_duplicate_key: false)
+    fixture.fetch('vectors').each do |vector|
+      kind = vector.fetch('kind').to_sym
+      key = Skvoz::Server::NatsAuth::Key.new(kind, vector.fetch('seed'))
+      expect(key.public_key).to eq(vector.fetch('public_key'))
+      expect { Skvoz::Server::NatsAuth.decode(key.public_key, :server) }.to raise_error(ArgumentError)
+      corrupted = key.public_key[0...-1] + (key.public_key[-1] == 'A' ? 'B' : 'A')
+      expect { Skvoz::Server::NatsAuth.decode(corrupted, kind) }.to raise_error(ArgumentError)
+    end
+  end
+
   it 'emits TCP-only and strict NAT44/routed IPv6 policies with finite canonical limits' do
     standard = Skvoz::Server::NetworkConfiguration.new(Skvoz::Server::Configuration.new(value))
     expect(standard.network).to include('families' => [4])
@@ -86,20 +98,20 @@ RSpec.describe 'Server network and durable identity contract' do
       state = Skvoz::Server::State.new(config)
       first, id = state.mutate('add', 'shared', password: 'long enough password')
       state.commit(first)
-      second, another = state.mutate('device-add', 'shared', password: 'long enough password')
+      second, another = state.mutate('device-add', 'shared', verified: true)
       state.commit(second)
       expect(another).not_to eq(id)
-      expect { state.mutate('device-add', 'shared', password: 'long enough password') }.to raise_error(Skvoz::Server::Error, 'Device pool exhausted')
+      expect { state.mutate('device-add', 'shared', verified: true) }.to raise_error(Skvoz::Server::Error, 'Device pool exhausted')
       removed, = state.mutate('remove', 'shared'); state.commit(removed)
       replacement, next_id = state.mutate('add', 'new', password: 'long enough password'); state.commit(replacement)
       expect(next_id).to be > another
-      candidate = state.candidate; candidate['tls'] = { 'certificate' => 'unused.pem', 'key' => 'unused.key' }; state.commit(candidate)
+      candidate = state.candidate; candidate['tls'] = { 'certificate' => '/unused.pem', 'key' => '/unused.key' }; state.commit(candidate)
       profile = state.profile(Skvoz::Server::NetworkConfiguration.new(config))
-      expect(profile).to include('v' => 2, 'role' => 'server')
-      expect(profile.fetch('core')).to include('peer_id' => ((1 << 63) + 8).to_s, 'membership' => 'allowlist', 'ca_file' => nil, 'tls_server_name' => 'example.org')
-      expect(state.nats_config).to include('skvoz.enroll.v3.')
-      expect(state.export('new', next_id, 'long enough password')).to include('v' => 3,
-        'network_runtime' => { 'network' => 5, 'api' => 1, 'version' => '0.5.0', 'core' => '4.1.0' })
+      expect(profile).to include('v' => 3, 'role' => 'server')
+      expect(profile.fetch('core')).to include('peer_id' => '0', 'membership' => 'allowlist', 'ca_file' => nil, 'tls_server_name' => 'example.org', 'allowed_peers' => [next_id.to_s], 'initiate' => [])
+      expect(state.nats_config).to include('skvoz.enroll.v4.')
+      expect(state.export('new', next_id, 'long enough password')).to include('v' => 4,
+        'network_runtime' => { 'network' => 6, 'api' => 1, 'version' => '0.6.0', 'core' => '4.1.0' })
       state.close
       reopened = Skvoz::Server::State.new(config)
       expect(reopened.value['next_id']).to eq(5)
@@ -108,55 +120,69 @@ RSpec.describe 'Server network and durable identity contract' do
     end
   end
 
-  it 'keeps control-only configuration independent of egress inventory and DATA credentials' do
+  it 'rejects removed roles and keeps native bootstrap identities scoped and independent of callout' do
+    %w[components upstream leaf_port advertised_leaf_port].each do |key|
+      expect { Skvoz::Server::Configuration.new(value.merge(key => ['control'])) }.to raise_error(Skvoz::Server::Error)
+    end
     Dir.mktmpdir do |root|
-      config = Skvoz::Server::Configuration.new(value.merge('components' => ['control'], 'state_dir' => File.join(root, 'entry')))
-      policy = Skvoz::Server::NetworkConfiguration.new(config)
-      expect(policy.network.fetch('families')).to eq([])
-      expect(policy.server).to be_nil
-      expect(Socket).not_to receive(:ip_address_list)
-      expect(policy.inventory!(config)).to eq(policy)
+      config = Skvoz::Server::Configuration.new(value.merge('state_dir' => File.join(root, 'state')))
       state = Skvoz::Server::State.new(config)
       candidate = state.candidate
-      candidate['tls'] = { 'certificate' => 'certificate.pem', 'key' => 'key.pem' }
+      candidate['tls'] = { 'certificate' => '/certificate.pem', 'key' => '/key.pem' }
       state.commit(candidate)
-      profile = state.profile(policy)
-      expect(profile.fetch('routing')).to include('egress' => false)
-      expect(profile.dig('routing', 'authority', 'registry', 'nodes')).to eq([])
-      expect(profile.dig('core', 'peer_id')).to eq('0')
-      users = JSON.parse(state.nats_config).dig('accounts', 'APP', 'users')
-      expect(users.length).to eq(1)
-      expect(users.first.fetch('permissions').values.flatten.grep(/\.lane\.|\.join\./)).to be_empty
+      native = JSON.parse(state.nats_config)
+      expect(native.fetch('accounts').keys.sort).to eq(%w[APP AUTH SYS])
+      users = native.fetch('accounts').transform_values { |account| account.fetch('users') }
+      expect(users.fetch('APP').map { |user| user.fetch('user') }).to eq(%w[__skvoz_runtime __skvoz_enrollment __skvoz_probe])
+      expect(users.fetch('AUTH').map { |user| user.fetch('user') }).to eq(['__skvoz_auth'])
+      expect(users.fetch('SYS').map { |user| user.fetch('user') }).to eq(['__skvoz_sys'])
+      credentials = state.value.fetch('services').values
+      expect(credentials.map { |credential| credential.fetch('password') }.uniq.size).to eq(5)
+      expect(native.dig('authorization', 'auth_callout', 'auth_users').sort).to eq(Skvoz::Server::State::SERVICES.keys.map { |kind| "__skvoz_#{kind}" }.sort)
+      expect(native).not_to have_key('leafnodes')
+      expect(state.profile(Skvoz::Server::NetworkConfiguration.new(config))).not_to have_key('routing')
       state.close
     end
   end
 
-  it 'burns node IDs, retains identity during rotation and rejects another join over an existing egress state' do
+  it 'admits reserved device capacity only when the complete literal ACL fits the finite native response' do
     Dir.mktmpdir do |root|
-      control = Skvoz::Server::Configuration.new(value.merge('components' => ['control'], 'state_dir' => File.join(root, 'entry')))
-      entry = Skvoz::Server::State.new(control)
-      candidate = entry.candidate
-      candidate['tls'] = { 'certificate' => 'certificate.pem', 'key' => 'key.pem' }
-      entry.commit(candidate)
-      candidate, first = entry.mutate_node('node-add'); entry.commit(candidate)
-      candidate, rotated = entry.mutate_node('node-rotate', first.fetch('identity')); entry.commit(candidate)
-      expect(rotated.values_at('identity', 'node_id')).to eq(first.values_at('identity', 'node_id'))
-      expect(rotated.fetch('password')).not_to eq(first.fetch('password'))
-      join = File.join(root, 'join.json')
-      File.write(join, JSON.generate(first)); File.chmod(0o600, join)
-      input = { 'components' => ['egress'], 'upstream' => join, 'state_dir' => File.join(root, 'exit'), 'network' => {} }
-      exit_config = Skvoz::Server::Configuration.new(input)
-      egress = Skvoz::Server::State.new(exit_config)
-      expect(egress.value).not_to have_key('users')
-      egress.close
-      File.write(join, JSON.generate(rotated)); File.chmod(0o600, join)
-      egress = Skvoz::Server::State.new(Skvoz::Server::Configuration.new(input)); egress.close
-      candidate, = entry.mutate_node('node-revoke', first.fetch('identity')); entry.commit(candidate)
-      candidate, second = entry.mutate_node('node-add'); entry.commit(candidate)
-      expect(second.fetch('node_id')).to be > first.fetch('node_id')
-      File.write(join, JSON.generate(second)); File.chmod(0o600, join)
-      expect { Skvoz::Server::State.new(Skvoz::Server::Configuration.new(input)) }.to raise_error(Skvoz::Server::Error, 'Join identity differs from persistent node state')
-      entry.close
+      rows = []
+      expect { Skvoz::Server::Configuration.new(value.merge('namespace' => 'n' * 256)) }.to raise_error(Skvoz::Server::Error, 'Invalid namespace')
+      [[17, 8], [17, 64], [256, 8], [256, 64]].each do |namespace_bytes, devices|
+        config = Skvoz::Server::Configuration.new(value.merge('state_dir' => File.join(root, "state-#{namespace_bytes}-#{devices}"),
+          'namespace' => (namespace_bytes == 256 ? [63, 63, 63, 64].map { |size| 'n' * size }.join('.') : 'n' * namespace_bytes), 'devices_per_user' => devices))
+        state = Skvoz::Server::State.new(config)
+        candidate = state.candidate
+        candidate['next_id'] = (1 << 63) - 129
+        candidate['access_revision'] = (1 << 63) - 2
+        state.commit(candidate)
+        before = File.binread(File.join(state.directory, 'state.json'))
+        if namespace_bytes == 256 && devices == 64
+          expect { state.mutate('add', 'a' * 64, password: 'auth-budget-password') }.to raise_error(Skvoz::Server::Error)
+          expect(state.value.fetch('users')).to be_empty
+          rows << { namespace_bytes: namespace_bytes, reserved_devices: devices, admitted: false }
+        else
+          candidate, = state.mutate('add', 'a' * 64, password: 'auth-budget-password')
+          ids = candidate.fetch('users').fetch('a' * 64).fetch('ids')
+          issuer = Skvoz::Server::NatsAuth::Key.new(:account, state.value.fetch('auth').fetch('issuer_seed'))
+          curve = Skvoz::Server::NatsAuth::Key.new(:curve, state.value.fetch('auth').fetch('xkey_seed'))
+          request = { 'exp' => Time.now.to_i + 2, 'nats' => { 'user_nkey' => Skvoz::Server::NatsAuth::Key.new(:user).public_key,
+            'server_id' => { 'id' => Skvoz::Server::NatsAuth::Key.new(:server).public_key, 'xkey' => curve.public_key } } }
+          grant = Skvoz::Server::NatsAuth.response(request, issuer, curve, identity: state.identity('a' * 64, candidate),
+            permissions: state.permissions('a' * 64, candidate, ids: ids))
+          expect(ids.size).to eq(devices)
+          expect(grant.bytesize).to be <= 65_588
+          expect(grant.bytesize).to be > 16_384 if namespace_bytes == 256
+          rows << { namespace_bytes: namespace_bytes, reserved_devices: devices, admitted: true, actual_encrypted_response_bytes: grant.bytesize }
+        end
+        expect(File.binread(File.join(state.directory, 'state.json'))).to eq(before)
+        state.close
+      end
+      if ENV['SKVOZ_TEST_ARTIFACTS']
+        FileUtils.mkdir_p(ENV.fetch('SKVOZ_TEST_ARTIFACTS'), mode: 0o700)
+        File.write(File.join(ENV.fetch('SKVOZ_TEST_ARTIFACTS'), 'auth-budget-actual.json'), JSON.pretty_generate(rows))
+      end
     end
   end
 end

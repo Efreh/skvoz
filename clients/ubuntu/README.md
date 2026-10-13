@@ -10,6 +10,10 @@ HTTP/HTTPS CONNECT и SOCKS5 CONNECT либо передачей IP-пакето
 amd64 включает runtime и узкий системный `skvoz-network-helper`; Rust и Python
 на пользовательской машине не требуются.
 
+Ubuntu6.0.0 использует runtime0.6.0, network6, enrollment4 и API1.
+Полноценный сервер SKVOZ7 выдаёт устройство автоматически; общий Core4.1.0
+соединяет клиент с peer0 через native NATS.
+
 [Установка, подключение, режимы и проверки](../../docs/ubuntu-client.md)
 описаны в каноническом руководстве. `src/app.rs` связывает жизненный цикл
 приложения, backend и desktop; `src/ui.rs` строит окна и обрабатывает действия

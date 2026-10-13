@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew and verify native NATS certificate
+OnFailure=skvoz-nats-retry.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/skvoz-nats/entry.env
+ExecStart=/usr/local/lib/skvoz-nats/renew.sh
+TimeoutStartSec=180
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/skvoz-nats

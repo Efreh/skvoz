@@ -96,6 +96,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["check", "demo", "load", "tcp", "qualify", "daemon", "network", "network-runtime", "tcp-capacity"], nargs="?", default="check")
     parser.add_argument("--offline", action="store_true", help="Use cached Cargo dependencies and Docker image")
+    parser.add_argument("--nats-image", default=IMAGE, help="Stock broker image for this qualification; default retains the transport compatibility baseline")
     parser.add_argument("--clients", type=int, default=10)
     parser.add_argument("--streams-per-client", type=int, default=10)
     parser.add_argument("--active-per-client", type=int, default=2)
@@ -226,8 +227,7 @@ def main():
             mesh_users.append(f'{{ user: "daemon-devices", password: "{daemon_password}", permissions: {{ publish: ["{shared_publish}"], subscribe: ["{shared_subscribe}"] }} }}')
             # Keep network runtime principals separate from generic Core fixtures.
             ffi_passwords = [secrets.token_hex(24) for _ in range(2)]
-            ffi_authority_password = secrets.token_hex(24)
-            for user in topology_users(f"skvoz.ffi.{token}", ffi_passwords, ffi_authority_password):
+            for user in topology_users(f"skvoz.ffi.{token}", ffi_passwords):
                 user['user'] = 'ffi-' + user['user']
                 mesh_users.append(json.dumps(user))
             mesh_authorization = ",\n".join(mesh_users)
@@ -280,7 +280,7 @@ authorization {{
                     *([] if args.network_profile else ["--publish", f"127.0.0.1:{broker_port}:4222",
                         "--publish", f"127.0.0.1:{fixed_monitor_port}:8222"]),
                     "--mount", f"type=bind,source={directory},target=/bench,readonly",
-                    "--pull=never" if args.offline else "--pull=missing", IMAGE, "--config", "/bench/nats.conf",
+                    "--pull=never" if args.offline else "--pull=missing", args.nats_image, "--config", "/bench/nats.conf",
                     *(["--profile", "8223"] if args.network_profile else [])], stdout=subprocess.DEVNULL)
                 created = True
                 command(["docker", "start", container], stdout=subprocess.DEVNULL)
@@ -315,7 +315,6 @@ authorization {{
                     "SKVOZ_NATS_RUN_TOKEN": token, "SKVOZ_NATS_CONTAINER": container, "SKVOZ_NATS_MONITOR": monitor,
                     "SKVOZ_NATS_BOOTSTRAP_NETWORK": bootstrap if args.network_profile else "",
                     "SKVOZ_NATS_FFI_NODE_ID": str(EGRESS_ID),
-                    "SKVOZ_NATS_FFI_AUTHORITY_PASSWORD": ffi_authority_password,
                 }
                 env.update({f"SKVOZ_NATS_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(mesh_passwords)})
                 env.update({f"SKVOZ_NATS_FFI_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(ffi_passwords)})

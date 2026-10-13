@@ -805,6 +805,11 @@ impl NatsRuntime {
                 .and_then(|p| p.session.as_ref())
                 .is_some_and(|s| !s.retiring && s.proven)
     }
+    /// True after this peer's stream ownership and terminal records are released.
+    /// Hosts must also await a complete successful turn before revoking transport.
+    pub fn peer_streams_drained(&self, id: PeerId) -> bool {
+        self.manager.peer_streams(id).is_none_or(|count| count == 0)
+    }
     fn check_key(&self, key: RuntimeKey) -> Result<(), RuntimeError> {
         if key.epoch != self.epoch
             || !self

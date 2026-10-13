@@ -1,5 +1,6 @@
 //! Shared network records and a single-owner Core/NATS network engine.
 //! Packet ownership remains with the embedding host until a complete OS write.
+pub mod access;
 pub mod budget;
 mod codec;
 pub mod config;
@@ -8,7 +9,6 @@ pub mod enrollment;
 pub mod local_api;
 mod packet;
 pub mod policy;
-pub mod routing;
 pub use codec::*;
 pub use engine::*;
 pub use packet::*;
