@@ -619,7 +619,7 @@ impl NetworkEngine {
             host,
             port,
         };
-        let key = self.runtime.open(peer, &target.encode()?).map_err(|error| {
+        let key = self.runtime.open(peer, &target.encode()?).inspect_err(|error| {
             if !self.open_failure_reported {
                 self.open_failure_reported = true;
                 let status = self.runtime.status();
@@ -664,7 +664,6 @@ impl NetworkEngine {
                     })
                 );
             }
-            error
         })?;
         self.tcp.insert(key);
         Ok(key)
