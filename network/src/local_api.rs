@@ -367,7 +367,10 @@ impl Response {
 impl From<NetworkError> for ApiError {
     fn from(e: NetworkError) -> Self {
         match e {
-            NetworkError::UnsupportedVersion => Self::UnsupportedVersion,
+            NetworkError::UnsupportedVersion
+            | NetworkError::Runtime(skvoz_core::runtime::RuntimeError::UnsupportedVersion) => {
+                Self::UnsupportedVersion
+            }
             NetworkError::UnsupportedFamily => Self::UnsupportedFamily,
             NetworkError::Forbidden => Self::Forbidden,
             NetworkError::Overloaded => Self::Overloaded,

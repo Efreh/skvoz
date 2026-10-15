@@ -16,7 +16,9 @@ frame за вызов и может вернуть `accepted(n)` или `would_b
 [semantic_fixtures.rs](../semantic_fixtures.rs) исполняет эти независимые от
 языка сценарии; другая реализация может сравнить тот же trace.
 
-`wire-v2.tsv` содержит двенадцать бинарных векторов: `name<TAB>hex`.
+`wire-v2.tsv` содержит тринадцать бинарных векторов: `name<TAB>hex`.
 Stream frames используют ID 2, peer-control — ID 0; payload/metadata — `00ff`.
 [wire_contract.rs](../wire_contract.rs) сравнивает encoding/decoding с этими
 байтами. Контракт формата — [wire](../../../docs/wire.md).
+
+`runtime-v3.tsv` содержит exact outer runtime vectors `name<TAB>hex`: fixed200-byte SKC3 и SKD3 header48 с opaque body. Stream codec wire2 внутри DATA сохраняет отдельные vectors. Таблицы — [runtime protocol](../../../docs/runtime-protocol.md).

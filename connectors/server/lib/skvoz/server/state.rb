@@ -108,7 +108,7 @@ module Skvoz
     class State
       LOGIN = /\A[a-zA-Z0-9_-]{1,64}\z/
       TOKEN = /\A[0-9a-f]{32}\z/
-      VERSIONS = { 'network' => 6, 'api' => 1, 'version' => '0.6.0', 'core' => '4.1.0' }.freeze
+      VERSIONS = { 'network' => 6, 'api' => 1, 'version' => '0.7.0', 'core' => '5.0.0' }.freeze
       SERVICES = { 'runtime' => 'APP', 'enrollment' => 'APP', 'probe' => 'APP', 'auth' => 'AUTH', 'sys' => 'SYS' }.freeze
       attr_reader :directory, :value, :revision
 

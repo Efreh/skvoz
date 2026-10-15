@@ -1,6 +1,6 @@
 # NATS packet v2
 
-Core 4.1.0 использует wire 2; другие версии отвергаются. Одна публикация
+Core 5.0.0 использует wire 2; другие версии отвергаются. Одна публикация
 содержит один packet без padding. Все целые unsigned, big-endian. Максимум
 65 564 байта. Header: `SKVZ` (4 байта), version=2 (u8), kind (u8),
 reserved=0 (u16), stream_id (u64).
@@ -18,7 +18,7 @@ ID 0 зарезервирован исключительно для peer-control
 | 4 | DATA | offset u64, len u32, непустые bytes |
 | 5 | WINDOW_UPDATE | consumed u64 |
 | 6 | FIN | final_offset u64 |
-| 7 | CLOSE | reason u8: 1 Cancelled, 2 TransportLost, 3 ProtocolError, 4 OpenTimeout |
+| 7 | CLOSE | reason u8: 1 Cancelled, 2 TransportLost, 3 ProtocolError, 4 OpenTimeout, 5 ResourcePressure |
 | 8 | WINDOW_GRANT | consumed u64, limit u64, probe u64 |
 | 9 | PEER_GRANT | epoch u64, consumed_bytes u64, limit_bytes u64, consumed_records u64, limit_records u64, probe u64 |
 | 10 | PEER_REQUEST | bytes u32, records u32, probe u64, requester_stream_id u64, blocked u8 |
@@ -106,3 +106,7 @@ sequence поверх того же wire 2. Peer-control и DATA сохраня�
 Language-neutral hex vectors находятся в
 [wire-v2.tsv](../core/tests/fixtures/wire-v2.tsv), формат — в
 [README fixtures](../core/tests/fixtures/README.md).
+
+Dynamic NatsRuntime wraps these semantic frames in [runtime protocol3](runtime-protocol.md). Its runtime DATA profile is16KiB with metadata512bytes; the standalone codec retains the larger pure-library bound. The semantic codec version alone does not make different runtime versions compatible.
+
+Core5 adds abort reason5 (`ResourcePressure`) to CLOSE; existing codec2 vector bytes retain their meaning. Older experimental static peers must be updated together to recognize this value. Runtime peers already require outer protocol3.

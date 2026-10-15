@@ -10,13 +10,20 @@ import urllib.request
 
 
 class LatencyProxy:
-    """Forward real TLS bytes with per-direction delay and one 8-KiB held chunk."""
+    """Pipeline opaque TCP bytes with bounded delay, without pacing each chunk.
+
+    Each direction retains at most 256 64-KiB chunks plus its active read/write.
+    Capacity measurements must reject runs with queue_full_events: queue pressure
+    would turn the finite delay buffer into an unintended bandwidth limiter.
+    """
     def __init__(self, upstream, delay_ms, maximum):
         self.upstream, self.delay, self.maximum = upstream, delay_ms / 2000, maximum
         self.ready = threading.Event()
         self.loop = None
         self.port = None
         self.tasks = set()
+        self.queue_full_events = 0
+        self.maximum_queued_bytes = 0
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     async def connection(self, reader, writer):
@@ -29,16 +36,39 @@ class LatencyProxy:
         try:
             remote_reader, remote = await asyncio.open_connection("127.0.0.1", self.upstream)
             async def pump(source, target):
-                while True:
-                    chunk = await source.read(8192)
-                    if not chunk:
-                        return
-                    await asyncio.sleep(self.delay)
-                    target.write(chunk)
-                    await target.drain()
+                pending = asyncio.Queue(maxsize=256)
+                queued = 0
+                async def receive():
+                    nonlocal queued
+                    while chunk := await source.read(65536):
+                        if pending.full():
+                            self.queue_full_events += 1
+                        await pending.put((self.loop.time() + self.delay, chunk))
+                        queued += len(chunk)
+                        self.maximum_queued_bytes = max(self.maximum_queued_bytes, queued)
+                    await pending.put(None)
+                async def deliver():
+                    nonlocal queued
+                    while (item := await pending.get()) is not None:
+                        due, chunk = item
+                        remaining = due - self.loop.time()
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                        target.write(chunk)
+                        queued -= len(chunk)
+                        await target.drain()
+                    if target.can_write_eof():
+                        target.write_eof()
+                tasks = [asyncio.create_task(receive()), asyncio.create_task(deliver())]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for child in tasks:
+                        child.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
             pumps = [asyncio.create_task(pump(reader, remote)), asyncio.create_task(pump(remote_reader, writer))]
             try:
-                await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.gather(*pumps)
             finally:
                 for pump_task in pumps:
                     pump_task.cancel()

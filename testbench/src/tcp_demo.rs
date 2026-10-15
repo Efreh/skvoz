@@ -1,5 +1,5 @@
 //! Real TCP request/response through two copies of the same embedded Core.
-use crate::{BenchError, mesh};
+use crate::{BenchError, runtime_scenarios as r};
 use skvoz_core::{Event, PeerId};
 use std::time::{Duration, Instant};
 use tokio::{
@@ -7,14 +7,9 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 pub async fn run() -> Result<(), BenchError> {
-    let options = mesh::LoadOptions {
-        clients: 1,
-        streams_per_client: 1,
-        active_per_client: 1,
-        bytes: 0,
-    };
-    let (mut server, mut clients) = mesh::nodes("tcp", options).await?;
-    let mut client = clients.pop().unwrap();
+    let mut server = r::node(0, "tcp").await?;
+    let mut client = r::node(1, "tcp").await?;
+    r::joined(&mut client, &mut server, 1).await?;
     let local_listener = TcpListener::bind("127.0.0.1:0").await?;
     let target_listener = TcpListener::bind("127.0.0.1:0").await?;
     let requester = TcpStream::connect(local_listener.local_addr()?).await?;
@@ -93,19 +88,14 @@ pub async fn run() -> Result<(), BenchError> {
 
 /// Real socket write failure or overall deadline must cancel the live Core key.
 pub async fn failure(write_error: bool) -> Result<(), BenchError> {
-    let options = mesh::LoadOptions {
-        clients: 1,
-        streams_per_client: 1,
-        active_per_client: 0,
-        bytes: 0,
-    };
     let case = if write_error {
         "tcp_write_error"
     } else {
         "tcp_deadline"
     };
-    let (mut server, mut clients) = mesh::nodes(case, options).await?;
-    let mut client = clients.pop().unwrap();
+    let mut server = r::node(0, case).await?;
+    let mut client = r::node(1, case).await?;
+    r::joined(&mut client, &mut server, 1).await?;
     let initial_receive_backing = [
         client.resources().reserved_receive_bytes,
         server.resources().reserved_receive_bytes,

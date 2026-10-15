@@ -79,6 +79,7 @@ pub enum RuntimeError {
     Timeout,
     Transport,
     Protocol,
+    UnsupportedVersion,
     Admission,
     PeerUnavailable,
     StaleKey,
@@ -93,6 +94,11 @@ impl fmt::Display for RuntimeError {
     }
 }
 impl std::error::Error for RuntimeError {}
+impl From<crate::ProtocolError> for RuntimeError {
+    fn from(_: crate::ProtocolError) -> Self {
+        Self::Protocol
+    }
+}
 impl From<ManagerError> for RuntimeError {
     fn from(e: ManagerError) -> Self {
         if e == ManagerError::Admission {
@@ -168,6 +174,25 @@ impl Counters {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct DeliveryStatus {
+    pub limit_bytes: u64,
+    pub limit_records: u64,
+    pub receive_promised_bytes: u64,
+    pub receive_promised_records: u64,
+    pub send_flight_bytes: u64,
+    pub send_flight_records: u64,
+    pub quarantined_send_bytes: u64,
+    pub quarantined_receive_bytes: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct StreamDiagnostics {
+    pub application: crate::FlowObservation,
+    pub waiting_delivery: bool,
+    pub waiting_shared_flight: bool,
+    pub waiting_control_ms: Option<u64>,
+    pub scheduler_eligible: bool,
+}
+#[derive(Clone, Copy, Debug)]
 pub struct PeerStatus {
     pub generation: u128,
     pub pair_token: u128,
@@ -175,6 +200,16 @@ pub struct PeerStatus {
     pub sent_frames: u64,
     pub received_frames: u64,
     pub handshake_nonce: u128,
+    /// Continuous delivery state; bytes include the conservative envelope cost.
+    pub delivery_epoch: u64,
+    pub granted_bytes: u64,
+    pub sent_bytes: u64,
+    pub applied_bytes: u64,
+    pub available_records: u64,
+    pub sent_controls: u64,
+    pub received_controls: u64,
+    pub waiting_delivery: bool,
+    pub waiting_control: bool,
     pub ready: bool,
 }
 #[derive(Clone, Copy, Debug)]
@@ -269,6 +304,9 @@ impl RuntimeConfig {
             .iter()
             .any(|d| *d > Duration::from_secs(86400))
             || self.max_retries > 1024
+            || limits.max_peers > 128
+            || limits.stream.max_frame as usize > super::RUNTIME_FRAME_BYTES
+            || limits.stream.max_metadata > 512
             || self.initiate.len() > limits.max_peers
             || self.initiate.contains(&self.id)
         {

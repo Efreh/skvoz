@@ -1,6 +1,6 @@
 # Core daemon и локальный IPC v1
 
-Этот контракт описывает runnable Linux executable `skvoz-core-daemon`2.0.0.
+Этот контракт описывает runnable Linux executable `skvoz-core-daemon`3.0.0.
 Он встраивает ту же [универсальную Core library/NatsRuntime](nats-runtime.md),
 которую можно использовать из Rust. Python/Ruby/другие host languages общаются
 через pathname Unix socket; отдельного client/server Core или native bindings нет.
@@ -218,7 +218,7 @@ connection. Обновлённый profile требует нового daemon, �
 | 0x9004 | DATA | absolute offset u64, raw bytes |
 | 0x9005 | WRITABLE | empty |
 | 0x9006 | REMOTE_FINISHED | empty |
-| 0x9007 | CLOSED | reason u16:1Finished,2Rejected,3Cancelled,4TransportLost,5ProtocolError,6OpenTimeout |
+| 0x9007 | CLOSED | reason u16:1Finished,2Rejected,3Cancelled,4TransportLost,5ProtocolError,6OpenTimeout,7ResourcePressure |
 
 Handle — random daemon epoch64 + monotonic stream counter64, никогда не reused.
 Mapping хранит local owner session и полный generation-safe RuntimeKey. Чужой,
@@ -272,11 +272,11 @@ sequenceDiagram
 | output_bytes | 262144 | 143..8388608 |
 | ipc_timeout_ms | 5000 | 50..60000 |
 | shutdown_timeout_ms | 5000 | 100..60000 |
-| peers | 128 | 1..512 |
+| peers | 128 | 1..128 |
 | streams | 1024 | 1..8192 |
 | streams_per_peer | 128 | 1..8192 |
 | receive_window | 8192 | 1..33554432, фактический grant ограничен byte budget |
-| max_frame | 1024 | 1..32768 and <=receive_window |
+| max_frame | 1024 | 1..16384 and <=receive_window |
 | pending_frames | 8 | 1..64 |
 | open_timeout_ms | 5000 | 100..60000 |
 | receive_bytes | 8388608 | 1..536870912, aggregate backing |

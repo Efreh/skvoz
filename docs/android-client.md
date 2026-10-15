@@ -1,8 +1,8 @@
 # Клиент Android
 
 «Соединение SKVOZ» 3.0.0 — клиент Android API31+ с двумя режимами: **Прокси**
-и **ВПН**. APK включает Kotlin/Compose/Material3 и ту же Rust-библиотеку Core4.1.0
-с общим network runtime0.6.0. Application ID — `org.skvoz.android`;
+и **ВПН**. APK включает Kotlin/Compose/Material3 и ту же Rust-библиотеку Core5.0.0
+с общим network runtime0.7.0. Application ID — `org.skvoz.android`;
 ABI — `arm64-v8a` и `x86_64`. Сервер остаётся общим для любых совместимых клиентов.
 
 Текущий профиль требует enrollment4, network6, startup3 и локальный API1.

@@ -1,6 +1,6 @@
 [package]
 name = "skvoz-core"
-version = "4.1.0"
+version = "5.0.0"
 description = "Deterministic, bounded byte-stream state engine for SKVOZ"
 edition.workspace = true
 rust-version.workspace = true
@@ -26,3 +26,6 @@ rustls-native-certs = { version = "=0.8.4", optional = true }
 [[example]]
 name = "runtime_profile"
 required-features = ["nats"]
+
+[dev-dependencies]
+tokio = { version = "=1.53.1", features = ["rt", "macros"] }

@@ -103,7 +103,7 @@ jobs:
             env -u XDG_RUNTIME_DIR "$(command -v bundle)" exec rspec ../../clients/ubuntu/spec --fail-fast
       - name: Build and install deb
         run: |
-          cargo build --release --locked -p skvoz-ubuntu-client --bin skvoz-client
+          cargo build --release --locked -p skvoz-ubuntu-client -p skvoz-network -p skvoz-network-helper --features skvoz-network/linux-runtime
           clients/ubuntu/packaging/build-deb.sh
           sudo apt-get install -y ./clients/ubuntu/dist/skvoz-client_*_amd64.deb
           /usr/bin/skvoz-client --version

@@ -108,7 +108,11 @@ fn configured(id: u64, port: u16) -> StartupConfig {
         &std::fs::read(std::env::var("SKVOZ_RUNTIME_FIXTURE").unwrap()).unwrap(),
     )
     .unwrap();
-    value["core"]["url"] = fixture["url"].clone();
+    value["core"]["url"] = if id == 0 {
+        fixture.get("server_url").unwrap_or(&fixture["url"]).clone()
+    } else {
+        fixture["url"].clone()
+    };
     value["core"]["trust"] = json!("managed_ca");
     value["core"]["ca_file"] = fixture["ca"].clone();
     value["core"]["namespace"] = fixture["namespace"].clone();

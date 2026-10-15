@@ -625,17 +625,14 @@ async fn reciprocal_lane_proof_pending_retains_setup_but_never_activates_early()
         server.generation(),
         client.generation()
     );
-    let mut delayed_pong = b"SKC2".to_vec();
-    delayed_pong.push(6);
-    for value in [
+    let delayed_pong = skvoz_testbench::runtime_scenarios::control_bytes(
+        6,
         client.generation(),
         server.generation(),
         nonce,
         peer.pair_token,
-    ] {
-        delayed_pong.extend_from_slice(&value.to_be_bytes());
-    }
-    delayed_pong.extend_from_slice(&watermark.to_be_bytes());
+        watermark,
+    );
     let grant: SessionConfig = serde_json::from_value(serde_json::json!({
         "session":"0123456789abcdef0123456789abcdef", "families":[4],
         "source_grants":["192.0.2.10/32"], "routes":["0.0.0.0/0"],

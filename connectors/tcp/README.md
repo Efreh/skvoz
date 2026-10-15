@@ -5,9 +5,9 @@ TCP-сокетом и небольшими I/O буферами; использ�
 [Core](../../core/README.md), что и другие коннекторы. Маршрутизация и
 flow control находятся в Core.
 
-`relay_one(&mut NatsNode, StreamKey, TcpStream, Duration)` получает уже открытый
-Core stream и выделенный для этого сокета NatsNode. Host самостоятельно
-создаёт сокет, настраивает peer/session routes и принимает OPEN. Relay передаёт
+`relay_one(&mut NatsRuntime, RuntimeKey, TcpStream, Duration)` получает уже открытый
+Core stream и выделенный для этого сокета NatsRuntime с непрерывным protocol3. Host
+создаёт сокет, настраивает authenticated membership, ждёт peer_ready и принимает OPEN. Relay передаёт
 binary bytes в обоих направлениях; TCP EOF вызывает FIN, а RemoteFinished —
 shutdown отправляющего направления сокета. Ответ после EOF запроса допустим.
 
@@ -19,7 +19,7 @@ chunk (не больше настроенного max_frame). Кредит во�
 Это bounded попытка доставки, а не гарантия подтверждения отмены удалённым peer.
 Если bounded попытка не завершилась, relay локально fail-close peer и выдаёт
 terminal events, освобождая его reservation. Отмена output future навсегда
-защёлкивает failure NatsNode. Remote silent loss требует отдельного liveness;
+вызывает conservative transport failure. Runtime проверяет nonce/watermark liveness;
 будущие перезапуски relay не возобновляют старый поток.
 
 Воспроизводимый real TCP пример и failure checks запускаются из корня:

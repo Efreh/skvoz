@@ -121,11 +121,11 @@ fn strict_startup_rejects_missing_nullable_duplicate_unknown_and_profile_changes
     let config = StartupConfig::parse_json(CLIENT).unwrap();
     assert_eq!(
         config.network.limits.transport_reservation(Role::Client),
-        13_322_400 + 2048 + 512
+        3_496_800 + 2048 + 34_816
     );
     assert_eq!(
         Limits::canonical(Role::Server).transport_reservation(Role::Server),
-        82_332_432 + 128 * 2048 + 128 * 512
+        21_610_224 + 128 * 2048 + 128 * 34_816
     );
     let value: Value = serde_json::from_slice(CLIENT).unwrap();
     for (parent, key) in [

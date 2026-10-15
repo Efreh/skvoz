@@ -52,9 +52,9 @@ pending до восстановления связи; старые IDs и пок
 опциональная возможность `nats` добавляет статический NatsNode и динамический
 NatsRuntime на Tokio/async-nats. Роль приложения не меняет реализацию или контракт ядра.
 
-[Серверный коннектор](server-connector.md) 7.0.0 на Ruby управляет NATS,
+[Серверный коннектор](server-connector.md) 8.0.0 на Ruby управляет NATS,
 пользователями, профилями устройств и TLS. TCP/IP I/O выполняет
-[общий Rust runtime](network-runtime.md) 0.6.0 с тем же Core 4.1.0;
+[общий Rust runtime](network-runtime.md) 0.7.0 с тем же Core 5.0.0;
 Ruby получает только управляющие события. Узкий helper создаёт общий Linux TUN,
 маршруты и policy gateway. Default policy допускает публичные unicast назначения,
 а обычные private/local сервисы требуют явных правил.
@@ -130,7 +130,7 @@ flowchart TB
     cr <-->|"Потоки Core через TLS"| broker
 ```
 
-## Статическое встраивание и TCP-пример
+## Статическое встраивание и динамический TCP-пример
 
 Каждый NatsNode владеет одним NATS client и одной подпиской, без отдельного
 соединения или задачи на logical stream. Host задаёт явный список доверенных
@@ -149,7 +149,7 @@ API коннектора синхронно ставит bounded work. `turn(wai
 продолжаться, чтобы освободить terminal entries.
 
 `connectors/tcp` владеет одним сокетом и выдаваемыми Core буферами. Реальный
-TCP пример создаёт два выделенных NatsNode того же Core, локальный requester
+TCP пример создаёт два выделенных NatsRuntime того же Core, локальный requester
 и удалённый target. Он проверяет bytes/FIN/ответ после EOF. Для множества сокетов
 нужен диспетчер коннектора; текущий relay обслуживает только один сокет.
 
@@ -193,9 +193,9 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant A as Коннектор A
-    participant NA as NatsNode A / Manager
+    participant NA as NatsRuntime A / Manager
     participant N as Core NATS
-    participant NB as NatsNode B / Manager
+    participant NB as NatsRuntime B / Manager
     participant B as Коннектор B
     A->>NA: open(metadata)
     NA->>N: OPEN с лимитами приёма A

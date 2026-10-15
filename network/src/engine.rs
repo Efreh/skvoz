@@ -641,6 +641,7 @@ impl NetworkEngine {
                             skvoz_core::runtime::RuntimeError::Timeout => "Timeout",
                             skvoz_core::runtime::RuntimeError::Transport => "Transport",
                             skvoz_core::runtime::RuntimeError::Protocol => "Protocol",
+                            skvoz_core::runtime::RuntimeError::UnsupportedVersion => "UnsupportedVersion",
                             skvoz_core::runtime::RuntimeError::Admission => "Admission",
                             skvoz_core::runtime::RuntimeError::PeerUnavailable => "PeerUnavailable",
                             skvoz_core::runtime::RuntimeError::StaleKey => "StaleKey",

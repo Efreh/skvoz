@@ -1,7 +1,7 @@
 # Движок байтового потока
 
 Документ описывает экспериментальный внутренний API `skvoz-core`.
-Текущий контракт — Core 4.1.0 / wire 2; отдельные API/ABI описаны в страницах компонентов.
+Текущий контракт — Core 5.0.0 / wire 2; отдельные API/ABI описаны в страницах компонентов.
 
 ## Модель и операции
 
@@ -200,8 +200,7 @@ transport caller и освобождает pending send bytes; dispatched record
 сначала проверяется aggregate ledger. Отбросить можно пришедшие bytes; отмена
 потока не освобождает неиспользованное разрешение peer.
 
-Ready peers и streams планируются вложенным round-robin, один frame на peer за
-цикл. Control имеет отдельные coalesced slots, не требует DATA-кредита;
+Ready peers и streams планируются вложенными byte deficits с quantum16КиБ, ограниченным накоплением и стоимостью encoded bytes+1024 на каждый record. Фиксированная часть учитывает framing/parser/allocation работу малых сообщений; это вес планирования, а не ограничение скорости. Цикл имеет конечное число records. Control имеет отдельные coalesced slots, не требует DATA-кредита;
 FROZEN не обгоняет ранее извлечённые DATA. Poll выдаёт максимум 256 элементов.
 `Manager::poll_frames_with_budget(max, admit)` проверяет размер целого wire frame
 до извлечения, передавая callback его `StreamKey`, размер и признак DATA. Host
@@ -288,3 +287,5 @@ NATS очереди имеют message-count caps. Для Core publish/подп�
 показывает измеряемую область и её ограничения.
 
 `Manager.aggregate()` возвращает счётчики потоков, резервирования, отправки и готовых очередей за постоянное время. `resources()` подробно просматривает буферы за O(число потоков). Жизненный цикл динамических сессий, ключи RuntimeKey с проверкой поколения и транспортные отметки определены в [контракте NATS runtime](nats-runtime.md) поверх того же Stream.
+
+Resource-pressure cancellation reports `CloseReason::ResourcePressure`, separately from explicit application cancellation.

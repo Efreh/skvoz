@@ -56,7 +56,7 @@ fn error_code(e: RuntimeError) -> u16 {
         RuntimeError::Manager(ManagerError::Stream(Error::InvalidConsumption)) => 8,
         RuntimeError::Manager(ManagerError::Stream(Error::InvalidState)) => 7,
         RuntimeError::Manager(_) | RuntimeError::Config | RuntimeError::Authorization => 2,
-        RuntimeError::Protocol => 10,
+        RuntimeError::Protocol | RuntimeError::UnsupportedVersion => 10,
         _ => 9,
     }
 }
@@ -401,6 +401,7 @@ impl Host {
                         CloseReason::TransportLost => 4,
                         CloseReason::ProtocolError => 5,
                         CloseReason::OpenTimeout => 6,
+                        CloseReason::ResourcePressure => 7,
                     };
                     (protocol::CLOSED, reason.to_be_bytes().to_vec())
                 }

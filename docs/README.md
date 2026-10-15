@@ -30,3 +30,5 @@ SKVOZ объединяет ядро двунаправленных байтов�
 [ретранслятор TCP](../connectors/tcp/README.md).
 В концепции описаны и будущие возможности;
 текущие интерфейсы определяют контракты движка, wire, NATS runtime, сетевого runtime и IPC.
+
+[Runtime protocol3](runtime-protocol.md) documents continuous delivery, independent control and exact byte layouts.

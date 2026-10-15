@@ -189,7 +189,7 @@ module Skvoz
         renew(initial: true) unless @tls.valid?
         @runtime_stage = 'binary_validation'
         validate_binary(@config['nats_binary'], 'nats-server: v2.15.1')
-        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.6.0 network=6 api=1 core=4.1.0')
+        validate_binary(@config['runtime_binary'], 'skvoz-network-runtime 0.7.0 network=6 api=1 core=5.0.0')
         @nats_path = File.join(@state.directory, 'nats.conf')
         PrivateFiles.write(@nats_path, @state.nats_config)
         @runtime_stage = 'nats_validation'

@@ -129,7 +129,7 @@ mod credit_integration_tests {
         let (mut receiver, key) = queued_growth_sample();
         receiver.consume_through(key, 16384).unwrap();
         receiver.consume_through(key, 32768).unwrap();
-        assert_eq!(receiver.streams[&key].stream.receive_window(), 131072);
+        assert_eq!(receiver.streams[&key].stream.receive_window(), 262144);
         assert!(receiver.receive_promises.bytes <= receiver.config.receive_budget as u64);
     }
     #[test]
@@ -138,7 +138,7 @@ mod credit_integration_tests {
         receiver.consume_through(key, 16384).unwrap();
         receiver.tick(1100).unwrap();
         receiver.consume_through(key, 49152).unwrap();
-        assert_eq!(receiver.streams[&key].stream.receive_window(), 131072);
+        assert_eq!(receiver.streams[&key].stream.receive_window(), 262144);
         assert_eq!(
             receiver.streams[&key].received,
             receiver.streams[&key].consumed
@@ -857,12 +857,29 @@ mod credit_integration_tests {
             forward(&mut b, &mut a, now);
             a.poll_events(256);
         }
+        // A byte-sliced scheduler can leave a bounded suffix after one batch.
+        // Finish the warmup before asserting the next payload's exact prefix.
+        for now in 24..40 {
+            if a.aggregate().pending_send_bytes == 0 {
+                break;
+            }
+            forward(&mut a, &mut b, now);
+            for event in b.poll_events(256) {
+                if let Event::Data { offset, bytes } = event.event {
+                    b.consume_through(event.key, offset + bytes.len() as u64)
+                        .unwrap();
+                }
+            }
+            forward(&mut b, &mut a, now);
+            a.poll_events(256);
+        }
+        assert_eq!(a.aggregate().pending_send_bytes, 0);
         for _ in 0..8 {
             assert_eq!(a.send(ip, &[9; 16384]), Ok(SendOutcome::Accepted(16384)));
         }
         assert_eq!(a.send(tcp, b"healthy"), Ok(SendOutcome::Accepted(7)));
         a.close(terminal, CloseReason::Cancelled).unwrap();
-        forward(&mut a, &mut b, 24);
+        forward(&mut a, &mut b, 40);
         let mut room = 65536;
         let events = b.poll_events_with_data_budget(256, |key, bytes| {
             if key != ip {
@@ -1650,7 +1667,25 @@ pub struct Aggregate {
     pub ready_output_peers: usize,
     pub ready_event_peers: usize,
 }
+const SCHEDULER_QUANTUM: usize = 16 * 1024;
+// Fixed framing, parsing and allocation work exists even for a one-byte DATA.
+const SCHEDULER_RECORD_BYTES: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowObservation {
+    pub backlog_age_ms: Option<u64>,
+    pub application_credit_blocked: bool,
+    pub local_budget_blocked: bool,
+    pub queued_for_output: bool,
+    pub independent_control_ready: bool,
+    pub unread_bytes: u64,
+    pub pending_send_bytes: usize,
+}
+
 struct Entry {
+    deficit: usize,
+    backlog_since: Option<u64>,
+    announced: bool,
     stream: Stream,
     receive_ends: LinkedList<u64>,
     received: u64,
@@ -1677,6 +1712,7 @@ struct Pressure {
     deadline: u64,
 }
 struct Peer {
+    deficit: usize,
     tx: SendCredit,
     rx: ReceiveCredit,
     target: Amount,
@@ -1801,6 +1837,7 @@ impl Manager {
         self.peers.insert(
             id,
             Peer {
+                deficit: SCHEDULER_QUANTUM,
                 tx: SendCredit::default(),
                 rx,
                 target,
@@ -2044,7 +2081,7 @@ impl Manager {
             .max()
             .map(|(_, _, key)| key);
         if let Some(key) = victim {
-            self.close(key, CloseReason::Cancelled)?;
+            self.close(key, CloseReason::ResourcePressure)?;
             self.peers.get_mut(&peer).unwrap().pressure = None;
         } else {
             self.peers.get_mut(&peer).unwrap().pressure = None;
@@ -2440,6 +2477,9 @@ impl Manager {
         self.streams.insert(
             key,
             Entry {
+                deficit: SCHEDULER_QUANTUM,
+                backlog_since: None,
+                announced: !stream.has_pending_open(),
                 stream,
                 receive_ends: LinkedList::new(),
                 received: 0,
@@ -2642,7 +2682,11 @@ impl Manager {
                         .saturating_sub(p.target.bytes / 8)
                         .min(self.config.stream.receive_window as u64)
                         as u32;
-                    let window = current.saturating_mul(2).min(ceiling).max(current);
+                    let window = current
+                        .saturating_mul(2)
+                        .max(256 * 1024)
+                        .min(ceiling)
+                        .max(current);
                     if window > current {
                         e.stream.grant_receive_window(window, p.probe)?;
                     }
@@ -2754,6 +2798,11 @@ impl Manager {
         let retained_after = e.stream.retained_send_records();
         e.retained_send_records = retained_after;
         let after = snapshot.pending_send_bytes;
+        if after == 0 {
+            e.backlog_since = None;
+        } else if e.backlog_since.is_none() {
+            e.backlog_since = Some(self.now);
+        }
         if snapshot.state == State::Closed {
             self.unconsumed.remove(&key);
             let amount = Amount {
@@ -2877,8 +2926,8 @@ impl Manager {
             self.budget_waiters.remove(&key);
         }
     }
-    /// One frame per ready peer, rotating its ready streams. Caller must
-    /// transmit in returned order and bound its own retained frame batches.
+    /// Byte deficit scheduling between peers, then their ready streams.
+    /// Caller transmits in returned order and bounds retained frame batches.
     pub fn poll_frames(&mut self, max: usize) -> Vec<RoutedFrame> {
         self.poll_frames_with_budget(max, |_, _, _| true)
     }
@@ -2960,6 +3009,20 @@ impl Manager {
             .chain(rejected)
             .min()
     }
+    #[cfg(feature = "nats")]
+    pub(crate) fn stream_transport_weight(&self, key: StreamKey, overhead: usize) -> Option<usize> {
+        if self.open_output_blocked(key) {
+            return None;
+        }
+        let stream = &self.streams.get(&key)?.stream;
+        if stream.priority_control_ready() {
+            return None;
+        }
+        stream
+            .next_frame_size_for(key.stream_id)?
+            .0
+            .checked_add(overhead)
+    }
     fn open_output_blocked(&self, key: StreamKey) -> bool {
         self.streams
             .get(&key)
@@ -2975,6 +3038,58 @@ impl Manager {
                         })
                         .is_some_and(|entry| entry.stream.has_pending_open())
                 })
+    }
+    /// Extract one bounded flow-control/reset command independently of DATA.
+    /// Only ready stream indexes are visited; idle streams are never scanned.
+    pub(crate) fn poll_priority_control(&mut self, peer: PeerId) -> Option<RoutedFrame> {
+        if !self.peers.get(&peer)?.output_enabled {
+            return None;
+        }
+        let p = self.peers.get_mut(&peer)?;
+        if let Some(frame) = p.controls.pop_front().or_else(|| p.tx.frozen_frame()) {
+            return Some(RoutedFrame {
+                key: StreamKey { peer, stream_id: 0 },
+                frame,
+            });
+        }
+        let visits = p.output.len();
+        for _ in 0..visits {
+            let id = self.peers.get_mut(&peer)?.output.pop_front()?;
+            self.peers.get_mut(&peer)?.output_set.remove(&id);
+            let key = StreamKey {
+                peer,
+                stream_id: id,
+            };
+            let entry = self.streams.get_mut(&key)?;
+            let before = entry.stream.snapshot().pending_send_bytes;
+            let frame = entry.stream.poll_priority_control();
+            let announced = entry.announced;
+            self.refresh(key, before);
+            self.reap(key);
+            if let Some(frame) = frame {
+                // Cancellation before OPEN publication has no remote object.
+                if !announced && matches!(frame, Frame::Close { .. }) {
+                    continue;
+                }
+                return Some(RoutedFrame { key, frame });
+            }
+        }
+        None
+    }
+    pub(crate) fn validate_control_object(&self, key: StreamKey) -> Result<(), ManagerError> {
+        if key.stream_id == 0 || self.streams.contains_key(&key) {
+            return Ok(());
+        }
+        let p = self.peers.get(&key.peer).ok_or(ManagerError::UnknownPeer)?;
+        let last = if key.stream_id & 1 == p.local_bit {
+            p.local_sequence
+        } else {
+            p.remote_sequence
+        };
+        if key.stream_id >> 1 > last {
+            return Err(ManagerError::InvalidOrigin);
+        }
+        Ok(())
     }
     /// Admit an encoded Core frame before extraction. Denied work stays owned
     /// by Core; ready peers/streams rotate within a finite scan, never idle slots.
@@ -3021,6 +3136,31 @@ impl Manager {
                         .map(|(size, data)| (key, size, data, true))
                 })
             };
+            if let Some((key, size, _, stream)) = next {
+                let cost = size + SCHEDULER_RECORD_BYTES;
+                let p = self.peers.get_mut(&peer).unwrap();
+                if cost > p.deficit {
+                    p.deficit = p
+                        .deficit
+                        .saturating_add(SCHEDULER_QUANTUM)
+                        .min(4 * SCHEDULER_QUANTUM + SCHEDULER_RECORD_BYTES + 28);
+                    self.ready_peer(peer, true);
+                    continue;
+                }
+                if stream {
+                    let entry = self.streams.get_mut(&key).unwrap();
+                    if cost > entry.deficit {
+                        entry.deficit = entry
+                            .deficit
+                            .saturating_add(SCHEDULER_QUANTUM)
+                            .min(4 * SCHEDULER_QUANTUM + SCHEDULER_RECORD_BYTES + 28);
+                        let id = p.output.pop_front().unwrap();
+                        p.output.push_back(id);
+                        self.ready_peer(peer, true);
+                        continue;
+                    }
+                }
+            }
             // The receiver's replay watermark requires first OPEN publication
             // in identity order. Keep rotating denied work so smaller DATA,
             // FIN/CLOSE and peer controls can still use available credit.
@@ -3064,6 +3204,9 @@ impl Manager {
                     if let Some(e) = self.streams.get_mut(&key) {
                         let before = e.stream.snapshot().pending_send_bytes;
                         if let Some(frame) = e.stream.poll_frames(1).pop() {
+                            if matches!(frame, Frame::Open { .. }) {
+                                e.announced = true;
+                            }
                             if let Frame::Data { bytes, .. } = &frame {
                                 self.peers
                                     .get_mut(&peer)
@@ -3081,13 +3224,35 @@ impl Manager {
                     }
                 }
             }
+            if let Some((key, size, _, stream)) = next {
+                let cost = size + SCHEDULER_RECORD_BYTES;
+                self.peers.get_mut(&peer).unwrap().deficit -= cost;
+                if stream && let Some(entry) = self.streams.get_mut(&key) {
+                    entry.deficit -= cost;
+                    if entry.deficit != 0 && self.peers[&peer].output_set.contains(&key.stream_id) {
+                        let p = self.peers.get_mut(&peer).unwrap();
+                        p.output.retain(|id| *id != key.stream_id);
+                        p.output.push_front(key.stream_id);
+                    } else if entry.deficit == 0 {
+                        entry.deficit = SCHEDULER_QUANTUM;
+                    }
+                }
+            }
             let p = &self.peers[&peer];
             if !p.output.is_empty()
                 || p.rejection.is_some()
                 || !p.controls.is_empty()
                 || (p.tx.freezing.is_some() && !p.tx.frozen && p.tx.pending == Amount::default())
             {
+                let keep = p.deficit != 0;
+                if !keep {
+                    self.peers.get_mut(&peer).unwrap().deficit = SCHEDULER_QUANTUM;
+                }
                 self.ready_peer(peer, true);
+                if keep && self.output.back() == Some(&peer) {
+                    self.output.pop_back();
+                    self.output.push_front(peer);
+                }
             }
         }
         result
@@ -3268,6 +3433,23 @@ impl Manager {
     }
     pub fn snapshot(&self, key: StreamKey) -> Option<Snapshot> {
         self.streams.get(&key).map(|e| e.stream.snapshot())
+    }
+    /// Explicit per-stream query; no background scan or payload allocation.
+    /// Backlog age measures one continuous nonempty send backlog, not the age
+    /// of an individual frame or the remote application's processing time.
+    pub fn flow_observation(&self, key: StreamKey, now_ms: u64) -> Option<FlowObservation> {
+        let e = self.streams.get(&key)?;
+        let p = self.peers.get(&key.peer)?;
+        Some(FlowObservation {
+            backlog_age_ms: e.backlog_since.map(|since| now_ms.saturating_sub(since)),
+            application_credit_blocked: e.stream.credit_blocked()
+                && matches!(e.stream.state(), State::Open | State::HalfClosedRemote),
+            local_budget_blocked: self.budget_waiters.contains(&key),
+            queued_for_output: p.output_set.contains(&key.stream_id),
+            independent_control_ready: e.stream.priority_control_ready(),
+            unread_bytes: e.received - e.consumed,
+            pending_send_bytes: e.stream.snapshot().pending_send_bytes,
+        })
     }
     /// Inspect validated peer limits without advancing stream ownership.
     /// Unknown streams and streams awaiting peer negotiation return None.

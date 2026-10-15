@@ -585,9 +585,12 @@ async fn real_runtime_overflow_fails_affected_shard_and_preserves_other_shard() 
     )
     .unwrap();
     for sequence in session.sent_frames + 1..=session.sent_frames + 256 {
-        let mut b = session.pair_token.to_be_bytes().to_vec();
-        b.extend_from_slice(&sequence.to_be_bytes());
-        b.extend_from_slice(&packet);
+        let b = r::data_bytes(
+            session.pair_token,
+            sequence,
+            session.delivery_epoch,
+            &packet,
+        );
         flood
             .inject_subject(
                 format!(
@@ -947,9 +950,12 @@ async fn same_epoch_pair_rejoin_rejects_old_keys_data_and_control_replay() {
         },
     )
     .unwrap();
-    let mut data = old_session.pair_token.to_be_bytes().to_vec();
-    data.extend_from_slice(&1u64.to_be_bytes());
-    data.extend_from_slice(&packet);
+    let data = r::data_bytes(
+        old_session.pair_token,
+        1,
+        old_session.delivery_epoch,
+        &packet,
+    );
     client
         .inject_subject(
             format!(
@@ -961,17 +967,14 @@ async fn same_epoch_pair_rejoin_rejects_old_keys_data_and_control_replay() {
         .await
         .unwrap();
     for kind in [1u8, 3, 4, 6] {
-        let mut c = b"SKC2".to_vec();
-        c.push(kind);
-        for n in [
+        let c = r::control_bytes(
+            kind,
             epoch,
             server.generation(),
             old_session.handshake_nonce,
             old_session.pair_token,
-        ] {
-            c.extend_from_slice(&n.to_be_bytes());
-        }
-        c.extend_from_slice(&0u64.to_be_bytes());
+            0,
+        );
         let subject = if kind == 6 {
             format!(
                 "{namespace}.lane.0.{:032x}.1.control.1.{epoch:032x}",
@@ -984,17 +987,14 @@ async fn same_epoch_pair_rejoin_rejects_old_keys_data_and_control_replay() {
     }
     // Replay READY in its original responder -> initiator direction, carrying
     // the actual retired handshake nonce/token rather than an invented nonce.
-    let mut ready = b"SKC2".to_vec();
-    ready.push(4);
-    for n in [
+    let ready = r::control_bytes(
+        4,
         server.generation(),
         epoch,
         old_session.handshake_nonce,
         old_session.pair_token,
-    ] {
-        ready.extend_from_slice(&n.to_be_bytes());
-    }
-    ready.extend_from_slice(&0u64.to_be_bytes());
+        0,
+    );
     server
         .inject_subject(format!("{namespace}.join.1.0"), ready)
         .await
@@ -1164,9 +1164,10 @@ async fn actual_header_message_retires_only_its_transport_shard() {
     let (offender_key, _) = r::handshake(&mut offender, &mut server).await.unwrap();
     let (healthy_key, _) = r::handshake(&mut healthy, &mut server).await.unwrap();
     let session = offender.peer_status(PeerId(0)).unwrap();
-    let mut payload = session.pair_token.to_be_bytes().to_vec();
-    payload.extend_from_slice(&(session.sent_frames + 1).to_be_bytes());
-    payload.extend_from_slice(
+    let payload = r::data_bytes(
+        session.pair_token,
+        session.sent_frames + 1,
+        session.delivery_epoch,
         &skvoz_core::wire::encode(
             offender_key.stream.stream_id,
             &skvoz_core::Frame::WindowUpdate { consumed: 0 },

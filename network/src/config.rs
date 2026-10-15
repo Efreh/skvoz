@@ -300,7 +300,7 @@ impl Limits {
             + self.join_frames
             + self.client_frames * (lanes + 1)
             + 4 * (lanes + 1))
-            * (65588 + 1024)
+            * (skvoz_core::runtime::TRANSPORT_PACKET_BYTES + 1024)
             + self.manager(role).max_peers * skvoz_core::TRANSPORT_DELIVERY_STATE_BYTES
             + self.manager(role).max_peers * 2048
     }

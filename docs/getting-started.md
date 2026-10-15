@@ -81,7 +81,7 @@ python3 testbench/run.py tcp --offline
 
 Requester передаёт 32 768 байт и закрывает отправляющее направление TCP.
 Target читает до EOF, затем возвращает 65 536 байт и FIN. Пример проверяет
-полные bytes/EOF на обеих сторонах и нулевые live slots обоих NatsNode.
+полные bytes/EOF на обеих сторонах и нулевые live slots обоих NatsRuntime.
 `PASS real TCP` и код 0 означают выполнение этого сценария.
 [Relay одного сокета](../connectors/tcp/README.md) описывает API и ограничения.
 
@@ -147,7 +147,7 @@ cargo run --locked -p skvoz-core --example in_memory
 | Ошибка TLS или готовности брокера | Повторите через runner, который создаёт согласованные CA, конфигурацию и credentials; проверьте работоспособность Docker. |
 
 Сценарии demo/load используют конечные буферы в одном процессе и статический
-NatsNode; минимальный TCP relay требует выделенного node. Dynamic runtime
+NatsNode; минимальный TCP relay требует выделенного динамического NatsRuntime. Dynamic runtime
 поддерживает join/rejoin и новые streams после recovery. Прерванные потоки
 не возобновляются. [Клиент Ubuntu](ubuntu-client.md) поставляется отдельно через deb. Подробнее:
 [архитектура](architecture.md), [контракт](stream-engine.md),
@@ -156,7 +156,7 @@ NatsNode; минимальный TCP relay требует выделенного
 ## Независимые процессы runtime
 
 ```sh
-python3 testbench/run.py qualify --offline --clients 129 --streams-per-client 2 --active-per-client 1 --bytes 32768 --duration 3
+python3 testbench/run.py qualify --offline --clients 128 --streams-per-client 2 --active-per-client 1 --bytes 32768 --duration 3
 python3 testbench/run.py qualify --offline --clients 8 --streams-per-client 4 --active-per-client 2 --bytes 32768 --duration 1 --delay-ms 40 --slow-reader-delay-ms 250 --churn-rounds 2
 ```
 

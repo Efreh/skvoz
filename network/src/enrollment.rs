@@ -163,7 +163,7 @@ pub async fn enroll(credentials: &Credentials, device: &str) -> Result<Enrollmen
             || result.network_runtime.version != env!("CARGO_PKG_VERSION")
             || result.network_runtime.api != 1
             || result.network_runtime.network != crate::NETWORK_VERSION
-            || result.network_runtime.core != "4.1.0"
+            || result.network_runtime.core != "5.0.0"
         {
             return Err(Error("version_mismatch"));
         }

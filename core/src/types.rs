@@ -1,5 +1,6 @@
-/// Conservative scalar delivery receipt state, including Option alignment.
-pub const TRANSPORT_DELIVERY_STATE_BYTES: usize = 512;
+/// Bounded peer ledgers/control plus up to2048 retained exact prefix endpoints.
+/// Empty peers allocate no endpoint buffer; this is backing, not preallocation.
+pub const TRANSPORT_DELIVERY_STATE_BYTES: usize = 2048 + 2048 * 16;
 
 use std::fmt;
 
@@ -86,6 +87,7 @@ pub enum CloseReason {
     TransportLost,
     ProtocolError,
     OpenTimeout,
+    ResourcePressure,
 }
 
 impl CloseReason {

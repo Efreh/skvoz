@@ -9,6 +9,96 @@ import threading
 import time
 
 PORT = 9000
+PATTERN = bytes(range(256)) * 512
+
+
+def exact(sock, count):
+    data = bytearray()
+    while len(data) < count:
+        part = sock.recv(count - len(data))
+        if not part:
+            raise EOFError('Truncated workload record')
+        data.extend(part)
+    return bytes(data)
+
+
+def one_way_connection(sock, download):
+    with sock:
+        sock.settimeout(20)
+        count = struct.unpack('!Q', exact(sock, 8))[0]
+        assert 0 < count <= 128 * 1024 * 1024
+        offset = 0
+        digest = hashlib.sha256()
+        while offset < count:
+            if download:
+                chunk = PATTERN[:min(65536, count - offset)]
+                sock.sendall(chunk)
+            else:
+                chunk = sock.recv(min(65536, count - offset))
+                assert chunk and chunk == memoryview(PATTERN)[offset % 256:offset % 256 + len(chunk)]
+            digest.update(chunk)
+            offset += len(chunk)
+        if download:
+            sock.shutdown(socket.SHUT_WR)
+        else:
+            assert sock.recv(1) == b'', 'Upload missing half-close'
+            sock.sendall(digest.digest())
+
+
+def one_way_server(family, address, download):
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    if family == socket.AF_INET6:
+        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    listener.bind((address, PORT + (1 if download else 2)))
+    listener.listen(16)
+    while True:
+        connection, _ = listener.accept()
+        threading.Thread(target=one_way_connection, args=(connection, download), daemon=True).start()
+
+
+def one_way(address, count, download):
+    with socket.create_connection((address, PORT + (1 if download else 2)), timeout=20) as sock:
+        sock.sendall(struct.pack('!Q', count))
+        offset = 0
+        digest = hashlib.sha256()
+        started = time.monotonic()
+        first = None
+        while offset < count:
+            if download:
+                chunk = sock.recv(min(65536, count - offset))
+                assert chunk and chunk == memoryview(PATTERN)[offset % 256:offset % 256 + len(chunk)]
+                if first is None:
+                    first = time.monotonic() - started
+            else:
+                chunk = PATTERN[:min(65536, count - offset)]
+                sock.sendall(chunk)
+            digest.update(chunk)
+            offset += len(chunk)
+        if download:
+            assert sock.recv(1) == b'', 'Download missing half-close'
+        else:
+            sock.shutdown(socket.SHUT_WR)
+            assert exact(sock, 32) == digest.digest(), 'Upload hash mismatch'
+        elapsed = time.monotonic() - started
+        return {'bytes': offset, 'seconds': elapsed, 'mbit_s': offset * 8 / elapsed / 1e6,
+                'first_data_ms': None if first is None else first * 1000,
+                'sha256': digest.hexdigest(), 'direction': 'download' if download else 'upload'}
+
+
+def short_exchange(address, samples):
+    assert 0 < samples <= 1000
+    times = []
+    with socket.create_connection((address, PORT), timeout=10) as sock:
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        for _ in range(samples):
+            start = time.monotonic()
+            sock.sendall(PATTERN[:256])
+            assert exact(sock, 256) == PATTERN[:256]
+            times.append((time.monotonic() - start) * 1000)
+    times.sort()
+    return {'samples': samples, 'bytes': 256, 'p95_ms': times[min(samples - 1, int(samples * .95))],
+            'median_ms': times[samples // 2], 'min_ms': times[0]}
 
 
 def echo_stream(connection):
@@ -84,6 +174,8 @@ def icmp_monitor(family):
 
 def server():
     for family, address in [(socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")]:
+        for download in (True, False):
+            threading.Thread(target=one_way_server, args=(family, address, download), daemon=True).start()
         for function, args in [(tcp_server, (family, address)),
                                (datagram_server, (family, address)),
                                (datagram_server, (family, address, 143))]:
@@ -270,7 +362,7 @@ def spoof(address, source):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["server", "tcp", "tcp-duration", "udp", "raw", "spoof", "burst"])
+    parser.add_argument("mode", choices=["server", "tcp", "tcp-duration", "tcp-download", "tcp-upload", "tcp-short", "udp", "raw", "spoof", "burst"])
     parser.add_argument("address", nargs="?")
     parser.add_argument("--bytes", type=int, default=65536)
     parser.add_argument("--samples", type=int, default=1)
@@ -284,6 +376,9 @@ def main():
         return
     functions = {"tcp": lambda: tcp(args.address, args.bytes, args.rate_mbit),
                  "tcp-duration": lambda: tcp_duration(args.address, args.seconds),
+                 "tcp-download": lambda: one_way(args.address, args.bytes, True),
+                 "tcp-upload": lambda: one_way(args.address, args.bytes, False),
+                 "tcp-short": lambda: short_exchange(args.address, args.samples),
                  "udp": lambda: udp(args.address, args.bytes, args.samples, args.interval),
                  "raw": lambda: raw(args.address),
                  "spoof": lambda: spoof(args.address, args.source),

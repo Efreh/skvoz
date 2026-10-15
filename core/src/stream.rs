@@ -667,6 +667,31 @@ impl Stream {
         }
         bytes.min(maximum)
     }
+    pub(crate) fn priority_control_ready(&self) -> bool {
+        self.terminal_frame.is_some()
+            || (self.handshake_frame.is_none()
+                && (self.grant_frame.is_some() || self.credit_frame.is_some()))
+    }
+    pub(crate) fn poll_priority_control(&mut self) -> Option<Frame> {
+        if self.terminal_frame.is_some() {
+            return self.terminal_frame.take();
+        }
+        // ACCEPT/OPEN must precede their stream updates.
+        if self.handshake_frame.is_some() {
+            return None;
+        }
+        if let Some((limit, probe)) = self.grant_frame.take() {
+            self.credit_frame = None;
+            return Some(Frame::WindowGrant {
+                consumed: self.consumed,
+                limit,
+                probe,
+            });
+        }
+        self.credit_frame
+            .take()
+            .map(|consumed| Frame::WindowUpdate { consumed })
+    }
     fn next_frame(&mut self) -> Option<Frame> {
         if let Some(frame) = self.terminal_frame.take() {
             return Some(frame);

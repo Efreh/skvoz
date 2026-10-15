@@ -3,7 +3,7 @@
 `skvoz-client` 6.0.0 — приложение Rust с GTK4/libadwaita для Ubuntu 24.04+
 на amd64. Поддерживает локальные интерфейсы HTTP/CONNECT/SOCKS5 CONNECT
 и передачу IPv4/IPv6-пакетов через TUN.
-Оба используют комплектный `skvoz-network-runtime` 0.6.0 с тем же Core 4.1.0.
+Оба используют комплектный `skvoz-network-runtime` 0.7.0 с тем же Core 5.0.0.
 GTK управляет соединением; TCP и packet I/O находятся в
 [общем сетевом модуле](network-runtime.md). Установленному приложению не нужны
 Rust или Python.
@@ -30,7 +30,7 @@ IPv6 допускает `::1` или `[::1]`; порт вводится отде
 отключения. По умолчанию выбран
 режим «Прокси». Устройство выделяется автоматически; ручной peer_id не нужен.
 Сервер должен поддерживать [enrollment 4](#протокол-выделения-устройства-v4),
-network 6, API 1, runtime 0.6.0 и Core 4.1.0.
+network 6, API 1, runtime 0.7.0 и Core 5.0.0.
 
 TLS проверяет системные корни и исходное имя/IP сервера.
 Для private CA укажите PEM-файл, полученный от администратора по доверенному
@@ -193,7 +193,7 @@ broker-authorized reply subject. Request строго ограничен, пов
 поля и произвольный reply отклоняются. Ответ успешного сервера:
 
 ```json
-{"v":4,"namespace":"skvoz.application","peer_id":2,"network_runtime":{"network":6,"api":1,"version":"0.6.0","core":"4.1.0"}}
+{"v":4,"namespace":"skvoz.application","peer_id":2,"network_runtime":{"network":6,"api":1,"version":"0.7.0","core":"5.0.0"}}
 ```
 
 Повтор token идемпотентен, в том числе после потерянного ответа/перезапуска.

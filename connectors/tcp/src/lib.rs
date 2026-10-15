@@ -1,28 +1,29 @@
 //! A bounded single-socket example connector. The host establishes one Core
-//! stream and owns the NATS node; this connector only owns TCP I/O buffers.
+//! stream and owns the NATS runtime; this connector only owns TCP I/O buffers.
 use skvoz_core::{
-    CloseReason, Event, SendOutcome, StreamKey,
-    nats::{NatsError, NatsNode},
+    CloseReason, Event, SendOutcome,
+    runtime::{Lifecycle, NatsRuntime, RuntimeKey},
 };
 use std::time::Duration;
+pub type RelayError = Box<dyn std::error::Error + Send + Sync>;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 #[derive(Debug, Default)]
 pub struct RelayStats {
     pub sent: u64,
     pub received: u64,
 }
-fn error(message: &str) -> NatsError {
+fn error(message: &str) -> RelayError {
     std::io::Error::other(message).into()
 }
 /// Relay one established stream. The node must be dedicated to this socket;
 /// its configured stream max_frame must be >= 1. Application-controlled overall
 /// timeout is a demo limit, not a Core idle timeout or production liveness API.
 pub async fn relay_one(
-    node: &mut NatsNode,
-    key: StreamKey,
+    node: &mut NatsRuntime,
+    key: RuntimeKey,
     socket: TcpStream,
     timeout: Duration,
-) -> Result<RelayStats, NatsError> {
+) -> Result<RelayStats, RelayError> {
     let result = tokio::time::timeout(timeout, relay_established(node, key, socket))
         .await
         .unwrap_or_else(|_| Err(error("TCP relay exceeded its configured deadline")));
@@ -47,17 +48,17 @@ pub async fn relay_one(
         // A bounded transmit attempt may be cancelled or fail. This dedicated
         // node must still return without retaining local stream reservations.
         if node.snapshot(key).is_some() {
-            node.peer_lost(key.peer);
+            node.transport_lost();
             node.poll_events(256);
         }
     }
     result
 }
 async fn relay_established(
-    node: &mut NatsNode,
-    key: StreamKey,
+    node: &mut NatsRuntime,
+    key: RuntimeKey,
     mut socket: TcpStream,
-) -> Result<RelayStats, NatsError> {
+) -> Result<RelayStats, RelayError> {
     let mut stats = RelayStats::default();
     let mut outgoing = Vec::new();
     let mut out_position = 0;
@@ -65,7 +66,7 @@ async fn relay_established(
     let mut local_eof = false;
     let mut remote_eof = false;
     loop {
-        if node.failure_kind().is_some() {
+        if node.status().lifecycle != Lifecycle::Ready || !node.peer_ready(key.stream.peer) {
             node.poll_events(1);
             return Err(error("TCP relay transport lost"));
         }

@@ -19,6 +19,49 @@ async fn node(id: u64, case: &str) -> NatsRuntime {
         .unwrap()
 }
 
+// Every live participant must drive its control path even when its application
+// is idle: pressure reclaim is a paired fence, never a local timeout release.
+async fn bytes_with_idle_peer(
+    source: &mut NatsRuntime,
+    recipient: &mut NatsRuntime,
+    idle: &mut NatsRuntime,
+    key: skvoz_core::runtime::RuntimeKey,
+    remote: skvoz_core::runtime::RuntimeKey,
+    payload: &[u8],
+) {
+    let mut sent = 0;
+    let mut received = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received < payload.len() {
+        assert!(
+            Instant::now() < deadline,
+            "three-peer transfer: sent={sent} received={received}"
+        );
+        if sent < payload.len()
+            && let SendOutcome::Accepted(n) = source.send(key, &payload[sent..]).unwrap()
+        {
+            sent += n;
+        }
+        source.turn(Duration::ZERO).await.unwrap();
+        idle.turn(Duration::ZERO).await.unwrap();
+        recipient.turn(Duration::from_millis(1)).await.unwrap();
+        source.poll_events(256);
+        idle.poll_events(256);
+        for event in recipient.poll_events(256) {
+            if let Event::Data { offset, bytes } = event.event {
+                if event.key == remote {
+                    assert_eq!(offset as usize, received);
+                    assert_eq!(&*bytes, &payload[received..received + bytes.len()]);
+                    received += bytes.len();
+                }
+                recipient
+                    .consume_through(event.key, offset + bytes.len() as u64)
+                    .unwrap();
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn concurrent_sources_share_recipient_flight_and_a_fault_is_peer_scoped() {
     let mut recipient = node(0, "recipient_flight").await;
@@ -142,17 +185,15 @@ async fn concurrent_sources_share_recipient_flight_and_a_fault_is_peer_scoped() 
     // One authenticated impossible demand is a peer failure, not a host error.
     let status = second.peer_status(PeerId(0)).unwrap();
     let config = r::config(9, "recipient_flight").unwrap();
-    let mut message = b"SKC2".to_vec();
-    message.push(7);
-    for field in [
+    let mut message = r::control_bytes(
+        7,
         second.epoch(),
         recipient.epoch(),
-        u128::MAX,
+        0,
         status.pair_token,
-    ] {
-        message.extend_from_slice(&field.to_be_bytes());
-    }
-    message.extend_from_slice(&(4u64 << 20).to_be_bytes());
+        4u64 << 20,
+    );
+    message[80..88].copy_from_slice(&(status.sent_controls + 1).to_be_bytes());
     second
         .inject_subject(
             format!(
@@ -306,13 +347,25 @@ async fn queued_source_retirement_drains_before_same_id_epoch_reuse() {
         recipient.turn(Duration::from_millis(1)).await.unwrap();
     }
     let (a, remote_a) = r::handshake(&mut first, &mut recipient).await.unwrap();
-    let (b, _) = r::handshake(&mut old, &mut recipient).await.unwrap();
-    r::bytes(&mut first, &mut recipient, a, &vec![1; 4 << 20])
-        .await
-        .unwrap();
-    r::bytes(&mut old, &mut recipient, b, &vec![9; 4 << 20])
-        .await
-        .unwrap();
+    let (b, remote_b) = r::handshake(&mut old, &mut recipient).await.unwrap();
+    bytes_with_idle_peer(
+        &mut first,
+        &mut recipient,
+        &mut old,
+        a,
+        remote_a,
+        &vec![1; 4 << 20],
+    )
+    .await;
+    bytes_with_idle_peer(
+        &mut old,
+        &mut recipient,
+        &mut first,
+        b,
+        remote_b,
+        &vec![9; 4 << 20],
+    )
+    .await;
     let old_epoch = old.epoch();
     let old_pair = old.peer_status(PeerId(0)).unwrap().pair_token;
     let mut sent = [4 << 20; 2];
@@ -348,16 +401,43 @@ async fn queued_source_retirement_drains_before_same_id_epoch_reuse() {
         turns += 1;
     }
     let before = recipient.inspect_source_retirement(1, PeerId(9));
+    let held = recipient.delivery_status().unwrap().receive_promised_bytes;
     recipient.terminate_peer(PeerId(9));
-    let quarantined = recipient.inspect_source_retirement(1, PeerId(9));
-    assert_eq!(quarantined, (before.0, before.1, true));
+    assert!(!recipient.peer_ready(PeerId(9)));
+    assert_eq!(
+        recipient.delivery_status().unwrap().receive_promised_bytes,
+        held
+    );
+    // The exact source stays subscribed until both committed prefixes have
+    // arrived. Neither a local close nor a timer releases its backing.
+    assert_eq!(
+        recipient.inspect_source_retirement(1, PeerId(9)).1,
+        before.1
+    );
     let started = Instant::now();
-    recipient.turn(Duration::ZERO).await.unwrap();
+    while !recipient.peer_streams_drained(PeerId(9)) {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "paired terminal cleanup deadline"
+        );
+        old.turn(Duration::ZERO).await.unwrap();
+        first.turn(Duration::ZERO).await.unwrap();
+        recipient.turn(Duration::from_millis(1)).await.unwrap();
+        old.poll_events(256);
+        first.poll_events(256);
+        for event in recipient.poll_events(256) {
+            if let Event::Data { offset, bytes } = event.event {
+                recipient
+                    .consume_through(event.key, offset + bytes.len() as u64)
+                    .unwrap();
+            }
+        }
+        assert!(recipient.peer_ready(PeerId(1)));
+    }
     let cleanup_us = started.elapsed().as_micros();
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(recipient.status().counters.shard_failures, 0);
     assert!(recipient.peer_ready(PeerId(1)));
-    old.terminate_peer(PeerId(0));
     old.poll_events(256);
     old.shutdown().await.unwrap();
     let mut replacement = node(9, "recipient_retire").await;
@@ -381,9 +461,10 @@ async fn queued_source_retirement_drains_before_same_id_epoch_reuse() {
     // Delayed old incarnation DATA cannot consume the new pair's credit or
     // affect the healthy source; both subject epoch and pair token are pinned.
     let config = r::config(9, "recipient_retire").unwrap();
-    let mut stale = old_pair.to_be_bytes().to_vec();
-    stale.extend_from_slice(&1u64.to_be_bytes());
-    stale.extend_from_slice(
+    let stale = r::data_bytes(
+        old_pair,
+        1,
+        0,
         &skvoz_core::wire::encode(
             b.stream.stream_id,
             &skvoz_core::Frame::WindowUpdate { consumed: 0 },
@@ -424,16 +505,28 @@ async fn queued_source_retirement_drains_before_same_id_epoch_reuse() {
         first.poll_events(256);
         recipient.poll_events(256);
     }
-    let (healthy, _) = r::handshake(&mut first, &mut recipient).await.unwrap();
-    r::bytes(&mut first, &mut recipient, healthy, &[3; 65536])
+    let (healthy, remote_healthy) = r::handshake(&mut first, &mut recipient).await.unwrap();
+    bytes_with_idle_peer(
+        &mut first,
+        &mut recipient,
+        &mut replacement,
+        healthy,
+        remote_healthy,
+        &[3; 65536],
+    )
+    .await;
+    let (fresh, remote_fresh) = r::handshake(&mut replacement, &mut recipient)
         .await
         .unwrap();
-    let (fresh, _) = r::handshake(&mut replacement, &mut recipient)
-        .await
-        .unwrap();
-    r::bytes(&mut replacement, &mut recipient, fresh, &[9; 65536])
-        .await
-        .unwrap();
+    bytes_with_idle_peer(
+        &mut replacement,
+        &mut recipient,
+        &mut first,
+        fresh,
+        remote_fresh,
+        &[9; 65536],
+    )
+    .await;
     println!(
         "source retirement lane=1 queued={} retained_bytes={} cleanup_us={} fresh_epoch=true",
         before.0, before.1, cleanup_us

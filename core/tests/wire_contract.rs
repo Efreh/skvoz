@@ -40,6 +40,9 @@ fn language_neutral_vectors_match_all_frames() {
             "close" => Frame::Close {
                 reason: CloseReason::Cancelled,
             },
+            "close_resource_pressure" => Frame::Close {
+                reason: CloseReason::ResourcePressure,
+            },
             "window_grant" => Frame::WindowGrant {
                 consumed: 2,
                 limit: 16,

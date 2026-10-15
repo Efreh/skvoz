@@ -4,7 +4,7 @@ require 'json'
 require 'socket'
 
 if ARGV == ['--version']
-  puts 'skvoz-network-runtime 0.6.0 network=6 api=1 core=4.1.0'
+  puts 'skvoz-network-runtime 0.7.0 network=6 api=1 core=5.0.0'
   exit
 end
 

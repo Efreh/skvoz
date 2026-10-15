@@ -3,19 +3,25 @@
 //! Broker permissions MUST bind sender, recipient and sender shard. A subject is
 //! not an identity proof without that provisioning contract. See the runtime guide.
 mod api;
-mod credit;
+mod closing;
+mod continuous;
+mod delivery;
 mod diagnostics;
+mod protocol;
+mod termination;
 pub use api::{
-    Authentication, Counters, Lifecycle, Membership, PeerStatus, RuntimeConfig, RuntimeError,
-    RuntimeEvent, RuntimeKey, Status, Trust, verified_tls_config,
+    Authentication, Counters, DeliveryStatus, Lifecycle, Membership, PeerStatus, RuntimeConfig,
+    RuntimeError, RuntimeEvent, RuntimeKey, Status, StreamDiagnostics, Trust, verified_tls_config,
 };
 pub use diagnostics::TurnDiagnostics;
 
+use crate::credit::Amount;
 use crate::{
     CloseReason, Manager, ManagerConfig, PeerId, PeerLimits, Resources, SendOutcome, Snapshot,
     StreamKey, wire,
 };
 use futures_util::{FutureExt, Stream, StreamExt};
+use protocol::{CONTROL_BYTES, Control, DATA_HEADER, DataHeader};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -29,8 +35,10 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-pub const TRANSPORT_PACKET_BYTES: usize = wire::MAX_PACKET_BYTES + 24;
-const CONTROL_BYTES: usize = 77;
+pub const RUNTIME_FRAME_BYTES: usize = 16 * 1024;
+pub const TRANSPORT_PACKET_BYTES: usize = DATA_HEADER + 16 + 12 + RUNTIME_FRAME_BYTES;
+// Broker payload also serves bounded provisioning/control outside Core.
+pub const BROKER_PAYLOAD_BYTES: usize = 65588;
 fn elapsed_us(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -103,7 +111,7 @@ struct Connection {
     dirty: bool,
 }
 struct RetiredSource {
-    outstanding: u64,
+    outstanding: Amount,
     barrier: Option<u64>,
 }
 impl MessageReceiver {
@@ -117,41 +125,6 @@ impl MessageReceiver {
 fn retire_source_handles<T>(sources: &mut BTreeMap<PeerId, T>, removing: &mut Vec<T>, id: PeerId) {
     if let Some(handles) = sources.remove(&id) {
         removing.push(handles);
-    }
-}
-#[derive(Clone, Copy)]
-struct Control {
-    kind: u8,
-    sender: u128,
-    recipient: u128,
-    hello: u128,
-    token: u128,
-    watermark: u64,
-}
-impl Control {
-    fn encode(self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(CONTROL_BYTES);
-        b.extend_from_slice(b"SKC2");
-        b.push(self.kind);
-        for x in [self.sender, self.recipient, self.hello, self.token] {
-            b.extend_from_slice(&x.to_be_bytes());
-        }
-        b.extend_from_slice(&self.watermark.to_be_bytes());
-        b
-    }
-    fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() != CONTROL_BYTES || &b[..4] != b"SKC2" || !(1..=10).contains(&b[4]) {
-            return None;
-        }
-        let n = |i| u128::from_be_bytes(b[i..i + 16].try_into().unwrap());
-        Some(Self {
-            kind: b[4],
-            sender: n(5),
-            recipient: n(21),
-            hello: n(37),
-            token: n(53),
-            watermark: u64::from_be_bytes(b[69..77].try_into().unwrap()),
-        })
     }
 }
 #[derive(Clone, Copy)]
@@ -170,8 +143,8 @@ struct Candidate {
 }
 const BROKER_PENDING_BYTES: u64 = 4 * 1024 * 1024;
 const DATA_DELIVERY_BYTES: u64 = 3 * 1024 * 1024;
-const MSG_FRAMING_BYTES: usize = 516;
-const SOURCE_CONTROL_BYTES: u64 = 6 * (CONTROL_BYTES + MSG_FRAMING_BYTES) as u64;
+const MSG_FRAMING_BYTES: usize = 1024;
+const SOURCE_CONTROL_BYTES: u64 = 12 * (CONTROL_BYTES + MSG_FRAMING_BYTES) as u64;
 const ENVELOPE_WEIGHT: u64 = (TRANSPORT_PACKET_BYTES + MSG_FRAMING_BYTES) as u64;
 
 fn lane_credit_limit(sources: usize) -> Result<u64, RuntimeError> {
@@ -214,8 +187,22 @@ struct Session {
     proof_deadline: Instant,
     ping: Option<(u128, u64, Instant, u64)>,
     delivery: DeliveryFlight,
-    sender_credit: credit::Sender,
-    recipient_credit: credit::Recipient,
+    sender_credit: delivery::Sender,
+    recipient_credit: delivery::Recipient,
+    control: delivery::ControlWindow,
+    pending_control: Option<Control>,
+    closing: Option<closing::Closing>,
+    advertised: delivery::Limit,
+    target: Amount,
+    demand: u64,
+    announced_demand: u64,
+    remote_demand: u64,
+    growth_applied: u64,
+    growth_records: u64,
+    last_data: Instant,
+    fence_sent: bool,
+    frozen_sent: bool,
+    fence_deadline: Option<Instant>,
     pong: Option<(u128, u64)>,
     retiring: bool,
     proven: bool,
@@ -245,6 +232,8 @@ impl Session {
     }
 }
 struct Peer {
+    hello_attempts: usize,
+    join_failures: usize,
     session: Option<Session>,
     incoming: Option<Flight>,
     outgoing: Option<Flight>,
@@ -253,6 +242,8 @@ struct Peer {
 impl Peer {
     fn new() -> Self {
         Self {
+            hello_attempts: 0,
+            join_failures: 0,
             session: None,
             incoming: None,
             outgoing: None,
@@ -310,6 +301,7 @@ pub struct NatsRuntime {
     retry_at: Instant,
     drain_started: Option<Instant>,
     transport_bound: usize,
+    retired_send: BTreeMap<PeerId, Amount>,
     #[cfg(feature = "fault-injection")]
     drop_next_data: bool,
     #[cfg(feature = "fault-injection")]
@@ -364,6 +356,7 @@ impl NatsRuntime {
             retry_at: now,
             drain_started: None,
             transport_bound,
+            retired_send: BTreeMap::new(),
             #[cfg(feature = "fault-injection")]
             drop_next_data: false,
             #[cfg(feature = "fault-injection")]
@@ -444,7 +437,7 @@ impl NatsRuntime {
                 _ => RuntimeError::Transport,
             }
         })?;
-        if client.max_payload() != TRANSPORT_PACKET_BYTES {
+        if client.max_payload() != BROKER_PAYLOAD_BYTES {
             return Err(RuntimeError::Config);
         }
         let (data, control, data_sender, control_sender) = if lane.is_some() {
@@ -502,15 +495,16 @@ impl NatsRuntime {
             .flatten()
             .map(|connection| connection.sources.len() + connection.retired.len())
             .sum::<usize>();
-        let outstanding = self.lane_outstanding(lane)?;
+        let outstanding = self.domain_obligation()?.bytes;
+        let send_flight = self.send_flight()?.bytes;
         let connection = self.lanes[lane].as_mut().ok_or(RuntimeError::Transport)?;
         if connection.sources.contains_key(&id) {
             return Ok(());
         }
         if connection.retired.contains_key(&id)
             || source_count >= self.limits.max_peers
-            || outstanding
-                > lane_credit_limit(connection.sources.len() + connection.retired.len() + 1)?
+            || outstanding > lane_credit_limit(source_count + 1)?
+            || send_flight > lane_credit_limit(source_count + 1)?
         {
             return Err(RuntimeError::Admission);
         }
@@ -589,39 +583,25 @@ impl NatsRuntime {
         }
         Ok(())
     }
+    #[cfg(feature = "fault-injection")]
     fn lane_outstanding(&self, lane: usize) -> Result<u64, RuntimeError> {
-        let mut total = 0u64;
-        if let Some(connection) = &self.lanes[lane] {
-            for source in connection.retired.values() {
-                total = total
-                    .checked_add(source.outstanding)
-                    .ok_or(RuntimeError::IdentityExhausted)?;
-            }
-        }
-        for (id, peer) in &self.peers {
-            if shard(*id, self.config.shards) == lane
-                && let Some(session) = &peer.session
-            {
-                total = total
-                    .checked_add(session.recipient_credit.outstanding())
-                    .ok_or(RuntimeError::IdentityExhausted)?;
-            }
-        }
-        Ok(total)
+        Ok(self.lane_obligation(lane)?.bytes)
     }
     fn ensure_peer(&mut self, id: PeerId) -> Result<(), RuntimeError> {
         if !self.allowed(id) {
             return Err(RuntimeError::Authorization);
         }
         if !self.peers.contains_key(&id) {
-            let retired_only = self
+            let retired: std::collections::BTreeSet<_> = self
                 .lanes
                 .iter()
                 .flatten()
                 .flat_map(|c| c.retired.keys())
-                .filter(|id| !self.peers.contains_key(id))
-                .count();
-            if self.peers.len() + retired_only >= self.limits.max_peers {
+                .chain(self.retired_send.keys())
+                .filter(|key| !self.peers.contains_key(key) && **key != id)
+                .copied()
+                .collect();
+            if self.peers.len() + retired.len() >= self.limits.max_peers {
                 return Err(RuntimeError::Admission);
             }
             self.peers.insert(id, Peer::new());
@@ -634,6 +614,7 @@ impl NatsRuntime {
             return Ok(());
         }
         let now = Instant::now();
+        self.peers.get_mut(&id).unwrap().hello_attempts = 0;
         self.peers.get_mut(&id).unwrap().outgoing = Some(Flight {
             message: Control {
                 kind: 1,
@@ -642,6 +623,7 @@ impl NatsRuntime {
                 hello: random()?,
                 token: 0,
                 watermark: 0,
+                ..Control::default()
             },
             due: now,
             expires: now + self.config.join_timeout,
@@ -702,9 +684,15 @@ impl NatsRuntime {
             .peers
             .get_mut(&id)
             .and_then(|p| p.session.as_mut())
-            .map_or(0, |s| {
-                let outstanding = s.recipient_credit.outstanding();
-                s.recipient_credit = credit::Recipient::default();
+            .map_or(Amount::default(), |s| {
+                let outstanding = s.recipient_credit.obligation();
+                let flight = s.sender_credit.outstanding();
+                if flight != Amount::default() {
+                    let old = self.retired_send.entry(id).or_default();
+                    *old = old.add(flight).expect("bounded send quarantine");
+                }
+                s.sender_credit = delivery::Sender::default();
+                s.recipient_credit = delivery::Recipient::default();
                 outstanding
             });
         for connection in self.lanes.iter_mut().flatten() {
@@ -721,14 +709,23 @@ impl NatsRuntime {
         }
     }
     pub fn terminate_peer(&mut self, id: PeerId) {
-        self.retire(id);
+        self.start_close(id);
         if let Some(p) = self.peers.get_mut(&id) {
             p.incoming = None;
             p.outgoing = None;
             p.candidate = None;
         }
         self.config.initiate.retain(|p| *p != id);
-        self.retire_source(id);
+        if self
+            .peers
+            .get(&id)
+            .and_then(|p| p.session.as_ref())
+            .is_none_or(|s| {
+                s.closing.is_none() && s.sender_credit.outstanding() == Amount::default()
+            })
+        {
+            self.retire_source(id);
+        }
     }
     fn retire(&mut self, id: PeerId) {
         if let Some(p) = self.peers.get_mut(&id)
@@ -737,6 +734,8 @@ impl NatsRuntime {
         {
             s.retiring = true;
             s.retired_at = Some(Instant::now());
+            s.ping = None;
+            s.next_ping = Instant::now();
             if s.proven {
                 self.active -= 1;
             }
@@ -786,6 +785,9 @@ impl NatsRuntime {
     /// Explicit per-peer protocol diagnostics; tokens are not authentication secrets.
     pub fn peer_status(&self, id: PeerId) -> Option<PeerStatus> {
         let s = self.peers.get(&id)?.session.as_ref()?;
+        let needed = self
+            .manager
+            .next_transport_weight(id, DATA_HEADER + MSG_FRAMING_BYTES);
         Some(PeerStatus {
             generation: s.generation,
             pair_token: s.token,
@@ -793,6 +795,16 @@ impl NatsRuntime {
             sent_frames: s.tx,
             received_frames: s.rx,
             handshake_nonce: s.hello,
+            delivery_epoch: s.sender_credit.epoch,
+            granted_bytes: s.sender_credit.allowed.bytes,
+            sent_bytes: s.sender_credit.sent.bytes,
+            applied_bytes: s.sender_credit.applied.bytes,
+            available_records: s.sender_credit.room().records,
+            sent_controls: s.control.sent,
+            received_controls: s.control.received,
+            waiting_delivery: needed
+                .is_some_and(|bytes| !s.sender_credit.room().contains(Amount::data(bytes))),
+            waiting_control: s.control.deadline.is_some(),
             ready: !s.retiring && s.proven && !self.manager.peer_failed(id),
         })
     }
@@ -809,6 +821,26 @@ impl NatsRuntime {
     /// Hosts must also await a complete successful turn before revoking transport.
     pub fn peer_streams_drained(&self, id: PeerId) -> bool {
         self.manager.peer_streams(id).is_none_or(|count| count == 0)
+            && self
+                .peers
+                .get(&id)
+                .and_then(|p| p.session.as_ref())
+                .is_none_or(|s| !s.retiring || s.sender_credit.outstanding() == Amount::default())
+            && self
+                .peers
+                .get(&id)
+                .and_then(|p| p.session.as_ref())
+                .is_none_or(|s| s.closing.is_none_or(|c| c.complete()))
+            && !self.retired_send.contains_key(&id)
+            && !self.lanes.iter().flatten().any(|c| {
+                c.retired.contains_key(&id)
+                    || (c.sources.contains_key(&id)
+                        && self
+                            .peers
+                            .get(&id)
+                            .and_then(|p| p.session.as_ref())
+                            .is_some_and(|s| s.retiring))
+            })
     }
     fn check_key(&self, key: RuntimeKey) -> Result<(), RuntimeError> {
         if key.epoch != self.epoch
@@ -877,6 +909,45 @@ impl NatsRuntime {
     pub fn snapshot(&self, key: RuntimeKey) -> Option<Snapshot> {
         self.check_key(key).ok()?;
         self.manager.snapshot(key.stream)
+    }
+    /// On-demand layered wait observation. Socket/batch wall time is reported
+    /// separately by Counters and opt-in TurnDiagnostics, without a stream scan.
+    pub fn stream_diagnostics(&self, key: RuntimeKey) -> Option<StreamDiagnostics> {
+        self.check_key(key).ok()?;
+        let application = self
+            .manager
+            .flow_observation(key.stream, self.now().ok()?)?;
+        let s = self.peers.get(&key.stream.peer)?.session.as_ref()?;
+        let needed = self
+            .manager
+            .stream_transport_weight(key.stream, DATA_HEADER + MSG_FRAMING_BYTES);
+        let waiting_delivery =
+            needed.is_some_and(|bytes| !s.sender_credit.room().contains(Amount::data(bytes)));
+        let free = self
+            .domain_limit()
+            .ok()?
+            .sub(self.send_flight().ok()?)
+            .ok()?;
+        let waiting_shared_flight = needed.is_some_and(|bytes| !free.contains(Amount::data(bytes)));
+        Some(StreamDiagnostics {
+            scheduler_eligible: application.queued_for_output
+                && needed.is_some()
+                && s.proven
+                && !s.retiring
+                && !waiting_delivery
+                && !waiting_shared_flight,
+            application,
+            waiting_delivery,
+            waiting_shared_flight,
+            waiting_control_ms: s.control.deadline.map(|deadline| {
+                u64::try_from(
+                    Instant::now()
+                        .saturating_duration_since(deadline - self.config.peer_timeout)
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX)
+            }),
+        })
     }
     /// Local configured limits; this does not change runtime or stream state.
     pub fn limits(&self) -> ManagerConfig {
@@ -1009,6 +1080,24 @@ impl NatsRuntime {
         message: Control,
         established: bool,
     ) -> Result<(), RuntimeError> {
+        let mut message = message;
+        if established {
+            let session = self
+                .peers
+                .get_mut(&id)
+                .and_then(|p| p.session.as_mut())
+                .ok_or(RuntimeError::PeerUnavailable)?;
+            message.ack = session.control.received;
+            if matches!(message.kind, 5 | 6) && !session.proven {
+                // Readiness carries a backed bootstrap. Opening a short stream
+                // after readiness never needs an extra delivery-credit RTT.
+                message.body_len = 16;
+                let promise = session.recipient_credit.obligation();
+                message.body[..8].copy_from_slice(&promise.bytes.min(4096).to_be_bytes());
+                message.body[8..16].copy_from_slice(&promise.records.min(2).to_be_bytes());
+            }
+            session.control.mark_receipt_sent();
+        }
         let (client, latch, subject) = if established {
             let s = self.peers[&id]
                 .session
@@ -1115,6 +1204,7 @@ impl NatsRuntime {
                             hello: c.hello,
                             token: s.token,
                             watermark: 0,
+                            ..Control::default()
                         },
                         due: now,
                         expires: now + self.config.join_timeout,
@@ -1142,6 +1232,7 @@ impl NatsRuntime {
                         hello: c.hello,
                         token: random()?,
                         watermark: 0,
+                        ..Control::default()
                     },
                     due: now,
                     expires: now + self.config.join_timeout,
@@ -1158,6 +1249,7 @@ impl NatsRuntime {
                         hello: c.hello,
                         token: c.token,
                         watermark: 0,
+                        ..Control::default()
                     };
                     f.due = now;
                 }
@@ -1193,6 +1285,7 @@ impl NatsRuntime {
                             hello: c.hello,
                             token: c.token,
                             watermark: 0,
+                            ..Control::default()
                         },
                         due: now,
                         expires: now + self.config.join_timeout,
@@ -1280,13 +1373,43 @@ impl NatsRuntime {
                 proof_deadline: Instant::now() + self.config.peer_timeout,
                 ping: None,
                 delivery: DeliveryFlight::default(),
-                sender_credit: credit::Sender::default(),
-                recipient_credit: credit::Recipient::default(),
+                sender_credit: delivery::Sender::default(),
+                recipient_credit: delivery::Recipient::default(),
+                control: delivery::ControlWindow::default(),
+                pending_control: None,
+                closing: None,
+                advertised: delivery::Limit::default(),
+                target: Amount {
+                    bytes: 4096,
+                    records: 2,
+                },
+                demand: 0,
+                announced_demand: 0,
+                remote_demand: 0,
+                growth_applied: 0,
+                growth_records: 0,
+                last_data: Instant::now(),
+                fence_sent: false,
+                frozen_sent: false,
+                fence_deadline: None,
                 pong: None,
                 retiring: false,
                 proven: false,
                 retired_at: None,
             });
+            let free = self.domain_limit()?.sub(self.domain_obligation()?)?;
+            let bootstrap = Amount {
+                bytes: free.bytes.min(4096),
+                records: free.records.min(2),
+            };
+            self.peers
+                .get_mut(&id)
+                .unwrap()
+                .session
+                .as_mut()
+                .unwrap()
+                .recipient_credit
+                .extend(bootstrap)?;
             self.counters.joins += 1;
             self.attempt = 0;
         }
@@ -1294,6 +1417,7 @@ impl NatsRuntime {
         p.candidate = None;
         p.outgoing = None;
         p.incoming = None;
+        p.join_failures = 0;
         if candidate.responder {
             self.send_control(
                 id,
@@ -1304,6 +1428,7 @@ impl NatsRuntime {
                     hello: candidate.hello,
                     token: candidate.token,
                     watermark: 0,
+                    ..Control::default()
                 },
                 false,
             )
@@ -1330,7 +1455,13 @@ impl NatsRuntime {
             (tail, "")
         };
         let id = PeerId(id.parse().ok()?);
-        if !self.allowed(id) {
+        let closing_source = lane.is_some()
+            && self
+                .peers
+                .get(&id)
+                .and_then(|p| p.session.as_ref())
+                .is_some_and(|s| s.closing.is_some());
+        if !(self.allowed(id) || closing_source) {
             return None;
         }
         if let Some(lane) = lane {
@@ -1338,7 +1469,9 @@ impl NatsRuntime {
                 return None;
             }
             let s = self.peers.get(&id)?.session.as_ref()?;
-            if s.retiring || generation != format!("{:032x}", s.generation) {
+            if (s.retiring && !control && s.closing.is_none())
+                || generation != format!("{:032x}", s.generation)
+            {
                 return None;
             }
         }
@@ -1367,20 +1500,62 @@ impl NatsRuntime {
             return Ok(());
         };
         if lane.is_none() {
-            if let Some(c) = Control::decode(&message.payload) {
+            if let Ok(c) = Control::decode(&message.payload) {
                 return self.handle_join(id, c);
+            }
+            if message.payload.starts_with(b"SKC") && message.payload.get(..4) != Some(b"SKC3") {
+                self.last_error = Some(RuntimeError::UnsupportedVersion);
+                if self.config.initiate.contains(&id) {
+                    self.manager.transport_lost();
+                    self.active = 0;
+                    self.lifecycle = Lifecycle::Failed;
+                }
             }
             self.counters.invalid_input += 1;
             return Ok(());
         }
         if control {
-            let Some(c) = Control::decode(&message.payload) else {
+            let Ok(c) = Control::decode(&message.payload) else {
                 self.counters.invalid_input += 1;
                 return Ok(());
             };
             let s = self.peers.get_mut(&id).unwrap().session.as_mut().unwrap();
             if c.sender != s.generation || c.recipient != self.epoch || c.token != s.token {
                 return Ok(());
+            }
+            if let Err(error) = s.control.acknowledge(c.ack) {
+                self.retire(id);
+                self.last_error = Some(error);
+                return Ok(());
+            }
+            if (12..=14).contains(&c.kind) {
+                let _ = s;
+                if let Err(error) = self.receive_close(id, c) {
+                    self.retire(id);
+                    self.last_error = Some(error);
+                    self.retired_send.entry(id).or_default();
+                }
+                return Ok(());
+            }
+            if s.retiring && c.kind != 6 {
+                return Ok(());
+            }
+            if matches!(c.kind, 5 | 6)
+                && c.body_len == 16
+                && s.sender_credit.allowed == Amount::default()
+                && s.sender_credit.epoch == 0
+            {
+                let allowed = Amount {
+                    bytes: u64::from_be_bytes(c.body[..8].try_into().unwrap()),
+                    records: u64::from_be_bytes(c.body[8..16].try_into().unwrap()),
+                };
+                if allowed.bytes > 4096 || allowed.records > 2 {
+                    return Err(RuntimeError::Protocol);
+                }
+                s.sender_credit.grant(delivery::Limit {
+                    allowed,
+                    ..delivery::Limit::default()
+                })?;
             }
             match c.kind {
                 5 if c.hello != 0 => {
@@ -1394,10 +1569,15 @@ impl NatsRuntime {
                         return Ok(());
                     }
                     if s.acknowledge_receipt(&c, self.epoch)? {
-                        if !s.proven {
+                        s.sender_credit.apply_receipt(Amount {
+                            bytes: s.delivery.acknowledged,
+                            records: s.delivery.sequence,
+                        })?;
+                        if !s.proven && !s.retiring {
                             s.proven = true;
                             self.active += 1;
                             self.manager.set_peer_output_enabled(id, true)?;
+                            self.retired_send.remove(&id);
                         }
                         s.next_ping = if s.delivery.sent - s.delivery.acknowledged
                             >= DATA_DELIVERY_BYTES / 2
@@ -1408,20 +1588,11 @@ impl NatsRuntime {
                         };
                     }
                 }
-                7..=10 => {
-                    let result = match c.kind {
-                        7 => s.recipient_credit.request(
-                            c.hello,
-                            c.watermark,
-                            DATA_DELIVERY_BYTES,
-                            Instant::now(),
-                            self.config.peer_timeout,
-                        ),
-                        8 => s.sender_credit.grant(c.hello, c.watermark),
-                        9 => s.recipient_credit.returned(c.hello, c.watermark),
-                        _ => s.sender_credit.acknowledge(c.hello, c.watermark),
-                    };
-                    if let Err(error) = result {
+                7..=12 => {
+                    // Control can overtake DATA. Apply prefix-dependent commands
+                    // only after the matching ordered publication prefix.
+                    let _ = s;
+                    if let Err(error) = self.apply_control(id, c) {
                         self.retire(id);
                         self.last_error = Some(error);
                     }
@@ -1430,19 +1601,24 @@ impl NatsRuntime {
             }
             return Ok(());
         }
-        if message.payload.len() < 24 {
-            self.retire(id);
-            self.last_error = Some(RuntimeError::Protocol);
-            return Ok(());
-        }
-        let token = u128::from_be_bytes(message.payload[..16].try_into().unwrap());
-        let seq = u64::from_be_bytes(message.payload[16..24].try_into().unwrap());
+        let (header, body) = match DataHeader::decode(&message.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                self.retire(id);
+                self.last_error = Some(error);
+                return Ok(());
+            }
+        };
+        let seq = header.sequence;
         let s = self.peers.get_mut(&id).unwrap().session.as_mut().unwrap();
-        if token != s.token {
+        if header.token != s.token {
             return Ok(());
         }
-        let weight = (message.payload.len() + MSG_FRAMING_BYTES) as u64;
-        if !s.recipient_credit.admits(weight) {
+        let weight = Amount::data(message.payload.len() + MSG_FRAMING_BYTES);
+        if header.epoch != s.recipient_credit.epoch
+            || !s.recipient_credit.obligation().contains(weight)
+            || s.control.acknowledge(header.control_ack).is_err()
+        {
             self.retire(id);
             self.last_error = Some(RuntimeError::Protocol);
             return Ok(());
@@ -1463,7 +1639,7 @@ impl NatsRuntime {
             self.last_error = Some(RuntimeError::Protocol);
             return Ok(());
         }
-        let packet = match wire::decode(&message.payload[24..]) {
+        let packet = match wire::decode(body) {
             Ok(p) => p,
             Err(_) => {
                 self.retire(id);
@@ -1471,14 +1647,17 @@ impl NatsRuntime {
                 return Ok(());
             }
         };
-        if let Err(error) = self.manager.receive(
-            StreamKey {
-                peer: id,
-                stream_id: packet.stream_id,
-            },
-            &packet.frame,
-            self.now()?,
-        ) {
+        let closing = self.peers[&id].session.as_ref().unwrap().closing.is_some();
+        if !closing
+            && let Err(error) = self.manager.receive(
+                StreamKey {
+                    peer: id,
+                    stream_id: packet.stream_id,
+                },
+                &packet.frame,
+                self.now()?,
+            )
+        {
             eprintln!(
                 "Peer stream receive failure: peer={} stream={} sequence={} error={error:?}",
                 id.0, packet.stream_id, seq
@@ -1489,7 +1668,23 @@ impl NatsRuntime {
         }
         let session = self.peers.get_mut(&id).unwrap().session.as_mut().unwrap();
         session.recipient_credit.apply(weight)?;
+        if matches!(
+            packet.frame,
+            crate::Frame::Open { .. } | crate::Frame::Accept { .. } | crate::Frame::Data { .. }
+        ) {
+            session.remote_demand = session.remote_demand.max(256 * 1024);
+            session.target.bytes = session.target.bytes.max(256 * 1024);
+            session.target.records = session.target.records.max(32);
+        }
         session.rx = seq;
+        session.last_data = Instant::now();
+        if !closing
+            && let Some(command) = session.pending_control.take()
+            && let Err(error) = self.apply_control(id, command)
+        {
+            self.retire(id);
+            self.last_error = Some(error);
+        }
         self.sync_manager_failures();
         Ok(())
     }
@@ -1507,19 +1702,22 @@ impl NatsRuntime {
             {
                 let demand = self.manager.transport_demand(
                     id,
-                    24 + MSG_FRAMING_BYTES,
+                    DATA_HEADER + MSG_FRAMING_BYTES,
                     DATA_DELIVERY_BYTES as usize,
                 );
-                if session.sender_credit.request(
-                    demand as u64,
-                    Instant::now(),
-                    self.config.peer_timeout,
-                )? {
-                    count += 1;
+                if demand != 0 {
+                    session.demand = session.demand.max(demand as u64).max(256 * 1024);
                 }
             }
         }
-        for _ in 0..self.config.max_outgoing_per_turn {
+        let mut output_bytes = 0usize;
+        for _ in 0..self.config.max_outgoing_per_turn.min(32) {
+            if output_bytes >= 256 * 1024
+                || (count != 0 && started.elapsed() >= Duration::from_millis(1))
+            {
+                break;
+            }
+            let free = self.domain_limit()?.sub(self.send_flight()?)?;
             let peers = &mut self.peers;
             let frame = self
                 .manager
@@ -1528,8 +1726,10 @@ impl NatsRuntime {
                         .get(&key.peer)
                         .and_then(|p| p.session.as_ref())
                         .is_some_and(|s| {
-                            s.sender_credit
-                                .admits((size + 24 + MSG_FRAMING_BYTES) as u64)
+                            let weight = Amount::data(size + DATA_HEADER + MSG_FRAMING_BYTES);
+                            !s.retiring
+                                && free.contains(weight)
+                                && s.sender_credit.room().contains(weight)
                         })
                 })
                 .pop();
@@ -1568,8 +1768,14 @@ impl NatsRuntime {
             }
             let size = wire::encoded_size(frame.key.stream_id, &frame.frame)
                 .map_err(|_| RuntimeError::Protocol)?;
-            let weight = (size + 24 + MSG_FRAMING_BYTES) as u64;
-            s.sender_credit.consume(weight)?;
+            output_bytes += size;
+            let weight = (size + DATA_HEADER + MSG_FRAMING_BYTES) as u64;
+            let amount = Amount {
+                bytes: weight,
+                records: 1,
+            };
+            s.sender_credit.reserve(amount)?;
+            s.sender_credit.commit(amount)?;
             s.delivery.sent = s
                 .delivery
                 .sent
@@ -1578,9 +1784,15 @@ impl NatsRuntime {
             if s.delivery.sent - s.delivery.acknowledged >= DATA_DELIVERY_BYTES / 2 {
                 s.next_ping = Instant::now();
             }
-            let mut bytes = Vec::with_capacity(24 + size);
-            bytes.extend_from_slice(&s.token.to_be_bytes());
-            bytes.extend_from_slice(&s.tx.to_be_bytes());
+            let mut bytes = Vec::with_capacity(DATA_HEADER + size);
+            DataHeader {
+                token: s.token,
+                sequence: s.tx,
+                control_ack: s.control.received,
+                epoch: s.sender_credit.epoch,
+            }
+            .encode(size, &mut bytes)?;
+            s.control.mark_receipt_sent();
             wire::encode_into(&mut bytes, frame.key.stream_id, &frame.frame)
                 .map_err(|_| RuntimeError::Protocol)?;
             let subject = format!(
@@ -1601,19 +1813,6 @@ impl NatsRuntime {
         }
         // Every extracted frame stays guarded until all touched socket flushes
         // complete; cancellation conservatively fails every touched shard.
-        for (&id, peer) in &mut self.peers {
-            if let Some(session) = &mut peer.session
-                && !session.retiring
-                && let Some(granted) = session.sender_credit.granted
-            {
-                let needed = self
-                    .manager
-                    .next_transport_weight(id, 24 + MSG_FRAMING_BYTES);
-                if needed.is_none_or(|n| granted - session.sender_credit.used < n as u64) {
-                    session.sender_credit.seal();
-                }
-            }
-        }
         count += self.credit_work().await?;
         for c in self
             .lanes
@@ -1683,7 +1882,6 @@ impl NatsRuntime {
     #[cfg(feature = "fault-injection")]
     #[doc(hidden)]
     pub fn inspect_recipient_credit(&self, lane: usize) -> (u64, u64, usize) {
-        let connection = self.lanes[lane].as_ref().unwrap();
         let sources = self
             .peers
             .iter()
@@ -1692,12 +1890,12 @@ impl NatsRuntime {
                     && peer
                         .session
                         .as_ref()
-                        .is_some_and(|s| s.recipient_credit.outstanding() > 0)
+                        .is_some_and(|s| s.recipient_credit.obligation().bytes > 0)
             })
             .count();
         (
             self.lane_outstanding(lane).unwrap(),
-            lane_credit_limit(connection.sources.len() + connection.retired.len()).unwrap(),
+            self.domain_limit().unwrap().bytes,
             sources,
         )
     }
@@ -1711,9 +1909,9 @@ impl NatsRuntime {
                 self.peers
                     .get(&id)
                     .and_then(|p| p.session.as_ref())
-                    .map_or(0, |s| s.recipient_credit.outstanding())
+                    .map_or(0, |s| s.recipient_credit.obligation().bytes)
             },
-            |s| s.outstanding,
+            |s| s.outstanding.bytes,
         );
         (connection.data.queued(), outstanding, retired.is_some())
     }
@@ -1764,128 +1962,6 @@ impl NatsRuntime {
             self.config.max_outgoing_per_turn,
         )
     }
-    async fn credit_work(&mut self) -> Result<usize, RuntimeError> {
-        let mut ids: Vec<_> = self.peers.keys().copied().collect();
-        if let Some(cursor) = self.credit_cursor {
-            let index = ids.partition_point(|id| *id <= cursor);
-            ids.rotate_left(index);
-        }
-        for &id in &ids {
-            let Some(s) = self.peers[&id].session.as_ref().filter(|s| !s.retiring) else {
-                continue;
-            };
-            if s.recipient_credit.deadline.is_some() && s.recipient_credit.granted.is_none() {
-                let lane = shard(id, self.config.shards);
-                let connection = self.lanes[lane].as_ref().ok_or(RuntimeError::Transport)?;
-                let limit = lane_credit_limit(connection.sources.len() + connection.retired.len())?;
-                let free = limit
-                    .checked_sub(self.lane_outstanding(lane)?)
-                    .ok_or(RuntimeError::Protocol)?;
-                let demand = s.recipient_credit.demand;
-                if free >= demand.min(ENVELOPE_WEIGHT) {
-                    self.peers
-                        .get_mut(&id)
-                        .unwrap()
-                        .session
-                        .as_mut()
-                        .unwrap()
-                        .recipient_credit
-                        .reserve(free.min(demand))?;
-                    self.credit_cursor = Some(id);
-                }
-            }
-        }
-        let mut count = 0;
-        for id in peer_batch(
-            &self.peers,
-            &mut self.credit_visit_cursor,
-            self.config.max_outgoing_per_turn,
-        ) {
-            let Some(session) = self.peers[&id].session.as_ref().filter(|s| !s.retiring) else {
-                continue;
-            };
-            let now = Instant::now();
-            if session.sender_credit.deadline.is_some_and(|n| now >= n)
-                || session.recipient_credit.deadline.is_some_and(|n| now >= n)
-            {
-                self.retire(id);
-                self.counters.peer_timeouts += 1;
-                continue;
-            }
-            let tx = &session.sender_credit;
-            let send = if tx.deadline.is_some() && !tx.published && tx.granted.is_none() {
-                Some((7, tx.round, tx.demand))
-            } else if tx.sealed && !tx.published {
-                Some((9, tx.round, tx.used))
-            } else {
-                None
-            };
-            if let Some((kind, hello, watermark)) = send {
-                let s = self.peers[&id].session.as_ref().unwrap();
-                self.send_control(
-                    id,
-                    Control {
-                        kind,
-                        sender: self.epoch,
-                        recipient: s.generation,
-                        hello,
-                        token: s.token,
-                        watermark,
-                    },
-                    true,
-                )
-                .await?;
-                self.peers
-                    .get_mut(&id)
-                    .unwrap()
-                    .session
-                    .as_mut()
-                    .unwrap()
-                    .sender_credit
-                    .published = true;
-                count += 1;
-            }
-            let s = self.peers[&id].session.as_ref().unwrap();
-            let rx = &s.recipient_credit;
-            let send = if rx.complete() {
-                Some((10, rx.round, rx.applied))
-            } else {
-                rx.granted
-                    .filter(|_| !rx.published)
-                    .map(|bytes| (8, rx.round, bytes))
-            };
-            if let Some((kind, hello, watermark)) = send {
-                self.send_control(
-                    id,
-                    Control {
-                        kind,
-                        sender: self.epoch,
-                        recipient: s.generation,
-                        hello,
-                        token: s.token,
-                        watermark,
-                    },
-                    true,
-                )
-                .await?;
-                let rx = &mut self
-                    .peers
-                    .get_mut(&id)
-                    .unwrap()
-                    .session
-                    .as_mut()
-                    .unwrap()
-                    .recipient_credit;
-                if kind == 10 {
-                    rx.acknowledge();
-                } else {
-                    rx.published = true;
-                }
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
     async fn control_work(&mut self) -> Result<usize, RuntimeError> {
         let now = Instant::now();
         let mut count = 0;
@@ -1902,6 +1978,7 @@ impl NatsRuntime {
                 self.last_error = Some(RuntimeError::TerminalDrainTimeout);
             }
             self.promote(id).await?;
+            count += self.close_work(id).await?;
             for incoming in [false, true] {
                 let flight = if incoming {
                     self.peers[&id].incoming
@@ -1915,6 +1992,7 @@ impl NatsRuntime {
                             p.incoming = None;
                         } else {
                             p.outgoing = None;
+                            p.join_failures = p.join_failures.saturating_add(1);
                         }
                     } else if f.due <= now {
                         if !incoming && f.message.kind == 3 {
@@ -1925,13 +2003,23 @@ impl NatsRuntime {
                         }
                         self.send_control(id, f.message, false).await?;
                         let p = self.peers.get_mut(&id).unwrap();
-                        let f = if incoming {
+                        let due = if !incoming && f.message.kind == 1 {
+                            p.hello_attempts += 1;
+                            if p.hello_attempts < 3 {
+                                now + self.config.retry_initial.max(Duration::from_millis(250))
+                            } else {
+                                f.expires
+                            }
+                        } else {
+                            f.expires
+                        };
+                        let pending = if incoming {
                             p.incoming.as_mut()
                         } else {
                             p.outgoing.as_mut()
                         };
-                        if let Some(f) = f {
-                            f.due = now + self.config.retry_initial;
+                        if let Some(pending) = pending {
+                            pending.due = due;
                         }
                         count += 1;
                     }
@@ -1973,6 +2061,7 @@ impl NatsRuntime {
                         hello: nonce,
                         token: s.token,
                         watermark,
+                        ..Control::default()
                     },
                     true,
                 )
@@ -1987,7 +2076,12 @@ impl NatsRuntime {
                 count += 1;
             }
             let ping = self.peers[&id].session.as_ref().is_some_and(|s| {
-                !s.retiring && s.can_ping && s.ping.is_none() && s.next_ping <= now
+                s.closing.is_none()
+                    && s.can_ping
+                    && s.ping.is_none()
+                    && s.next_ping <= now
+                    && (!s.retiring
+                        || (s.proven && s.sender_credit.outstanding() != Amount::default()))
             });
             if ping {
                 let nonce = random()?;
@@ -2002,6 +2096,7 @@ impl NatsRuntime {
                         hello: nonce,
                         token: s.token,
                         watermark,
+                        ..Control::default()
                     },
                     true,
                 )
@@ -2020,8 +2115,13 @@ impl NatsRuntime {
                 ));
                 count += 1;
             }
-            let remove = self.peers[&id].session.as_ref().is_none_or(|s| s.retiring)
-                && self.manager.peer_streams(id).is_none_or(|n| n == 0)
+            let remove = self.peers[&id].session.as_ref().is_none_or(|s| {
+                s.retiring
+                    && s.closing.is_none_or(|c| c.complete())
+                    && (s.sender_credit.outstanding() == Amount::default()
+                        || s.retired_at
+                            .is_some_and(|t| t.elapsed() >= self.config.terminal_drain_timeout))
+            }) && self.manager.peer_streams(id).is_none_or(|n| n == 0)
                 && self.peers[&id].incoming.is_none()
                 && self.peers[&id].outgoing.is_none()
                 && self.peers[&id].candidate.is_none();
@@ -2030,9 +2130,18 @@ impl NatsRuntime {
                     self.manager.remove_peer(id)?;
                 }
                 self.retire_source(id);
+                let failures = self.peers[&id].join_failures;
                 self.peers.remove(&id);
                 if self.config.initiate.contains(&id) {
-                    self.join_peer(id)?;
+                    if failures < self.config.max_retries {
+                        self.join_peer(id)?;
+                        self.peers.get_mut(&id).unwrap().join_failures = failures;
+                    } else {
+                        self.last_error = Some(RuntimeError::RetryExhausted);
+                        if self.active == 0 && self.config.initiate.len() == 1 {
+                            self.lifecycle = Lifecycle::Failed;
+                        }
+                    }
                 }
             }
         }
@@ -2060,6 +2169,10 @@ impl NatsRuntime {
         self.attempt += 1;
         self.counters.retries += 1;
         self.epoch = random()?;
+        let ids: Vec<_> = self.peers.keys().copied().collect();
+        for id in ids {
+            self.retire_source(id);
+        }
         self.peers.clear();
         self.manager = Manager::new(self.limits)?;
         self.started = Instant::now();
@@ -2192,7 +2305,16 @@ impl NatsRuntime {
             if measured {
                 self.diagnostics.idle_count = self.diagnostics.idle_count.saturating_add(1);
             }
-            let timeout = wait
+            let control_wait = if self.peers.values().any(|p| {
+                p.session
+                    .as_ref()
+                    .is_some_and(|s| s.control.receipt_dirty())
+            }) {
+                Duration::from_millis(2)
+            } else {
+                wait
+            };
+            let timeout = control_wait
                 .min(self.config.heartbeat_interval)
                 .min(self.config.retry_initial);
             if let Ok(incoming) = tokio::time::timeout(
@@ -2423,8 +2545,25 @@ mod tests {
                 acknowledged: 0,
                 sequence: 0,
             },
-            sender_credit: credit::Sender::default(),
-            recipient_credit: credit::Recipient::default(),
+            sender_credit: delivery::Sender::default(),
+            recipient_credit: delivery::Recipient::default(),
+            control: delivery::ControlWindow::default(),
+            pending_control: None,
+            closing: None,
+            advertised: delivery::Limit::default(),
+            target: Amount {
+                bytes: 4096,
+                records: 2,
+            },
+            demand: 0,
+            announced_demand: 0,
+            remote_demand: 0,
+            growth_applied: 0,
+            growth_records: 0,
+            last_data: now,
+            fence_sent: false,
+            frozen_sent: false,
+            fence_deadline: None,
             pong: None,
             retiring: false,
             proven: true,
@@ -2437,6 +2576,7 @@ mod tests {
             hello: 40,
             token: 20,
             watermark: 7,
+            ..Control::default()
         };
         for invalid in [
             Control {
@@ -2490,37 +2630,45 @@ mod tests {
     }
     #[test]
     fn recipient_flight_counts_all_sources_and_preserves_the_current_profile() {
-        assert_eq!(lane_credit_limit(128).unwrap(), 3 << 20);
-        let now = Instant::now();
-        let mut first = credit::Recipient::default();
-        let mut second = credit::Recipient::default();
-        let limit = lane_credit_limit(2).unwrap();
+        let limit = lane_credit_limit(128).unwrap();
+        assert!(limit < DATA_DELIVERY_BYTES);
+        assert!(limit + 128 * SOURCE_CONTROL_BYTES + ENVELOPE_WEIGHT <= BROKER_PENDING_BYTES);
+        let mut first = delivery::Recipient::default();
+        let mut second = delivery::Recipient::default();
         first
-            .request(1, limit, limit, now, Duration::from_secs(10))
+            .extend(Amount {
+                bytes: limit - 1024,
+                records: 100,
+            })
             .unwrap();
         second
-            .request(1, limit, limit, now, Duration::from_secs(10))
+            .extend(Amount {
+                bytes: 1024,
+                records: 1,
+            })
             .unwrap();
-        first.reserve(limit - 1024).unwrap();
-        second.reserve(limit - first.outstanding()).unwrap();
-        assert_eq!(first.outstanding() + second.outstanding(), limit);
-        first.returned(1, 512).unwrap();
-        assert!(!first.complete());
-        assert_eq!(first.outstanding() + second.outstanding(), limit);
-        first.apply(512).unwrap();
-        assert!(first.complete());
-        first.acknowledge();
-        assert_eq!(second.outstanding(), 1024);
+        assert_eq!(first.obligation().bytes + second.obligation().bytes, limit);
+        first.freeze().unwrap();
+        first
+            .observe_frozen(
+                1,
+                Amount {
+                    bytes: 512,
+                    records: 1,
+                },
+            )
+            .unwrap();
+        assert!(first.reclaim().unwrap().is_none());
+        first
+            .apply(Amount {
+                bytes: 512,
+                records: 1,
+            })
+            .unwrap();
+        first.reclaim().unwrap().unwrap();
+        assert_eq!(second.obligation().bytes, 1024);
         assert!(lane_credit_limit(usize::MAX).is_err());
-        assert!(
-            std::mem::size_of::<credit::Sender>()
-                + std::mem::size_of::<credit::Recipient>()
-                + std::mem::size_of::<DeliveryFlight>()
-                + std::mem::size_of::<RetiredSource>()
-                + std::mem::size_of::<Option<(u128, u64, Instant, u64)>>()
-                + 64
-                <= crate::TRANSPORT_DELIVERY_STATE_BYTES
-        );
+        assert!(std::mem::size_of::<Peer>() + std::mem::size_of::<RetiredSource>() <= 2048);
     }
     #[test]
     fn control_and_credit_visitation_reach_every_peer_with_independent_cursors() {
@@ -2553,21 +2701,22 @@ mod tests {
             hello: 4,
             token: 5,
             watermark: 6,
+            ..Control::default()
         };
         let mut b = c.encode();
         assert_eq!(b.len(), CONTROL_BYTES);
         assert_eq!(Control::decode(&b).unwrap().watermark, 6);
         b.push(0);
-        assert!(Control::decode(&b).is_none());
+        assert!(Control::decode(&b).is_err());
         b.pop();
-        b[4] = 11;
-        assert!(Control::decode(&b).is_none());
+        b[4] = 15;
+        assert!(Control::decode(&b).is_err());
         b[4] = 1;
         b[..4].copy_from_slice(b"SKC1");
-        assert!(Control::decode(&b).is_none());
+        assert!(Control::decode(&b).is_err());
         b[..4].copy_from_slice(b"SKC2");
         b[0] = 0;
-        assert!(Control::decode(&b).is_none());
+        assert!(Control::decode(&b).is_err());
     }
     #[test]
     fn cancelled_batch_fails_every_touched_shard_and_overflow_cannot_hide_loss() {

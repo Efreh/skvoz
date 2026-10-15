@@ -1,11 +1,12 @@
 # Динамический NATS runtime
 
 `skvoz_core::runtime::NatsRuntime` — опциональный runtime одной универсальной
-Core library 4.1.0. Он добавляет authenticated join, смену peer session, проверку
+Core library 5.0.0. Он добавляет authenticated join, смену peer session, проверку
 живости и восстановление транспорта для новых byte streams. Включается feature
 `nats`; HTTP/SOCKS parsing, DNS, сокеты, GUI и выдача credentials принадлежат host.
-Статический [NatsNode](../core/src/nats.rs) используется простым TCP relay
-и статическими сценариями стенда. У него нет автоматического join/recovery.
+Статический [NatsNode](../core/src/nats.rs) остаётся low-level adapter для
+статических транспортных сценариев стенда, без automatic join/recovery.
+Минимальный TCP relay использует тот же NatsRuntime/protocol3, что и приложения.
 
 ## Подключение из приложения
 
@@ -74,8 +75,7 @@ Debug конфигурации и typed errors не раскрывают endpoin
 по виртуальным хостам. Без параметра сохраняется проверка имени из URL.
 [Профили демона](daemon-ipc.md) предоставляют то же необязательное поле.
 
-NATS должен объявлять `max_payload: 65588`: максимальный wire v2 packet 65564
-bytes плюс runtime envelope 24 bytes. Runtime отвергает и меньший, и больший
+NATS должен объявлять `max_payload: 65588` для совместного bounded provisioning. Core ограничивает собственный envelope16460bytes независимо от этой величины. Runtime отвергает и меньший, и больший
 лимит, чтобы count-bounded inbound queues имели конечную границу payload bytes.
 При общем брокере этот профиль необходимо согласовать с другими приложениями.
 
@@ -188,12 +188,7 @@ session; runtime не заменяет credential revocation.
 
 ## Присоединение, замена и готовность
 
-Control v2 — ровно 77 bytes: `SKC2`, kind u8, sender generation u128, recipient
-generation u128, nonce/round u128, pair token/challenge u128, watermark u64;
-числа big-endian. Kinds1…6 задают JOIN и PING/PONG; kinds7…10 — REQUEST, GRANT,
-RETURN и RETURN_ACK общей ёмкости доставки. `SKC1` не поддерживается. Это
-отдельный transport envelope; stream wire v2 и его
-[fixtures](../core/tests/fixtures/README.md) сохраняются.
+Control v3 — ровно200bytes: `SKC3`, kind, reserved zero и binding sender/recipient generations, hello nonce, pair token. Затем watermark, command serial, applied-control receipt, ledger epoch, record boundary и applied byte/record prefix. Последние72bytes содержат length, reserved и bounded semantic control. DATA — `SKD3` header48 и прежний проверяемый semantic stream frame wire2. Старые outer envelopes не поддерживаются. Точные поля и векторы — [runtime protocol](runtime-protocol.md).
 
 Node generation, initiator nonce и responder challenge генерируются OS randomness.
 HELLO инициирует CHALLENGE; CONFIRM связывает обе generations и оба challenges;
@@ -220,8 +215,7 @@ broker PONG и не доказательство установленной subs
 peer остаётся неготовым до собственного matching nonce PONG на новой lane.
 PING/PONG на установленной lane публикуются однократно; отсутствие ответа
 завершает peer в пределах исходного deadline. `peer_ready` и `open` требуют
-этого доказательства. JOIN flights имеют собственные ограниченные retries на
-отдельном соединении.
+этого доказательства. Initial HELLO допускает до3 публикаций с интервалом не менее250ms, поскольку remote interest может ещё не существовать. Остальные phases публикуются один раз на отдельном соединении; отсутствие ответа завершает phase по абсолютному deadline. Новая попытка создаёт новый nonce. Начальное обеспеченное delivery permission передаётся с lane readiness, без дополнительной credit-транзакции перед первым OPEN.
 
 Доказательство готовности локально: одна сторона может уже видеть ready,
 пока другая ещё ждёт своего PONG. Полученный authenticated OPEN и действующий
@@ -256,17 +250,14 @@ sequenceDiagram
     A->>N: Соответствующий PONG после обработки входа
     N->>B: Соответствующий PONG lane
     Note over A,B: Готовность peer требует собственного подтверждения lane
-    A->>N: REQUEST: уже готовые байты для отправки
-    N->>B: REQUEST
-    B->>N: GRANT: разрешённые байты общей lane
-    N->>A: GRANT
-    A->>N: OPEN / DATA в пределах разрешения
-    N->>B: OPEN / DATA
-    A->>N: RETURN: завершить выдачу, сообщить использованные байты
-    N->>B: RETURN
-    B->>B: Применить весь указанный префикс DATA
-    B->>N: RETURN_ACK: остаток освобождён
-    N->>A: RETURN_ACK
+    Note over A,B: Готовность включает обеспеченный начальный лимит
+    A->>N: OPEN / DATA в пределах текущего лимита
+    N->>B: Упорядоченные envelopes
+    B->>B: Применить в обеспеченный application stage
+    B-->>A: CREDIT: абсолютные G и applied A
+    A->>N: Следующие DATA без завершения предыдущей выдачи
+    Note over A,B: Временная пауза не отзывает окно
+
 ```
 
 Host обязан регулярно вызывать `turn` и `poll_events`. Если terminal events не
@@ -310,123 +301,35 @@ Transport/Protocol и безопасные Manager errors.
 
 ## Очереди, изоляция и состояние
 
-Одна join connection и до `shards` lazy lane connections. На каждой lane есть
-две общие ограниченные очереди: DATA и CONTROL. Для каждого допущенного peer
-runtime регистрирует два отдельных subscription SID с точным sender PeerId;
-они направляют сообщения в эти общие очереди. Дополнительные очереди, соединения
-или задачи на peer/stream не создаются. Такой subject позволяет NATS leaf
-передавать subscription interest при публикационных правах, ограниченных
-собственным sender PeerId ноды. Регистрация и flush завершаются до готовности
-session. При удалении peer runtime снимает обе source subscriptions, ждёт
-отдельный broker PING/PONG barrier и обрабатывает зафиксированный префикс общей
-DATA queue. Только затем освобождаются неизвестные остатки разрешений и source
-slot. Обычный `Client.flush()` остаётся локальным socket flush и не заменяет
-этот barrier. Во время ожидания runtime продолжает обрабатывать входящие
-сообщения; ошибка или deadline barrier завершает соответствующую lane.
+Права доставки непрерывны и абсолютны. Для направления peer сохраняются granted boundary G, committed S, локальный pending P и actually applied A; `A<=S`, `S+P<=G`. Стоимость — размер envelope+1024bytes и одна запись. Receiver проверяет оба измерения. Его обязательство `G-A` входит в общий input pool всех lanes, включая карантин retiring sources. Sender отдельно ограничивает общий `S-A` всех получателей; это защищает общий native leaf при download. При receipt проверяется точная граница ранее committed envelope.
 
-Default shards8, допустимо1..32. Клиент к server PeerId0 использует только
-shard0, сервер — не больше восьми lanes данного профиля. CONTROL имеет
-собственную queue, join — отдельный входной budget. Incoming shards вращаются
-после каждого message. Активные, снимаемые и ожидающие обработки старой очереди
-source slots в сумме ограничены `max_peers`.
+После применения DATA payload переходит в отдельный обеспеченный Manager/application stage. ACK доставки не освобождает непрочитанный payload. `consume_through` вызывается только после фактического освобождения bytes коннектором. Network сохраняет единый byte-stream API для TCP proxy и framed IP records; Core IP-пакеты не разбирает.
 
-SlowConsumer/ошибка lane завершает peers этой shard. Другие shards сохраняют
-прогресс; isolation внутри одной shard не обещается. Контрольный flood,
-credential-authorized unlimited publish или broker-global saturation требуют
-операционных rate/account limits. Broker `max_pending`/`write_deadline` ограничивают
-его очереди. Повышение queue capacity не заменяет loss detection и admission.
+Bootstrap составляет до4КиБ/2envelopes при доступном backing. Известный активный спрос запрашивает target256КиБ/32records. Target растёт при реальном применении; выдача ограничена свободным shared backing. Snapshot обновляет разрешение заранее, обычно после освобождения четверти target. Неиспользованный grant остаётся за peer во время короткой паузы. Старые REQUEST/RETURN rounds отсутствуют.
 
-Перед извлечением frames из Manager runtime получает разрешение получателя на
-доставку отдельно от credit фактического потребления. Все sources одной
-recipient lane делят общий flight не более 3 МиБ с учётом envelope и
-консервативного NATS framing. Внутри broker `max_pending: 4194304` дополнительно
-резервируются3558 bytes на каждый допущенный или снимаемый source
-(`6 × (77 + 516)`, шесть control records) и один максимальный envelope. Если этот резерв требует
-больше места, доступный общий flight уменьшается до выдачи новых разрешений.
-Добавление source не сокращает уже выданные разрешения; при нехватке backing
-admission отклоняется. Меньший broker limit требует согласованного transport
-contract.
+При конкурирующем спросе и дефиците разрешение редкого idle victim отзывается FENCE. Sender останавливает новые резервации, завершает уже reserved prefix и отвечает FROZEN. Receiver не освобождает остаток, пока ordered DATA не достигнет exact prefix. Затем начинается следующий epoch; timer не переиспользует неизвестный flight. Истечение самостоятельного control/fence deadline завершает peer.
 
-REQUEST сообщает объём уже готовых frames; получатель выдаёт конечный GRANT
-из свободной общей ёмкости. Активный sender может использовать доступную
-ёмкость, idle peers не резервируют долю для будущих данных. Запросы обслуживаются
-с вращением; постоянного деления на максимальное число peers нет. Все Core
-frames на DATA subject, включая управляющие, расходуют выданные framed bytes.
-Без достаточного разрешения frame остаётся в Manager.
+Один sequenced control snapshot на направление peer ограничивает служебный flight. CREDIT может включать bounded semantic peer credit, stream window update или RESET. RESET несёт source DATA watermark; получатель ждёт его перед применением, в одном pending slot. OPEN/ACCEPT/FIN сохраняют порядок DATA. Receipt находится в следующем DATA/control либо отдельном unsequenced RECEIPT, который не требует ответного receipt. Неподтверждённый command имеет абсолютный peer timeout; heartbeat его не продлевает.
 
-В каждой паре и направлении действует не более одной выдачи. Перед RETURN
-sender закрывает её для дальнейшей отправки и сообщает использованный объём.
-Поздний или повторный GRANT не открывает закрытую выдачу. Получатель возвращает
-использованную ёмкость по мере применения входящих frames, а неиспользованный
-остаток — только после обработки всего указанного в RETURN префикса. CONTROL
-может прийти раньше DATA, поэтому получение RETURN само по себе недостаточно.
-Следующая выдача начинается после соответствующего RETURN_ACK. Epoch, token,
-round и счётчики проверяются; переполнение и невозможные переходы отклоняются.
+Broker pending остаётся4МиБ. Для configured max peers N заранее резервируется `N*12*(200+1024)` на служебные сообщения и один maximum DATA16460+1024. Общий обычный delivery budget — минимум остатка и3МиБ, record budget2048. Runtime допускает до128 configured peers. Reserve закладывает будущие admitted/retiring slots до выдачи permissions; каждый shard не получает собственные независимые3МиБ. Поддерживается один полный сервер и native leaf/intermediate путь без постороннего payload publisher/fanout в APP account; произвольная multi-server topology требует отдельного domain allocator.
 
-REQUEST/GRANT/RETURN/RETURN_ACK на установленной lane публикуются однократно.
-У выдачи собственный абсолютный `peer_timeout`; успешный heartbeat не продлевает
-ожидание потерянного ответа. Неопределённый остаток сохраняется до подтверждённого
-снятия source и обработки старой очереди либо завершения lane. Ни локальный
-flush, ни восстановление leaf не освобождают его автоматически. Потеря
-подтверждения завершает peer без повторной отправки прикладных данных.
+Retirement снимает exact-source subscriptions, ждёт broker barrier и дренирует зафиксированный old DATA queue prefix. Неизвестный исход publication остаётся в quarantine. Общий outgoing debt сохраняется до свежего authenticated pair proof, после безопасной замены source на другой стороне; длительно исчезнувший peer может удерживать часть доступного flight. Отсутствие безопасного backing даёт backpressure/admission failure. Дедлайн сам не удаляет долг.
 
-Подтверждение доставки не возвращает Core receive credit: для него по-прежнему
-необходимо фактическое потребление host. Flight ограничивает одновременно
-находящиеся в пути bytes, а не байты в секунду.
+Lane data/control subscriptions используют две общие bounded queues, а не две очереди на каждый peer. Максимум payload16460 применяется до allocation независимо от INFO max_payload65588. INFO ограничен4096bytes, остальные строки512; HMSG отвергается до создания HeaderMap. Обеспеченный transport backing:
 
-DATA output публикуется bounded batch и flush выполняется на затронутые
-connections. Cancellation guard действует для всех extracted frames до завершения
-всех batch flushes: отмена может консервативно завершить все touched shards.
-Во время незавершённой публикации/flush тот же owner обрабатывает established
-lane input без новой очереди/task; immutable envelope сохраняет исходные token
-и sequence. Поэтому общий incoming count turn может превышать обычный pass
-budget, оставаясь ограниченным output batch и I/O deadline. Initial peer grants
-не извлекаются до matching PONG readiness. Manager freeze failure также
-завершает runtime session, даже если следующего DATA нет.
-Handshake flights и established control records имеют отдельные конечные slots.
+```
+(join_capacity + 2*shards*subscription_capacity
+ + (shards+1)*client_capacity + 4*(shards+1)) * (16460+1024)
+ + max_peers*(34816+2048)
+```
 
-`RuntimeConfig::new` задаёт capacities128 DATA/CONTROL,128 join,16 commands,
-64 inbound messages на каждый DATA/CONTROL pass и32 output frames/turn.
-Control work дополнительно посещает до32 peers/turn с максимум четырьмя flights/
-heartbeat messages на посещение; join input имеет отдельный budget16. Capacities
-допускаются1..65536, batches1..256, retry attempts1..1024; durations максимум24h.
-Manager limits задаются отдельно, включая max peers и global/per-peer streams/
-receive/send budgets. Metadata limit512 bytes подходит для bounded destination
-profile с255-byte hostname; parser в Core не входит.
+Последнее слагаемое — delivery/control state с bounded exact-prefix endpoints и exact-source subscription metadata. Bounded committed-prefix record metadata входит в transport accounting. TLS, kernel buffers, broker и caller-owned payload оцениваются отдельно; эта формула не является RSS процесса.
 
-`status()` использует O(1) Manager aggregate и counters, показывает active peers,
-membership slots (включая pending), connections/retries/last error. `peer_status`
-даёт явную per-peer диагностику; token/nonce не являются authentication secrets.
-`resources()` остаётся O(stream count) диагностикой buffer occupancy.
-Transport counters также включают число успешных DATA publish commands,
-payload bytes, пять групп размеров DATA (`<1500`, `1500…8191`, `8192…16383`,
-`16384`, `>16384`), WINDOW publish commands и завершённых socket flushes.
-`output_elapsed_ns` измеряет суммарное wall time output batches, включая
-ожидание publish/flush. Счётчики насыщаются на `u64::MAX`; они не измеряют CPU
-и не подтверждают доставку или потребление payload удалённым приложением.
-`validate_profile` учитывает queued messages и четыре дополнительных слота на
-соединение: одну pending decoded Message, парсер и одну временную Message.
-Обеспеченная граница —
-`(join_capacity + 2*shards*subscription_capacity + (shards+1)*client_capacity + 4*(shards+1)) * (65588+1024) + max_peers*(512+2*1024)`.
-Последнее слагаемое обеспечивает конечное состояние разрешений отправителя и
-получателя, delivery flight, незавершённого PING и карантина снимаемой подписки,
-а также метаданные двух exact-source подписок каждого peer.
-Парсер ограничен `2*(65588+516)` байтами capacity; тело каждого queued payload
-имеет собственный буфер точной длины. Fixed body maximum 65588 действует до
-первого INFO, при TLS upgrade и reconnect, независимо от broker max_payload.
-INFO ограничен 4096 байтами, остальные control/MSG строки — 512. HMSG не
-поддерживается: заголовки отклоняются до расширения HeaderMap и завершают
-затронутое соединение. Текущий Runtime публикует plain PUB/MSG.
+Горячий scheduler работает с ready peers/streams и byte deficits. Число streams одного peer не увеличивает его верхний вес. DATA batch ограничен32envelopes,256КиБ и cooperative time slice около1ms; peer control имеет отдельные bounded slots и rotation, а ожидание publication допускает progress чтения; первый frame не ждёт наполнения batch. Pending publish/flush продолжает входное чтение. Не завершившийся extracted batch guarded и консервативно завершает затронутые lanes при отмене. Idle streams не имеют собственных задач/таймеров.
 
-[Локальная поправка async-nats](../vendor/async-nats/PATCHES.md) сохраняет одну
-pending Message при полной subscription, прекращая новые чтения, пока запись,
-flush, commands и heartbeat продолжают работу. После io_timeout соединение
-терминально закрывается. Это предотвращает silent DATA drop; произвольная пауза
-host не обещает бесконечного ожидания. Upstream default и независимый static
-NatsNode сохраняют исходный loss contract.
+`peer_status` показывает delivery epoch, granted/sent/applied bytes, свободные records, command sequences и delivery/control wait. `snapshot` сохраняет отдельное application/send состояние. `stream_diagnostics(key)` добавляет возраст непрерывно непустой send-очереди, application/local-budget flags, ожидание delivery/shared-flight/control и eligibility планировщика для выбранного stream. Это query без background scan; elapsed output/turn включает совместную обработку I/O и не является временем удалённого приложения. `TurnDiagnostics` измеряет этапы owner turn; transport publish counters не подтверждают consume. Диагностические полные snapshots могут стоить O(stream count).
 
-Это конечное userspace backing, не полный RSS: TLS, kernel TCP buffers, broker
-queues и caller-owned allocations оцениваются отдельно.
+[Локальная поправка async-nats](../vendor/async-nats/PATCHES.md) удерживает одну pending Message при заполненной subscription, продолжая write/flush/commands/heartbeat. После io_timeout connection закрывается; silent DATA drop недопустим. Статический экспериментальный NatsNode имеет свой отдельный documented contract.
 
 ## Воспроизводимая квалификация
 

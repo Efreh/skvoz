@@ -67,8 +67,15 @@ fn owners_isolate_same_ids_and_global_budget_not_peer_window() {
     assert_eq!(a.stream_id, b.stream_id);
     assert_eq!(m.send(a, b"1234").unwrap(), SendOutcome::Accepted(4));
     assert_eq!(m.send(b, b"x").unwrap(), SendOutcome::WouldBlock);
+    let blocked = m.flow_observation(b, 3).unwrap();
+    assert!(blocked.local_budget_blocked);
+    assert!(!blocked.application_credit_blocked);
+    let queued = m.flow_observation(a, 3).unwrap();
+    assert_eq!(queued.backlog_age_ms, Some(3));
+    assert!(queued.queued_for_output);
     assert_eq!(m.resources().pending_send_bytes, 4);
     m.poll_frames(1);
+    assert_eq!(m.flow_observation(a, 4).unwrap().backlog_age_ms, None);
     assert!(
         m.poll_events(8)
             .iter()
@@ -183,7 +190,7 @@ fn close_churn_reaps_only_after_terminal_work_and_replay_cannot_reopen() {
     assert_eq!(m.resources().streams, 0);
 }
 #[test]
-fn round_robin_is_by_peer_then_stream_and_open_order_survives_abort() {
+fn byte_slices_preserve_open_order_after_abort() {
     let mut m = manager();
     m.poll_frames(256);
     let a = m.open(PeerId(1), b"", 0).unwrap();
@@ -191,9 +198,13 @@ fn round_robin_is_by_peer_then_stream_and_open_order_survives_abort() {
     let c = m.open(PeerId(2), b"", 0).unwrap();
     m.close(a, CloseReason::Cancelled).unwrap();
     let frames = m.poll_frames(3);
-    assert_eq!(frames.iter().map(|f| f.key).collect::<Vec<_>>(), [a, c, b]);
-    assert!(matches!(frames[0].frame, Frame::Close { .. }));
-    assert!(matches!(frames[2].frame, Frame::Open { .. }));
+    let keys = frames.iter().map(|f| f.key).collect::<Vec<_>>();
+    assert!(keys.contains(&a) && keys.contains(&b) && keys.contains(&c));
+    let cancelled = keys.iter().position(|k| *k == a).unwrap();
+    let next_open = keys.iter().position(|k| *k == b).unwrap();
+    assert!(cancelled < next_open);
+    assert!(matches!(frames[cancelled].frame, Frame::Close { .. }));
+    assert!(matches!(frames[next_open].frame, Frame::Open { .. }));
 }
 #[test]
 fn deadlines_are_indexed_and_failure_cleans_queued_terminal_frames() {
@@ -344,16 +355,110 @@ fn busy_streams_rotate_within_each_ready_peer_without_idle_work() {
     let b = establish(&mut m, PeerId(1));
     let c = establish(&mut m, PeerId(2));
     let d = establish(&mut m, PeerId(2));
-    for _ in 0..8 {
+    for round in 0..8 {
         for k in [a, b, c, d] {
             assert_eq!(m.send(k, b"abcdefgh").unwrap(), SendOutcome::Accepted(4));
             assert_eq!(m.send(k, b"efgh").unwrap(), SendOutcome::Accepted(4));
         }
         let frames = m.poll_frames(8);
-        assert_eq!(
-            frames.iter().map(|f| f.key).collect::<Vec<_>>(),
-            [a, c, b, d, a, c, b, d]
-        );
+        for key in [a, b, c, d] {
+            let offsets: Vec<_> = frames
+                .iter()
+                .filter(|f| f.key == key)
+                .map(|f| {
+                    let Frame::Data { offset, .. } = f.frame else {
+                        panic!("expected DATA")
+                    };
+                    offset
+                })
+                .collect();
+            assert_eq!(offsets, [round * 8, round * 8 + 4]);
+        }
+        assert_eq!(frames.len(), 8);
         assert_eq!(m.resources().ready_output_peers, 0);
     }
+}
+
+#[test]
+fn byte_fairness_survives_unequal_frames_and_more_streams_on_one_peer() {
+    let mut m = Manager::new(ManagerConfig {
+        stream: Config {
+            receive_window: 1 << 20,
+            max_frame: 16384,
+            max_pending_frames: 256,
+            max_metadata: 8,
+            open_timeout_ms: 5000,
+        },
+        max_peers: 2,
+        max_streams: 8,
+        max_streams_per_peer: 8,
+        receive_budget: 8 << 20,
+        receive_budget_per_peer: 4 << 20,
+        send_budget: 4 << 20,
+        send_budget_per_peer: 2 << 20,
+    })
+    .unwrap();
+    for id in [PeerId(1), PeerId(2)] {
+        m.register_peer(id, false).unwrap();
+    }
+    m.poll_frames(256);
+    let mut keys = Vec::new();
+    for peer in [PeerId(1), PeerId(1), PeerId(1), PeerId(1), PeerId(2)] {
+        let key = m.open(peer, b"", 0).unwrap();
+        m.poll_frames(256);
+        m.receive(
+            key,
+            &Frame::Accept {
+                receive_window: 1 << 20,
+                max_frame: 16384,
+                metadata: Box::new([]),
+            },
+            0,
+        )
+        .unwrap();
+        m.receive(
+            StreamKey { peer, stream_id: 0 },
+            &Frame::PeerGrant {
+                epoch: 0,
+                consumed_bytes: 0,
+                limit_bytes: 1 << 20,
+                consumed_records: 0,
+                limit_records: 2048,
+                probe: 0,
+            },
+            0,
+        )
+        .unwrap();
+        m.poll_events(256);
+        keys.push(key);
+    }
+    for &key in &keys[..4] {
+        for _ in 0..128 {
+            assert_eq!(m.send(key, &[1; 256]).unwrap(), SendOutcome::Accepted(256));
+        }
+    }
+    for _ in 0..8 {
+        assert_eq!(
+            m.send(keys[4], &[2; 16384]).unwrap(),
+            SendOutcome::Accepted(16384)
+        );
+    }
+    let mut bytes = [0usize; 2];
+    let frames = m.poll_frames(128);
+    assert!(
+        frames.iter().position(|f| f.key.peer == PeerId(2)).unwrap() <= 32,
+        "tiny records monopolized service before the other peer"
+    );
+    for frame in frames {
+        bytes[(frame.key.peer.0 - 1) as usize] += wire::encode(frame.key.stream_id, &frame.frame)
+            .unwrap()
+            .len()
+            + 1024;
+    }
+    assert!(bytes.iter().all(|b| *b > 0));
+    assert!(
+        bytes[0].abs_diff(bytes[1]) <= 3 * 16384 + 28,
+        "byte service skew: {bytes:?}"
+    );
+    assert!(m.aggregate().pending_send_bytes > 0);
 }

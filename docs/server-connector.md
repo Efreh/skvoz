@@ -1,9 +1,9 @@
 # Серверный коннектор
 
-`skvoz-server` 7.0.0 — Ruby 4.0.7 host общего сетевого runtime: он управляет
+`skvoz-server` 8.0.0 — Ruby 4.0.7 host общего сетевого runtime: он управляет
 NATS 2.15.1, пользователями, устройствами, Auth Callout и TLS.
-TCP-сокеты и полные IP-пакеты обслуживает `skvoz-network-runtime` 0.6.0,
-встраивающий Core 4.1.0 (network 6, API 1).
+TCP-сокеты и полные IP-пакеты обслуживает `skvoz-network-runtime` 0.7.0,
+встраивающий Core 5.0.0 (network 6, API 1).
 Привилегированные операции выхода выполняет узкий Linux helper.
 Одна реализация сервера принимает совместимые клиентские коннекторы независимо
 от их ОС и языка. [Общий контракт](network-runtime.md) определяет данные,
@@ -421,7 +421,7 @@ Auth Callout. Большой inventory обрабатывается ограни
 | `bind`, `port`, `monitor_port` | Брокер `0.0.0.0:4222`, мониторинг loopback:8222. |
 | `client_address`, `client_ca` | Адрес и trust входа для client exports; по умолчанию собственный address/CA. |
 | `namespace` | `skvoz.application`; совпадает с постоянным состоянием. |
-| `runtime_binary`, `helper_binary`, `nats_binary` | Комплектные runtime/helper 0.6.0 и NATS 2.15.1. |
+| `runtime_binary`, `helper_binary`, `nats_binary` | Комплектные runtime0.7.0/helper0.6.0 и NATS 2.15.1. |
 | `max_identities`, `devices_per_user` | 128 и 8; конечные лимиты активных устройств. |
 | `admin_timeout`, `stop_timeout` | 5 и 8 секунд; административный запрос и остановка дочерних процессов. |
 | `allow`, `deny` | До 128 правил `{cidr,protocols,ports}`. |
@@ -451,10 +451,10 @@ Compose задаёт IPv4 forwarding и fragment limits 4 МиБ / 15 секун
 Pool conflicts, uplink и обратная маршрутизация должны быть проверены в реальном
 окружении. Успех парсинга конфигурации этого не доказывает.
 
-Пример явного разрешения обычного TCP-сервиса `127.0.0.1:8081`:
+Пример явного разрешения обычного TCP-сервиса `128.0.0.1:8081`:
 
 ```json
-{"allow":[{"cidr":"127.0.0.1/32","protocols":[6],"ports":[8081]}]}
+{"allow":[{"cidr":"128.0.0.1/32","protocols":[6],"ports":[8081]}]}
 ```
 
 Это фрагмент полной конфигурации. `protocols` — `"any"` либо unique список
@@ -592,8 +592,8 @@ stderr дочерних процессов, credentials или пользова�
 
 Брокер, runtime, enrollment и probes используют
 [общий профиль транспорта](nats-runtime.md#профиль-транспорта).
-Сервер7.0.0 требует enrollment4, network6, API1, runtime/helper0.6.0
-и Core4.1.0. Конфигурация —5, persistent state —3, startup —3; Core wire2
+Сервер8.0.0 требует enrollment4, network6, API1, runtime0.7.0/helper0.6.0
+и Core5.0.0. Конфигурация —5, persistent state —3, startup —3; Core wire2
 и ABI1 сохраняются. Постоянных legacy wire/config fallbacks нет.
 Ограниченная offline конвертация authority state2 описана выше; runtime
 не запускается с прежней node/pool configuration. Клиентский profile4 задаёт

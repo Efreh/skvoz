@@ -7,8 +7,8 @@ Kotlin/Compose-приложение с тем же Rust Core и сетевым r
 `VpnService`. Трафик обрабатывается в Rust; Kotlin управляет интерфейсом,
 сохранённым профилем, service lifecycle и конфигурацией TUN.
 
-Android3.0.0/code12 использует runtime0.6.0, network6, enrollment4 и API1.
-Полноценный сервер SKVOZ7 выдаёт устройство автоматически; общий Core4.1.0
+Android4.0.0/code14 использует runtime0.7.0, network6, enrollment4 и API1.
+Полноценный сервер SKVOZ8 выдаёт устройство автоматически; общий Core5.0.0
 соединяет клиент с peer0 через native NATS.
 
 [Настройка, сборка, ограничения и проверка](../../docs/android-client.md).

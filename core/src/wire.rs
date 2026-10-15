@@ -204,6 +204,7 @@ pub(crate) fn encode_into(
             CloseReason::TransportLost => 2,
             CloseReason::ProtocolError => 3,
             CloseReason::OpenTimeout => 4,
+            CloseReason::ResourcePressure => 5,
             _ => unreachable!("validated abort reason"),
         }),
     }
@@ -269,6 +270,7 @@ pub fn decode(bytes: &[u8]) -> Result<Packet, WireError> {
                 2 => CloseReason::TransportLost,
                 3 => CloseReason::ProtocolError,
                 4 => CloseReason::OpenTimeout,
+                5 => CloseReason::ResourcePressure,
                 _ => return Err(WireError::InvalidValue),
             },
         },

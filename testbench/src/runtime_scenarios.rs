@@ -134,7 +134,11 @@ pub async fn bytes(
     let start = Instant::now();
     while received.len() < data.len() {
         if start.elapsed() > Duration::from_secs(5) {
-            return Err(std::io::Error::other("runtime byte deadline").into());
+            return Err(std::io::Error::other(format!(
+                "runtime byte deadline: sent={sent} received={} client={:?} remote={:?} client_delivery={:?} server_delivery={:?} stream={:?}",
+                received.len(), client.peer_status(key.stream.peer), server.status(),
+                client.delivery_status(), server.delivery_status(), client.snapshot(key)
+            )).into());
         }
         if sent < data.len()
             && let SendOutcome::Accepted(n) = client.send(key, &data[sent..])?
@@ -155,4 +159,34 @@ pub async fn bytes(
         return Err(std::io::Error::other("runtime bytes differ").into());
     }
     Ok(())
+}
+
+/// Build an exact protocol3 control for authenticated negative fixtures.
+pub fn control_bytes(
+    kind: u8,
+    sender: u128,
+    recipient: u128,
+    hello: u128,
+    token: u128,
+    watermark: u64,
+) -> Vec<u8> {
+    let mut b = vec![0; 200];
+    b[..4].copy_from_slice(b"SKC3");
+    b[4] = kind;
+    for (offset, value) in [(8, sender), (24, recipient), (40, hello), (56, token)] {
+        b[offset..offset + 16].copy_from_slice(&value.to_be_bytes());
+    }
+    b[72..80].copy_from_slice(&watermark.to_be_bytes());
+    b
+}
+/// DATA uses a checked outer version/length, even when its body is adversarial.
+pub fn data_bytes(token: u128, sequence: u64, epoch: u64, body: &[u8]) -> Vec<u8> {
+    let mut b = b"SKD3".to_vec();
+    b.extend_from_slice(&token.to_be_bytes());
+    for value in [sequence, 0, epoch] {
+        b.extend_from_slice(&value.to_be_bytes());
+    }
+    b.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    b.extend_from_slice(body);
+    b
 }
