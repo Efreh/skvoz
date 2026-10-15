@@ -140,14 +140,24 @@ async fn response_is_possible_after_request_eof() {
     );
     drop(events);
     consumer.consume_through(id, 3).await.unwrap();
-    consumer.send(id, b"reply").await.unwrap();
-    consumer.send(id, b"y").await.unwrap();
-    consumer.finish(id).await.unwrap();
+    let reply = b"reply";
+    let mut sent = 0;
+    let mut finished = false;
     let mut response = Vec::new();
     let mut saw_fin = false;
     let deadline = Instant::now() + Duration::from_secs(3);
     while !saw_fin {
         assert!(Instant::now() < deadline);
+        if sent < reply.len()
+            && let SendOutcome::Accepted(count) = consumer.send(id, &reply[sent..]).await.unwrap()
+        {
+            sent += count;
+        }
+        if sent == reply.len() && !finished {
+            consumer.finish(id).await.unwrap();
+            finished = true;
+        }
+        consumer.turn(Duration::ZERO).await.unwrap();
         user.turn(Duration::from_millis(10)).await.unwrap();
         for event in user.poll_events() {
             match event.event {

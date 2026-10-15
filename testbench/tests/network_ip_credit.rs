@@ -79,7 +79,9 @@ async fn pair(case: &str, records: usize) -> (NetworkEngine, NetworkEngine, Sess
         client.drive(Duration::ZERO).await.unwrap();
         server.drive(Duration::from_millis(1)).await.unwrap();
         if let Some(session) = client.sessions().first() {
-            if session.state == SessionState::Preparing && !local_ready {
+            // ACCEPT enters Preparing before the negotiated CONFIG may arrive.
+            if session.state == SessionState::Preparing && session.config.is_some() && !local_ready
+            {
                 client.local_ready(&session.session).unwrap();
                 local_ready = true;
             }

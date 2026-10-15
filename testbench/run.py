@@ -319,7 +319,7 @@ authorization {{
                 env.update({f"SKVOZ_NATS_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(mesh_passwords)})
                 env.update({f"SKVOZ_NATS_FFI_P{peer_id}_PASSWORD": password for peer_id, password in enumerate(ffi_passwords)})
                 if args.mode == "check":
-                    command(cargo + ["test", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra,
+                    command(cargo + ["test", "--workspace", "--exclude", "skvoz-ubuntu-client", "--all-targets", "--no-fail-fast", "--features", "skvoz-testbench/real-nats,skvoz-daemon/real-nats", *extra,
                         "--", "--test-threads=1", "--nocapture"], env=env)
                     # The final Rust test restarts Docker without awaiting broker readiness.
                     ready(monitor)
