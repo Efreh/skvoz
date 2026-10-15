@@ -2076,7 +2076,10 @@ impl NatsRuntime {
                 count += 1;
             }
             let ping = self.peers[&id].session.as_ref().is_some_and(|s| {
-                s.closing.is_none()
+                // A failed lane cannot prove the old prefix. Keep its debt
+                // quarantined and let retirement reach a fresh pair instead.
+                self.lanes[shard(id, self.config.shards)].is_some()
+                    && s.closing.is_none()
                     && s.can_ping
                     && s.ping.is_none()
                     && s.next_ping <= now

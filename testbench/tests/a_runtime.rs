@@ -577,6 +577,24 @@ async fn real_runtime_overflow_fails_affected_shard_and_preserves_other_shard() 
     r::joined(&mut healthy, &mut server, 2).await.unwrap();
     let (flood_key, _) = r::handshake(&mut flood, &mut server).await.unwrap();
     let (healthy_key, _) = r::handshake(&mut healthy, &mut server).await.unwrap();
+    // Settle continuous-control receipts before deliberately stopping the owner.
+    // Otherwise the healthy peer also reaches its unacknowledged-control deadline.
+    let started = Instant::now();
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(2));
+        flood.turn(Duration::ZERO).await.unwrap();
+        healthy.turn(Duration::ZERO).await.unwrap();
+        server.turn(Duration::from_millis(1)).await.unwrap();
+        if [(&flood, 0), (&healthy, 0), (&server, 1), (&server, 2)]
+            .into_iter()
+            .all(|(node, id)| {
+                node.peer_status(PeerId(id))
+                    .is_some_and(|status| status.ready && !status.waiting_control)
+            })
+        {
+            break;
+        }
+    }
     let session = flood.peer_status(PeerId(0)).unwrap();
     let ns = r::config(1, "overflow").unwrap().namespace;
     let packet = skvoz_core::wire::encode(
@@ -626,7 +644,8 @@ async fn real_runtime_overflow_fails_affected_shard_and_preserves_other_shard() 
         }
     }
     assert_eq!(lost, 1);
-    assert!(server.status().counters.shard_failures > 0);
+    assert_eq!(server.status().counters.shard_failures, 1);
+    assert_eq!(server.status().counters.shard_overflows, 1);
     assert!(server.peer_ready(PeerId(2)));
     assert_eq!(server.resources().streams, 1);
     assert_eq!(server.resources().reserved_receive_bytes, 8192);
@@ -1085,7 +1104,7 @@ async fn cancelled_extracted_output_fails_shard_then_fresh_pair_opens() {
             outcome = &mut pending => Some(outcome),
         };
         // Only cancel after observing extraction; earlier Pending work may be
-        // publishing the credit request or receiving its remote grant.
+        // publishing continuous control or receiving delivery permission.
         drop(pending);
         match outcome {
             None => break,
@@ -1110,9 +1129,18 @@ async fn cancelled_extracted_output_fails_shard_then_fresh_pair_opens() {
     assert_eq!(client.resources().streams, 0);
     let start = Instant::now();
     while !client.peer_ready(PeerId(0)) || !server.peer_ready(PeerId(1)) {
-        assert!(start.elapsed() < Duration::from_secs(8));
-        client.turn(Duration::ZERO).await.unwrap();
-        server.turn(Duration::from_millis(1)).await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "cancelled output recovery: client={:?} server={:?} client_peer={:?} server_peer={:?} client_delivery={:?} server_delivery={:?}",
+            client.status(),
+            server.status(),
+            client.peer_status(PeerId(0)),
+            server.peer_status(PeerId(1)),
+            client.delivery_status(),
+            server.delivery_status()
+        );
+        recovery_turn(&mut client).await;
+        recovery_turn(&mut server).await;
         client.poll_events(256);
         server.poll_events(256);
     }
