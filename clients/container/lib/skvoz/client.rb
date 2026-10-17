@@ -11,7 +11,7 @@ require_relative 'client/service'
 
 module Skvoz
   module Client
-    VERSION = '1.0.0'
+    VERSION = '1.0.1'
     class Bootstrap
       def self.run(arguments)
         command = arguments.shift || 'serve'
