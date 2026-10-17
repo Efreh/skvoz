@@ -111,7 +111,7 @@ module ServerSystem
 
   def process_dead(pid)
     File.read("/proc/#{pid}/stat").split(') ', 2).last.split.first == 'Z'
-  rescue Errno::ENOENT
+  rescue Errno::ENOENT, Errno::ESRCH
     true
   end
 
