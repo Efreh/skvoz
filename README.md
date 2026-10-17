@@ -10,6 +10,7 @@ SKVOZ доставляет двунаправленные байтовые по�
 | Задача | С чего начать |
 | --- | --- |
 | Использовать настольное приложение | [Клиент Ubuntu](docs/ubuntu-client.md): установка deb, подключение и два режима работы. |
+| Запустить headless клиент в Docker | [Контейнерный клиент](docs/container-client.md): proxy, TCP/HTTP routes и VPN для выбранных контейнеров. |
 | Использовать Android приложение | [Клиент Android](docs/android-client.md): APK, Прокси/ВПН и системные настройки. |
 | Развернуть серверный коннектор | [Руководство сервера](docs/server-connector.md): Docker/Compose, NATS, учётные данные и TLS. |
 | Объединить вход и несколько выходных нод | [Составы одного образа и join](docs/server-connector.md#вход-и-отдельные-выходные-ноды), [схема обмена](docs/architecture.md#объединение-серверных-нод). |
@@ -26,6 +27,7 @@ SKVOZ доставляет двунаправленные байтовые по�
 | [connectors/server/](connectors/server/README.md) | Ruby host общего Rust runtime, управление NATS, пользователями и сертификатами; один образ для GHCR и локальной сборки. |
 | [clients/ubuntu/](clients/ubuntu/README.md) | Нативное GTK4/libadwaita приложение с общим runtime, локальными подключениями и сетевым интерфейсом. |
 | [clients/android/](clients/android/README.md) | Compose/Material3 приложение со встроенным тем же Rust runtime и Android VpnService; проверка на устройствах продолжается. |
+| [clients/container/](clients/container/README.md) | Headless Ruby host того же runtime, proxy, именованные TCP/HTTP входы и shared-netns VPN. |
 | [clients/python/](clients/python/README.md), [clients/ruby/](clients/ruby/README.md) | Самостоятельные IPC-примеры на стандартных библиотеках. |
 | [connectors/tcp/](connectors/tcp/README.md) | Экспериментальный ретранслятор одного TCP-сокета через встроенный Core. |
 | [testbench/](testbench/README.md) | Реальные NATS/TCP-сценарии и измерения нагрузки; отдельный стенд, не зависимость продукта. |

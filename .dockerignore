@@ -9,6 +9,8 @@
 !network/**
 !clients/
 clients/**
+!clients/container/
+!clients/container/**
 !clients/ruby/
 !clients/ruby/**
 !clients/ubuntu/Cargo.toml

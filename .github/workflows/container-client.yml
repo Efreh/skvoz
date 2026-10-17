@@ -1,0 +1,92 @@
+name: Container client
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - 'clients/container/**'
+      - 'core/**'
+      - 'network/**'
+      - 'vendor/async-nats/**'
+      - 'daemon/**'
+      - 'connectors/tcp/**'
+      - 'testbench/**'
+      - 'clients/ubuntu/Cargo.toml'
+      - 'clients/android/native/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.dockerignore'
+      - '.github/workflows/container-client.yml'
+  pull_request:
+    paths:
+      - 'clients/container/**'
+      - 'core/**'
+      - 'network/**'
+      - 'vendor/async-nats/**'
+      - 'daemon/**'
+      - 'connectors/tcp/**'
+      - 'testbench/**'
+      - 'clients/ubuntu/Cargo.toml'
+      - 'clients/android/native/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.dockerignore'
+      - '.github/workflows/container-client.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: container-client-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build component test image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: clients/container/Dockerfile
+          target: tests
+          platforms: linux/amd64
+          load: true
+          tags: skvoz-client:tests
+      - name: Component contracts
+        run: docker run --rm --cap-drop ALL --security-opt no-new-privileges:true skvoz-client:tests
+      - name: Build deploy image from source
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: clients/container/Dockerfile
+          target: deploy
+          platforms: linux/amd64
+          load: true
+          tags: skvoz-client:qualification
+      - name: Runtime versions
+        run: docker run --rm --cap-drop ALL --security-opt no-new-privileges:true skvoz-client:qualification --version
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish source-built image
+        if: github.event_name != 'pull_request'
+        env:
+          GHCR_REPOSITORY: ghcr.io/${{ github.repository }}/skvoz-client
+        run: |
+          image="${GHCR_REPOSITORY,,}"
+          docker tag skvoz-client:qualification "$image:sha-${GITHUB_SHA}"
+          docker push "$image:sha-${GITHUB_SHA}"
+          if [ "$GITHUB_REF_NAME" = "${{ github.event.repository.default_branch }}" ]; then
+            docker tag skvoz-client:qualification "$image:latest"
+            docker push "$image:latest"
+          fi

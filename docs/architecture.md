@@ -76,6 +76,25 @@ Core wire — 2. Источники новой интеграции ещё тр�
 ManagedCa PEM, imported CA — явное переопределение. Реальное device/TUN поведение
 требует отдельной квалификации; crossbuild/JVM checks её не заменяют.
 
+[Контейнерный клиент](container-client.md) 1.0.0 использует Ruby как supervisor
+общего network runtime. OPEN_TCP возвращает Unix FD для raw TCP и bounded
+HTTP/1.1 gateway; native runtime обслуживает proxy listeners. Альтернативный VPN
+режим передаёт общий TUN FD тому же runtime. Узкий root worker настраивает только
+shared container namespace и сохраняет guard после потери host; traffic host и
+runtime работают UID10001 без capabilities. Один private state volume хранит
+устройство и root bootstrap endpoint cache; ephemeral health находится в /run.
+
+```mermaid
+flowchart LR
+  apps["Приложения: fixed TCP / HTTP gateway"] --> ruby["Ruby host: lifecycle / bounded HTTP"]
+  proxy["Приложения: HTTP/CONNECT/SOCKS5 proxy"] --> native
+  ruby <-->|"API1 + SCM_RIGHTS"| native["Общий Rust Core/network"]
+  native <-->|"TLS / native NATS"| server["Полный сервер / stock NATS entry"]
+  consumer["VPN consumer: service:client namespace"] <-->|"TUN packets"| native
+  os["Root OS worker: NET_ADMIN"] -->|"Guard / routes / resolver"| namespace["Общий container namespace"]
+  os -->|"TUN FD"| ruby
+```
+
 Manager привязывает поток к `(PeerId, stream_id)` и отдельно ограничивает число
 активных и закрывающихся потоков. Aggregate byte/record backing обеспечивает
 уже объявленный peer credit; приём и отправка ограничены глобально и по peers.

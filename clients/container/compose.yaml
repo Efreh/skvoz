@@ -1,0 +1,38 @@
+services:
+  client:
+    image: ghcr.io/efreh/skvoz/skvoz-client:latest
+    restart: unless-stopped
+    environment:
+      SKVOZ_CLIENT_CONFIG: |
+        server: your-server.example:4222
+        username: your-login
+        password: "replace-with-your-issued-password"
+        mode: proxy
+        proxy:
+          http: 8080
+          socks: 1080
+    volumes:
+      - client-state:/var/lib/skvoz-client
+    tmpfs:
+      - /run/skvoz-client:uid=10001,gid=10001,mode=0700,size=1m
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, SETPCAP]
+    security_opt: [no-new-privileges:true]
+    cpus: 1
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 64
+    stop_grace_period: 10s
+    ulimits:
+      core: 0
+      nofile: 8192
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:1080:1080"
+
+# VPN alternative: set mode: vpn, remove proxy/ports, add NET_ADMIN to cap_add
+# and devices: [/dev/net/tun:/dev/net/tun]. Add selected consumers with
+# network_mode: service:client and depends_on: {client: {condition: service_healthy}}.
+# Do not add dns: to consumers sharing the client network namespace.
+volumes:
+  client-state:

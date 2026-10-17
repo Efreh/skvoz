@@ -82,6 +82,7 @@ Ubuntu — настольное приложение, Android — мобильн
 | Сервер: bootstrap, static policy и runtime control | `connectors/server/lib/skvoz/server/{bootstrap,network_configuration,runtime_control}.rb` |
 | Сервер: Auth Callout, отзыв и native leaf | `connectors/server/lib/skvoz/server/{auth_callout,revocation,nats_connection}.rb`, `connectors/server/compose.yaml` |
 | Дополнительный стандартный NATS вход и ACME | `deploy/nats/` |
+| Контейнерный клиент: config, enrollment, FD control, HTTP/TCP, VPN lifecycle | `clients/container/lib/skvoz/client/`, `clients/container/{Dockerfile,compose.yaml,spec}/` |
 | Ubuntu: подключение, выделение устройства и настройки | `clients/ubuntu/src/{backend,enrollment,settings}.rs` |
 | Android: UI, lifecycle, storage, VpnService | `clients/android/app/src/main/java/org/skvoz/android/` |
 | Android: JNI, ABI builds, APK checks | `clients/android/native/`, `clients/android/tools/` |

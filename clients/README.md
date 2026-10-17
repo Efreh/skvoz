@@ -8,6 +8,10 @@ HTTP/HTTPS CONNECT, SOCKS5 CONNECT и L3 ВПН, комплектным общи
 Core/network, loopback Прокси и Android VpnService. [Руководство Android](../docs/android-client.md)
 описывает APK, настройки и открытые проверки на устройстве.
 
+[Container](container/README.md) — headless Ruby host общего runtime с proxy,
+именованными TCP/HTTP routes и VPN для выбранных контейнеров.
+[Руководство Docker](../docs/container-client.md).
+
 [Python](python/README.md) и [Ruby](ruby/README.md) остаются самостоятельными
 примерами IPC на стандартной библиотеке, не зависимостями Ubuntu-приложения.
 Клиенты используют ту же универсальную Rust-библиотеку Core внутри
